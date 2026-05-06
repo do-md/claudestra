@@ -7,6 +7,7 @@ import {
   parseModalOptions,
   detectArrowNavModal,
   isAutoConfirmableModal,
+  isClaudeReady,
 } from "../src/lib/tmux-helper.js";
 
 describe("parseModalOptions", () => {
@@ -201,5 +202,66 @@ Steps:
 Enter to confirm something? (just text)
 `;
     expect(isAutoConfirmableModal(pane)).toBe(false);
+  });
+});
+
+describe("isClaudeReady", () => {
+  test("典型 idle pane（❯ 单独一行 + bypass permissions banner）→ true", () => {
+    const pane = `
+some banner content
+─────────────────────────── claudestra ──
+❯
+─────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+    expect(isClaudeReady(pane)).toBe(true);
+  });
+
+  test("❯ 后面带光标占位符（新版 2.1.129 可能渲染） → 仍 true", () => {
+    const pane = `
+banner
+─── claudestra ──
+❯ ▎
+──────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+    expect(isClaudeReady(pane)).toBe(true);
+  });
+
+  test("❯ 后面带 placeholder 文字 → 仍 true", () => {
+    const pane = `
+banner
+─── claudestra ──
+❯ Type a message...
+──────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+    expect(isClaudeReady(pane)).toBe(true);
+  });
+
+  test("启动中 pane（无 bypass permissions banner）→ false", () => {
+    const pane = `
+Claude Code v2.1.129
+Loading channels...
+`;
+    expect(isClaudeReady(pane)).toBe(false);
+  });
+
+  test("dev-channels 确认 modal（❯ 1. ... 在 last 5 但 banner 还没出）→ false", () => {
+    const pane = `
+WARNING: Loading development channels
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+Enter to confirm · Esc to cancel
+`;
+    // 没有 "bypass permissions" → 不算就绪（即便 ❯ 在 last 5）
+    expect(isClaudeReady(pane)).toBe(false);
+  });
+
+  test("shell prompt（无 ❯）→ false", () => {
+    const pane = `➜  some-dir`;
+    expect(isClaudeReady(pane)).toBe(false);
   });
 });

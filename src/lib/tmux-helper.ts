@@ -113,6 +113,26 @@ export async function isIdle(target: string): Promise<boolean> {
 }
 
 /**
+ * Claude Code TUI 启动就绪检测 —— 比 isIdle 宽松，专给 launch 流程用。
+ *
+ * 为什么需要：isIdle 要求行**只**含 ❯，但新版 Claude Code（≥ 2.1.129）启动后
+ * 的输入框可能把光标占位符 / placeholder 文字渲染在 ❯ 同一行（如 `❯ ▎` 或
+ * `❯ Type a message...`），让 isIdle 永远 false → cmdCreate / cmdResume 30s 超时
+ * 然后误清理一个其实已经就绪的 agent。
+ *
+ * 改成两个**联合**信号：
+ * 1. ❯ 出现在 pane 最后 5 行（容忍 ❯ 后面有任何字符）
+ * 2. pane 里出现 "bypass permissions" — Claude Code TUI 状态栏的固定文字
+ *
+ * 同时满足才算 ready。这个组合在 restart 路径（startClaudeInWindow）已经用了
+ * 很久，稳定。统一到 launch 流程里消除 create / resume 路径的滞后。
+ */
+export function isClaudeReady(pane: string): boolean {
+  const last5 = pane.split("\n").slice(-5).join("\n");
+  return /❯/.test(last5) && pane.includes("bypass permissions");
+}
+
+/**
  * 检测 pane 上是否有"可以安全自动按 Enter 确认"的 modal。
  *
  * 先用 parseModalOptions 做几何识别（必须有 ❯ 标记的选项菜单）。检测到 modal

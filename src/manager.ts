@@ -35,6 +35,7 @@ import {
   isAutoConfirmableModal,
   detectSessionIdlePrompt,
   clearShellInitPrompts,
+  isClaudeReady,
 } from "./lib/tmux-helper.js";
 import {
   buildClaudeCommand,
@@ -446,8 +447,8 @@ async function cmdCreate(
     await clearShellInitPrompts(target);
     await tmuxSendLine(target, cmd);
 
-    // 4. 轮询等待就绪
-    for (let i = 0; i < 60; i++) {
+    // 4. 轮询等待就绪 — 60s budget，与 restart 的 startClaudeInWindow 对齐
+    for (let i = 0; i < 120; i++) {
       await Bun.sleep(500);
       const pane = await captureLast(tmuxName, 10);
       // Session 闲置弹窗 → watcher 会通知用户，这里当成就绪返回
@@ -460,7 +461,7 @@ async function cmdCreate(
         await Bun.sleep(500);
         continue;
       }
-      if (await isAgentIdle(tmuxName)) {
+      if (isClaudeReady(pane)) {
         ready = true;
         break;
       }
@@ -606,8 +607,8 @@ async function cmdResume(
     await clearShellInitPrompts(target);
     await tmuxSendLine(target, cmd);
 
-    // 轮询等待
-    for (let i = 0; i < 60; i++) {
+    // 轮询等待 — 60s budget，与 restart 的 startClaudeInWindow 对齐
+    for (let i = 0; i < 120; i++) {
       await Bun.sleep(500);
       const pane = await captureLast(tmuxName, 10);
       // Session 闲置弹窗 → watcher 会通知用户，这里当成就绪返回
@@ -620,7 +621,7 @@ async function cmdResume(
         await Bun.sleep(500);
         continue;
       }
-      if (await isAgentIdle(tmuxName)) {
+      if (isClaudeReady(pane)) {
         ready = true;
         break;
       }
@@ -952,9 +953,7 @@ async function startClaudeInWindow(
     const pane = await captureLast(name, 10);
 
     // Claude Code 就绪
-    if (/❯/.test(pane.split("\n").slice(-5).join("\n")) && pane.includes("bypass permissions")) {
-      return true;
-    }
+    if (isClaudeReady(pane)) return true;
 
     // Session 闲置弹窗 → 不自动确认，交给 permission-watcher 通知用户
     // 当作"就绪"返回，cmdCreate/cmdResume 会保存 registry，watcher 会发 Discord 按钮
@@ -970,13 +969,11 @@ async function startClaudeInWindow(
     }
   }
 
-  // 最后再捕一次，用严格条件：必须同时有 "❯" 和 "bypass permissions" 才算 ready。
-  // 只检 "❯" 会被"❯ 1. I am using this for local development"这类选项菜单
-  // 里的游标字符误判为 shell 提示符，导致卡在对话框还返回成功。
+  // 最后再捕一次：用同样的严格条件兜底（不靠循环结束的瞬时状态）。
+  // 严格条件 isClaudeReady 同时要求 ❯ 和 "bypass permissions"，避免 ❯ 出现在
+  // "❯ 1. I am using this for local development" 这类选项菜单里被误判。
   const final = await captureLast(name, 10);
-  const hasReadyPrompt = /❯/.test(final.split("\n").slice(-5).join("\n"));
-  const hasBypassBanner = final.includes("bypass permissions");
-  return hasReadyPrompt && hasBypassBanner;
+  return isClaudeReady(final);
 }
 
 async function cmdRestart(name?: string) {
