@@ -103,13 +103,39 @@ export async function clearShellInitPrompts(
 }
 
 /** 基于 "❯" 提示符检测是否空闲。
- * 注意：Claude Code 的选项菜单也用 "❯ 1. xxx" 标记选中项，所以不能简单检测 "❯" 存在，
- * 必须是一行只有 "❯"（可带空格）才算 idle prompt。 */
+ *
+ * 旧版 Claude Code 的 idle prompt 是一行只有 "❯"（可带空格）。新版（≥ 2.1.129）
+ * 可能在 ❯ 同行渲染光标占位符 `▎` 或 placeholder 文字（"Type a message..."），
+ * 让严格的「行只有 ❯」匹配永远失败 → wedge-watcher / cmdList / bridge 中断判断
+ * 全部把 fresh idle agent 错认成"忙"。
+ *
+ * 修法：双模匹配 +「没有正在跑」的反向信号
+ * - 模式 1：legacy 严格匹配 `^\s*❯\s*$`
+ * - 模式 2：宽松匹配 — ❯ 在 last 5 行 + pane 含 "bypass permissions" banner +
+ *   pane **不**含 "esc to interrupt"
+ *
+ * 「esc to interrupt」是 Claude Code 状态栏在跑工具 / 等 LLM 响应时才会显示的
+ * 文字。它存在 = agent 在忙，不是 idle。idle 状态栏只有 "shift+tab to cycle"。
+ *
+ * 选项菜单（"❯ 1. xxx"）情况：模式 1 当然不匹配；模式 2 不会匹配因为 modal
+ * 通常没有 bypass banner（modal 覆盖输入框）。两种都返回 false，正确。
+ */
+/** 纯函数版：给定 pane 文本判断是否 idle。便于单测。 */
+export function paneLooksIdle(pane: string): boolean {
+  const last5 = pane.split("\n").slice(-5);
+  // 模式 1: 严格匹配 — 老 Claude Code 行为
+  if (last5.some((line) => /^\s*❯\s*$/.test(line))) return true;
+  // 模式 2: 宽松匹配 — 新 Claude Code 输入框可能带光标 / placeholder
+  const last5Joined = last5.join("\n");
+  const hasPrompt = /❯/.test(last5Joined);
+  const hasBanner = pane.includes("bypass permissions");
+  const isWorking = /esc to interrupt/i.test(pane);
+  return hasPrompt && hasBanner && !isWorking;
+}
+
 export async function isIdle(target: string): Promise<boolean> {
   const tail = await tmuxRaw(["capture-pane", "-t", target, "-p"]);
-  const last5 = tail.split("\n").slice(-5);
-  // 行匹配：^\s*❯\s*$ — 只有 prompt，没有后续文本
-  return last5.some((line) => /^\s*❯\s*$/.test(line));
+  return paneLooksIdle(tail);
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   detectArrowNavModal,
   isAutoConfirmableModal,
   isClaudeReady,
+  paneLooksIdle,
 } from "../src/lib/tmux-helper.js";
 
 describe("parseModalOptions", () => {
@@ -263,5 +264,81 @@ Enter to confirm · Esc to cancel
   test("shell prompt（无 ❯）→ false", () => {
     const pane = `➜  some-dir`;
     expect(isClaudeReady(pane)).toBe(false);
+  });
+});
+
+describe("paneLooksIdle", () => {
+  test("legacy 严格 idle（行只有 ❯）→ true", () => {
+    const pane = `
+some output
+─── claudestra ──
+❯
+─────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+    expect(paneLooksIdle(pane)).toBe(true);
+  });
+
+  test("新版 idle（❯ + 光标占位符 ▎）→ true（宽松匹配）", () => {
+    const pane = `
+some output
+─── ld-binance-operate ──
+❯ ▎
+─────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+    expect(paneLooksIdle(pane)).toBe(true);
+  });
+
+  test("新版 idle（❯ + placeholder 文字）→ true", () => {
+    const pane = `
+─── name ──
+❯ Type a message...
+───────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+    expect(paneLooksIdle(pane)).toBe(true);
+  });
+
+  test("Claude 在跑工具（pane 含 esc to interrupt）→ false", () => {
+    const pane = `
+✶ Sock-hopping... (5s · 1.2k tokens · thought for 1s)
+  ⎿  Tip: Use /statusline ...
+─── claudestra ──
+❯ ▎
+─────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt
+`;
+    expect(paneLooksIdle(pane)).toBe(false);
+  });
+
+  test("dev-channels modal（无 bypass banner）→ false", () => {
+    const pane = `
+WARNING: Loading development channels
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+Enter to confirm · Esc to cancel
+`;
+    expect(paneLooksIdle(pane)).toBe(false);
+  });
+
+  test("shell prompt（无 ❯ 也无 banner）→ false", () => {
+    const pane = `➜  some-dir`;
+    expect(paneLooksIdle(pane)).toBe(false);
+  });
+
+  test("permission 弹窗（❯ 1. Yes 在 last 5 但 esc to interrupt 不出现）→ false", () => {
+    // permission modal 通常没 bypass banner（被 modal 覆盖），所以两种 mode 都 false
+    const pane = `
+Do you want to make this edit to /etc/passwd?
+
+❯ 1. Yes
+  2. No, deny
+
+Enter to confirm
+`;
+    expect(paneLooksIdle(pane)).toBe(false);
   });
 });
