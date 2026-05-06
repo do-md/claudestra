@@ -60,6 +60,48 @@ export async function tmuxCapture(
   return tmuxRaw(["capture-pane", "-t", target, "-p", "-J", "-S", `-${lines}`]);
 }
 
+/**
+ * 等 shell 就绪 + 清掉 shell 初始化阶段的 Y/n 交互（oh-my-zsh "Would you like
+ * to update? [Y/n]"、homebrew "Update? (y/N)" 之类）。
+ *
+ * 为什么需要：tmux new-window 后 .zshrc 加载可能耗时数秒，oh-my-zsh 一旦达到
+ * UPDATE_ZSH_DAYS 阈值（默认 13 天）就弹这种 Y/n 提示。如果在 prompt 出现**前**
+ * 就 send-keys 输入 `claude ...`，第一个字符 'c' 被吞掉当 "no"（zsh read -k 1），
+ * 剩下 `laude ...` 跑成 shell 命令报 "command not found"，Claude Code 永远没启动，
+ * 调用方 30s 等就绪超时。
+ *
+ * 策略：在 maxWaitMs 时间窗（默认 5s）内轮询：
+ * - 看到 Y/n → 发 'n' + Enter 拒绝
+ * - shell idle prompt 出现 → 立即返回
+ * - 超时 → 也返回（让调用方继续；现实里超过 5s 还没就绪本来就会继续超时）
+ */
+const Y_N_PROMPT_RE = /[\[(](?:Y\/n|y\/N|yes\/no)[\])]/i;
+
+function looksLikeShellPromptTail(pane: string): boolean {
+  const lines = pane.split("\n").filter((l) => l.trim());
+  if (lines.length === 0) return false;
+  const last = lines[lines.length - 1];
+  // 常见 shell prompt 收尾：% $ # > ❯ » λ；oh-my-zsh ➜ + 路径
+  return /[%$#>❯»λ]\s*$/.test(last) || /➜\s+\S/.test(last);
+}
+
+export async function clearShellInitPrompts(
+  target: string,
+  maxWaitMs = 5000,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const pane = await tmuxCapture(target, 10);
+    if (Y_N_PROMPT_RE.test(pane)) {
+      await tmuxRaw(["send-keys", "-t", target, "n", "Enter"]);
+      await new Promise((r) => setTimeout(r, 600));
+      continue;
+    }
+    if (looksLikeShellPromptTail(pane)) return;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
 /** 基于 "❯" 提示符检测是否空闲。
  * 注意：Claude Code 的选项菜单也用 "❯ 1. xxx" 标记选中项，所以不能简单检测 "❯" 存在，
  * 必须是一行只有 "❯"（可带空格）才算 idle prompt。 */

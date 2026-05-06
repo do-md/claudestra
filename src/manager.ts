@@ -34,6 +34,7 @@ import {
   ensureSocketDir,
   isAutoConfirmableModal,
   detectSessionIdlePrompt,
+  clearShellInitPrompts,
 } from "./lib/tmux-helper.js";
 import {
   buildClaudeCommand,
@@ -440,6 +441,9 @@ async function cmdCreate(
       disallowedRaw: perms.disallowedRaw,
       effort,
     });
+    // 新 tmux window 起来后 .zshrc / .bashrc 可能弹 oh-my-zsh / homebrew 的 Y/n
+    // update prompt，会吞掉 send-keys 第一个字符。先清掉再发命令。
+    await clearShellInitPrompts(target);
     await tmuxSendLine(target, cmd);
 
     // 4. 轮询等待就绪
@@ -599,6 +603,7 @@ async function cmdResume(
       disallowedRaw: perms.disallowedRaw,
       effort,
     });
+    await clearShellInitPrompts(target);
     await tmuxSendLine(target, cmd);
 
     // 轮询等待
@@ -937,7 +942,8 @@ async function startClaudeInWindow(
     if (!isAtShell(retry)) return false;
   }
 
-  // 发送启动命令
+  // 发送启动命令前先清掉 shell init 阶段可能存在的 Y/n 交互（oh-my-zsh / homebrew）
+  await clearShellInitPrompts(target);
   await tmuxSendLine(target, claudeCmd);
 
   // 轮询处理各种确认提示，最多等 60 秒

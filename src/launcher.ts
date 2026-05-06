@@ -23,6 +23,7 @@ import {
   isAutoConfirmableModal,
   listAgentWindows,
   windowTarget,
+  clearShellInitPrompts,
   MASTER_SESSION as SESSION_NAME,
 } from "./lib/tmux-helper.js";
 
@@ -89,6 +90,8 @@ async function bringUpClaudeInMasterWindow(): Promise<boolean> {
     bridgeUrl: BRIDGE_URL,
     effort: MASTER_EFFORT,
   });
+  // shell init 阶段的 Y/n（oh-my-zsh / homebrew）会吞掉首字符，先清掉。
+  await clearShellInitPrompts(MASTER_WINDOW);
   await tmuxSendLine(MASTER_WINDOW, cmd);
 
   // 等待并自动确认各种提示（dev channel、trust、bypass、etc）
