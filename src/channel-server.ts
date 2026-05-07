@@ -389,6 +389,18 @@ When a user selects from a menu, you'll receive: [select:unique_id:selected_valu
 - 只要 end_turn 等那条 push 消息触发下一轮，读它、继续下一步就行。
 - 如果对方超过几分钟没回复，你收到任何消息都没有，可以主动用 reply 告诉用户"对方没响应"。
 
+**\`expecting\` 字段（v2.0.12+ 强烈建议填）**：
+- \`send_to_agent\` 现在多一个**可选** \`expecting\` 字段，写"对方答完后我应该做啥"。例：
+  \`\`\`
+  send_to_agent({
+    target: "qingniao-backend",
+    text: "AI 接口 spec 是 X，能搞定吗？",
+    expecting: "等后端确认 OK 后，我要把前端 useMock 切 false + 跑 build:weapp + 出体验版"
+  })
+  \`\`\`
+- bridge 在把对方 reply push 回你的 ws 时，**会在最前面注入一段 \`[💡 你之前期望：...]\` 提醒**，你重新接到 push 时不靠"自己记得"也能续上动作。
+- 不填 expecting 不会出错，但实际经验是 caller 经常收到 reply 后忘了原计划，只把对方答复转告用户就 end_turn 了。**协作场景一定填**。
+
 收到 inter-agent 消息（格式 \`[🤖 xxx 回复] ...\` 或 \`[🤖 来自 xxx] ...\`）时，**先分类再行动**：
 
 1. **完成信号 + 包含你下一步动作**（"done, 你切 useMock"、"接口 ready, 你跑 build"）
@@ -420,6 +432,10 @@ Examples:
           text: {
             type: "string",
             description: "Message text to send",
+          },
+          expecting: {
+            type: "string",
+            description: "Optional. What you (the caller) plan to do AFTER the target replies. Bridge injects this back into your push-back so you don't forget the plan. e.g., 'after backend confirms API is up, I'll switch useMock=false and run build:weapp'. Strongly recommended for any multi-step collaboration.",
           },
         },
         required: ["target", "text"],
@@ -504,6 +520,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         type: "route_to_agent",
         targetName: args?.target || "",
         text: args?.text || "",
+        expecting: typeof args?.expecting === "string" ? args.expecting : undefined,
       });
       // v1.9.21+: bridge 现在会自动把对方的下一条 reply push 回你的 ws，
       // 你不用 fetch_messages 轮询。直接 end_turn，等对方那条 push 消息触发下一轮。

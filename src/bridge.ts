@@ -160,6 +160,13 @@ interface PendingAgentCall {
    * 回复目标。没有正在处理的请求时是 undefined。
    */
   originalReplyChannel?: string;
+  /**
+   * v2.0.12+ caller 在 send_to_agent 时填的"答完后我应该做啥"。
+   * bridge 在把 target 的 reply push 回 caller ws 时，前缀注入这段文字
+   * （[💡 你之前期望：...]），帮 caller LLM 不靠"自己记得"也能续上动作。
+   * 修 self-develop 链路里 caller 收到答复后只 relay 不 act 的根因之一。
+   */
+  expecting?: string;
   ts: number;
 }
 const pendingAgentCalls = new Map<string, PendingAgentCall>();
@@ -176,6 +183,8 @@ interface PendingPeerCall {
   peerBotId: string;
   peerBotName: string;
   peerAgent: string;
+  /** v2.0.12+ 跟 PendingAgentCall.expecting 对称，跨 peer 也支持。 */
+  expecting?: string;
   ts: number;
 }
 const pendingPeerCalls = new Map<string, PendingPeerCall>();
@@ -1140,6 +1149,9 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
           // v2.0.0 Phase 4b: 从直接 pp.callerWs.send 改成 deliver(envelope)。
           // from=local 用 agentName="peer <bot>/<agent>" 标识来源（render 会自动
           // 拼 "[🤖 来自 peer bot/agent]" 前缀，跟原来 "[🤖 peer X/Y 回复]" 等价）。
+          const peerPushBody = pp.expecting
+            ? `[💡 你之前 send_to_agent 给 peer ${pp.peerBotName}/${pp.peerAgent} 时填的期望：${pp.expecting}\n对方答复如下，请按计划继续，不要只 relay 给用户。]\n\n${cleanText}`
+            : cleanText;
           const pushEnv: RouterEnvelope = {
             from: {
               kind: "local",
@@ -1154,7 +1166,7 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
               ws: pp.callerWs,
             },
             intent: "response",
-            content: cleanText,
+            content: peerPushBody,
             meta: {
               messageId: `peer_reply_${Date.now()}`,
               triggerKind: "peer_discord",
@@ -2368,6 +2380,12 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
             // 没有 originalReplyChannel 时回退到 msg.chatId（target 私频）—
             // 这是旧行为，保守兜底。
             const replyBackHint = pending.originalReplyChannel || msg.chatId;
+            const cleanedReply = text.replace(/<@!?\d+>\s*/g, "").trim();
+            // v2.0.12+: 如果 caller 当时填了 `expecting`，在 push 的最前面注入
+            // 一段提醒，让 caller LLM 不靠"自己记得"也知道这次答复后该续什么动作。
+            const pushBody = pending.expecting
+              ? `[💡 你之前 send_to_agent 给 ${pending.targetName} 时填的期望：${pending.expecting}\n对方答复如下，请按计划继续，不要只 relay 给用户。]\n\n${cleanedReply}`
+              : cleanedReply;
             const pushEnv: RouterEnvelope = {
               from: {
                 kind: "local",
@@ -2382,7 +2400,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
                 ws: pending.callerWs,
               },
               intent: "response",
-              content: text.replace(/<@!?\d+>\s*/g, "").trim(),
+              content: pushBody,
               meta: {
                 messageId: `agent_reply_${Date.now()}`,
                 triggerKind: "agent_tool",
@@ -2604,6 +2622,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
             callerName: fromName,
             targetName,
             originalReplyChannel,
+            expecting: typeof msg.expecting === "string" ? msg.expecting.trim() || undefined : undefined,
             ts: Date.now(),
           });
         }
@@ -2733,6 +2752,7 @@ async function handlePeerRouteToAgent(
       peerBotId: peer.id,
       peerBotName: peer.name,
       peerAgent: peerAgentName,
+      expecting: typeof msg.expecting === "string" ? msg.expecting.trim() || undefined : undefined,
       ts: Date.now(),
     });
 
