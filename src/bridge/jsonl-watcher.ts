@@ -244,7 +244,10 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
  * 这样 turn 结束的"快速一句话"场景不会因为 watcher debounce 1.5s 还没过就被
  * Stop 吞掉，同时也不需要 rescue 做第二遍代发。
  */
-export async function drainChannelWatcher(channelId: string, discord: Client): Promise<boolean> {
+export async function drainChannelWatcher(
+  channelId: string,
+  discord: Client,
+): Promise<{ drained: boolean; text: string | null }> {
   for (const state of watchers.values()) {
     if (state.channelId !== channelId) continue;
     try {
@@ -254,12 +257,22 @@ export async function drainChannelWatcher(channelId: string, discord: Client): P
       clearTimeout(state.textTimer);
       state.textTimer = null;
     }
+    let captured: string | null = null;
     if (state.textQueue.length > 0) {
+      // v2.0.13+: 在 flushText splice 掉 textQueue 之前先截一份。Stop hook 兜底
+      // pushback / peer-inbound forward 需要这段原文（不要带 flushText 加的 `-# ` 前缀）。
+      // 只保留 `💬 ` / `⛔ ` 前缀的真 assistant 文字，跳过 ⏱/📖/✏️ 这种 telemetry。
+      const assistantOnly = state.textQueue
+        .filter((item) => item.startsWith("💬 ") || item.startsWith("⛔ "))
+        .map((item) => item.replace(/^[💬⛔]\s+/u, ""))
+        .join("\n")
+        .trim();
+      captured = assistantOnly || null;
       try { await flushText(state, discord); } catch { /* non-critical */ }
     }
-    return true;
+    return { drained: true, text: captured };
   }
-  return false;
+  return { drained: false, text: null };
 }
 
 export async function startWatching(

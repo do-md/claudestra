@@ -188,6 +188,24 @@ interface PendingPeerCall {
   ts: number;
 }
 const pendingPeerCalls = new Map<string, PendingPeerCall>();
+
+/**
+ * v2.0.13+ 跨 peer 入站请求追踪。peer 路由进来一条 #agent-exchange 消息给我方某个
+ * agent 处理时（direct mode），记录 (本地 agent channelId) → (peer 共享频道 id +
+ * peer 信息)。如果该 agent 这一轮忘了用 reply() 工具答到 peer 的 #agent-exchange，
+ * 而是只在 assistant 文字里说了，watcher 会 drain 到本地 agent channel —— peer 完全
+ * 看不见。Stop hook 用这个 map 在 drain 后 forward 到 peer 共享频道兜底，避免消息
+ * 沉默丢失。reply 工具命中 sharedChannelId 时清掉这个 entry（agent 自己做对了）。
+ */
+interface PendingPeerInbound {
+  localAgentName: string;
+  sharedChannelId: string;     // peer 那边的 #agent-exchange channel id
+  peerBotId: string;
+  peerBotName: string;
+  isForeign: boolean;          // foreign exchange (对方 guild) vs local exchange
+  ts: number;
+}
+const pendingPeerInbound = new Map<string, PendingPeerInbound>();
 const typingSafetyTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const TYPING_SAFETY_TIMEOUT_MS = 30 * 60 * 1000; // 30 分钟
 
@@ -1410,6 +1428,18 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
   try {
     const delivery = await deliver(env);
     if (delivery.outcome.kind === "sent") {
+      // v2.0.13+: direct route 时记 pendingPeerInbound（local exchange 场景）。
+      // Stop drain 兜底用 — agent 忘 reply() 时 forward 到 #agent-exchange。
+      if (directRouted && isPeer && routeClient) {
+        pendingPeerInbound.set(routeClient.channelId, {
+          localAgentName: routeAgentName || "agent",
+          sharedChannelId: channelId,
+          peerBotId: msg.author.id,
+          peerBotName: msg.author.username,
+          isForeign: false,
+          ts: Date.now(),
+        });
+      }
       recordMetric("message_in", { channelId, meta: { len: content.length, attachments: attachmentPaths.length, direct: directRouted } });
     } else if (delivery.outcome.kind === "dropped") {
       console.log(`📪 deliver dropped ${envelopeLabel(env)}: ${delivery.outcome.reason}`);
@@ -2327,6 +2357,15 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         for (const [chId, info] of clients.entries()) {
           if (info.ws === ws) { fromChannelId = chId; break; }
         }
+        // v2.0.13+: agent 显式 reply() 到 peer 共享频道 = 它自己做对了，
+        // 清掉 pendingPeerInbound 兜底，避免 Stop drain 时双发。
+        if (fromChannelId) {
+          const peerInbound = pendingPeerInbound.get(fromChannelId);
+          if (peerInbound && msg.chatId === peerInbound.sharedChannelId) {
+            pendingPeerInbound.delete(fromChannelId);
+            console.log(`✅ peer inbound 已被 agent 正确 reply 到 ${peerInbound.sharedChannelId}，清 pending`);
+          }
+        }
         const fromEndpoint: RouterLocalEndpoint = {
           kind: "local",
           channelId: fromChannelId,
@@ -3147,6 +3186,16 @@ async function routePeerDirectWithAgent(
       console.error(`🎯 PEER DIRECT (button) deliver 失败: ${reason}`);
       return false;
     }
+    // v2.0.13+: 记 pendingPeerInbound，Stop hook drain 时如果 agent 忘 reply 就把
+    // 抓到的文字 forward 到 peer 的 #agent-exchange，避免 peer 完全看不见答复。
+    pendingPeerInbound.set(agentClient.channelId, {
+      localAgentName: targetAgent.name,
+      sharedChannelId: origChannelId,
+      peerBotId,
+      peerBotName,
+      isForeign: kind === "foreign",
+      ts: Date.now(),
+    });
     const senderLabel = origMsg.author.bot ? `peer bot ${origMsg.author.username}` : `用户 ${origMsg.author.username}`;
     console.log(`🎯 PEER DIRECT (button): ${senderLabel} → ${targetAgent.name} (kind=${kind})`);
     recordMetric("peer_direct_route_button", { channelId: origChannelId, meta: { agent: targetAgent.name, kind } });
@@ -3332,6 +3381,15 @@ async function tryRouteForeignAgentExchange(msg: DiscordMessage, channelId: stri
       console.error(`🎯 SYMMETRIC deliver 失败: ${reason}`);
       return false;
     }
+    // v2.0.13+: 记 pendingPeerInbound — Stop drain 兜底 forward 用
+    pendingPeerInbound.set(agentClient.channelId, {
+      localAgentName: targetAgent.name,
+      sharedChannelId: channelId,
+      peerBotId: peerBotForChannel.id,
+      peerBotName: peerBotForChannel.name,
+      isForeign: true,
+      ts: Date.now(),
+    });
     const senderLabel = msg.author.bot ? `peer bot ${msg.author.username}` : `用户 ${msg.author.username}`;
     console.log(`🎯 SYMMETRIC DIRECT: ${senderLabel} 在 foreign #agent-exchange (${channelId}) → 路由到 ${targetAgent.name}`);
     recordMetric("peer_direct_route_symmetric", { channelId, meta: { sender: msg.author.id, agent: targetAgent.name } });
@@ -3358,6 +3416,12 @@ setInterval(() => {
     if (now - pending.ts > STALE_MS) {
       pendingPeerCalls.delete(channelId);
       console.log(`🧹 pendingPeerCalls stale: 清掉 target=${pending.peerBotName}/${pending.peerAgent}`);
+    }
+  }
+  for (const [channelId, pending] of pendingPeerInbound.entries()) {
+    if (now - pending.ts > STALE_MS) {
+      pendingPeerInbound.delete(channelId);
+      console.log(`🧹 pendingPeerInbound stale: 清掉 agent=${pending.localAgentName} (peer=${pending.peerBotName})`);
     }
   }
 }, 60_000).unref();
@@ -3470,7 +3534,82 @@ async function handleHookRequest(req: Request): Promise<Response> {
       if (event === "Stop" || event === "StopFailure" || event === "stop") {
         const { drainChannelWatcher } = await import("./bridge/jsonl-watcher.js");
         for (const cid of channelsToClear) {
-          try { await drainChannelWatcher(cid, discord); } catch { /* non-critical */ }
+          try {
+            const drainResult = await drainChannelWatcher(cid, discord);
+            const drainedText = drainResult.text;
+
+            // v2.0.13+ 兜底 1: 本地 send_to_agent caller 在等 push。如果 target 这轮
+            // 走了 watcher drain（assistant 文字直接 post 到自己 channel）而**不是**
+            // reply()，老 pushback 路径根本不触发 → caller 永远等不到。这里在 Stop
+            // drain 之后强制 pushback 一次：
+            //   - drain 出了文字 → push 该文字
+            //   - drain 没文字（连 assistant text 都没有）→ push 一句 "对方结束了
+            //     turn 但没回复"，至少让 caller 不会无限静默等
+            const pendingAgent = pendingAgentCalls.get(cid);
+            if (pendingAgent) {
+              try {
+                const callerCtxLine = pendingAgent.expecting
+                  ? `[💡 你之前 send_to_agent 给 ${pendingAgent.targetName} 时填的期望：${pendingAgent.expecting}]\n`
+                  : "";
+                const pushBody = drainedText
+                  ? `${callerCtxLine}[ℹ️ 对方 (${pendingAgent.targetName}) 这轮没用 reply() 工具，下面是 bridge 从 assistant 文字兜底转发的：]\n\n${drainedText}`
+                  : `${callerCtxLine}[⚠️ 对方 (${pendingAgent.targetName}) 结束了 turn 但既没 reply() 也没产出 assistant 文字。可能挂了，或者拒绝执行。你需要主动追问或换路线。]`;
+                const stopWsClient = clients.get(cid);
+                const replyBackHint = pendingAgent.originalReplyChannel || cid;
+                const drainPushEnv: RouterEnvelope = {
+                  from: {
+                    kind: "local",
+                    agentName: pendingAgent.targetName,
+                    channelId: replyBackHint,
+                    ws: stopWsClient?.ws ?? pendingAgent.callerWs,
+                  },
+                  to: {
+                    kind: "local",
+                    agentName: pendingAgent.callerName,
+                    channelId: pendingAgent.callerChannelId,
+                    ws: pendingAgent.callerWs,
+                  },
+                  intent: "response",
+                  content: pushBody,
+                  meta: {
+                    messageId: `agent_drain_${Date.now()}`,
+                    triggerKind: "agent_tool",
+                    ts: new Date().toISOString(),
+                    threadId: newThreadId(),
+                  },
+                };
+                await deliver(drainPushEnv);
+                pendingAgentCalls.delete(cid);
+                console.log(`📨 AGENT PUSH-BACK (drain兜底): ${pendingAgent.targetName} → ${pendingAgent.callerName}（${drainedText ? "drain 文字" : "no-text 通知"}）`);
+                recordMetric("agent_pushback_drain", { channelId: pendingAgent.callerChannelId, meta: { hadText: drainedText ? "yes" : "no" } });
+              } catch (e) {
+                console.error("AGENT PUSH-BACK (drain兜底) 失败:", e);
+              }
+            }
+
+            // v2.0.13+ 兜底 2: 跨 peer 入站请求。peer 的 agent 这轮如果忘了 reply()
+            // 到 peer 的 #agent-exchange，watcher drain 把文字贴到 agent **自己** local
+            // channel，peer 完全看不见。这里 forward 到 peer 共享频道，让 peer 的
+            // bridge 通过 messageCreate 看到 → 老的 pendingPeerCalls pushback 就接力上。
+            const peerInbound = pendingPeerInbound.get(cid);
+            if (peerInbound) {
+              try {
+                if (drainedText) {
+                  const forwardBody = `[ℹ️ ${peerInbound.localAgentName} 这轮没用 reply() 工具回到 #agent-exchange，下面是 bridge 从 assistant 文字兜底转发的：]\n\n${drainedText}`;
+                  await discordReply(discord, peerInbound.sharedChannelId, forwardBody);
+                  console.log(`📨 PEER INBOUND DRAIN (兜底): ${peerInbound.localAgentName} → ${peerInbound.sharedChannelId}（forwarded ${drainedText.length} chars）`);
+                  recordMetric("peer_inbound_drain", { channelId: peerInbound.sharedChannelId, meta: { agent: peerInbound.localAgentName } });
+                } else {
+                  const noTextBody = `[⚠️ ${peerInbound.localAgentName} 结束了 turn 但既没 reply() 也没 assistant 文字 — 你那边请主动追问或换路线。]`;
+                  await discordReply(discord, peerInbound.sharedChannelId, noTextBody);
+                  console.log(`📨 PEER INBOUND DRAIN (no-text 兜底): ${peerInbound.localAgentName} → ${peerInbound.sharedChannelId}`);
+                }
+                pendingPeerInbound.delete(cid);
+              } catch (e) {
+                console.error("PEER INBOUND DRAIN (兜底) 失败:", e);
+              }
+            }
+          } catch { /* non-critical */ }
         }
       }
 
