@@ -265,6 +265,41 @@ Enter to confirm · Esc to cancel
     const pane = `➜  some-dir`;
     expect(isClaudeReady(pane)).toBe(false);
   });
+
+  test("v2.0.14: bypass banner 在 scrollback 但 last 10 没 → false（防 dev-channels modal 假阳性）", () => {
+    // 模拟 restart 场景：旧 claude session 留下 banner 残留在 scrollback 顶部，
+    // 但 last 10 行是 dev-channels modal（没 banner）。修复前会假阳性返回 true，
+    // 导致 polling 提前退出没机会按 Enter dismiss modal。
+    const pane = `
+old assistant output...
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+/exit
+Goodbye!
+[空行很多行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+(base) ➜ dir $ claude --dangerously-load-development-channels server:claudestra
+WARNING: Loading development channels
+
+--dangerously-load-development-channels is for local channel development only.
+
+Channels: server:claudestra
+
+❯ 1. I am using this for local development
+  2. Exit
+
+Enter to confirm · Esc to cancel
+`;
+    expect(isClaudeReady(pane)).toBe(false);
+  });
 });
 
 describe("paneLooksIdle", () => {
@@ -340,5 +375,45 @@ Do you want to make this edit to /etc/passwd?
 Enter to confirm
 `;
     expect(paneLooksIdle(pane)).toBe(false);
+  });
+
+  test("v2.0.14: stale bypass banner 在 scrollback 但 last 10 是 dev-channels modal → false", () => {
+    // 跟 isClaudeReady 的 stale test 同源 — paneLooksIdle 也会被 scrollback 假阳性
+    const pane = `
+old stuff...
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+/exit
+Goodbye!
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+[空行]
+(base) ➜ dir $ claude --dangerously-load-development-channels server:claudestra
+WARNING: Loading development channels
+
+Channels: server:claudestra
+
+❯ 1. I am using this for local development
+  2. Exit
+
+Enter to confirm · Esc to cancel
+`;
+    expect(paneLooksIdle(pane)).toBe(false);
+  });
+
+  test("v2.0.14: 真 idle pane (banner 在 last 10) 仍判 true", () => {
+    // 确保收紧 last 10 不影响正常 idle 检测 — banner 永远在输入框下面 1-2 行
+    const pane = `
+─── ld-binance-operate ──
+❯ Try "write a test"
+─────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+    expect(paneLooksIdle(pane)).toBe(true);
   });
 });

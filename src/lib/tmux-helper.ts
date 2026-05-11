@@ -122,14 +122,20 @@ export async function clearShellInitPrompts(
  */
 /** 纯函数版：给定 pane 文本判断是否 idle。便于单测。 */
 export function paneLooksIdle(pane: string): boolean {
-  const last5 = pane.split("\n").slice(-5);
+  const lines = pane.split("\n");
+  const last5 = lines.slice(-5);
   // 模式 1: 严格匹配 — 老 Claude Code 行为
   if (last5.some((line) => /^\s*❯\s*$/.test(line))) return true;
   // 模式 2: 宽松匹配 — 新 Claude Code 输入框可能带光标 / placeholder
-  const last5Joined = last5.join("\n");
-  const hasPrompt = /❯/.test(last5Joined);
-  const hasBanner = pane.includes("bypass permissions");
-  const isWorking = /esc to interrupt/i.test(pane);
+  // v2.0.14+: "bypass permissions" / "esc to interrupt" 检查都收紧到 last 10 行。
+  // 之前 `pane.includes(...)` / 全 pane regex 会把 scrollback 里 stale 的旧 TUI banner
+  // 字符串误命中，dev-channels modal 时假阳性返回 true → wedge / launch polling 提前
+  // 退出根本没机会按 Enter dismiss modal。Claude Code TUI 的 bypass banner 永远在
+  // 输入框下面 1-2 行 = 真 idle 时一定在 last 10。
+  const last10Joined = lines.slice(-10).join("\n");
+  const hasPrompt = /❯/.test(last5.join("\n"));
+  const hasBanner = /bypass permissions/.test(last10Joined);
+  const isWorking = /esc to interrupt/i.test(last10Joined);
   return hasPrompt && hasBanner && !isWorking;
 }
 
@@ -154,8 +160,14 @@ export async function isIdle(target: string): Promise<boolean> {
  * 很久，稳定。统一到 launch 流程里消除 create / resume 路径的滞后。
  */
 export function isClaudeReady(pane: string): boolean {
-  const last5 = pane.split("\n").slice(-5).join("\n");
-  return /❯/.test(last5) && pane.includes("bypass permissions");
+  const lines = pane.split("\n");
+  // v2.0.14+: bypass banner 检查从 `pane.includes(...)` 收紧到 last 10 行，避免
+  // 旧 claude session 残留在 scrollback 的 banner 字符串造成假阳性。具体 bug：
+  // restart 流程里 startClaudeInWindow 的 polling 第一次轮询就误以为 ready，跳过
+  // hasPromptToConfirm 分支没机会按 Enter，dev-channels modal 永远卡在那儿。
+  const hasPrompt = /❯/.test(lines.slice(-5).join("\n"));
+  const hasBanner = /bypass permissions/.test(lines.slice(-10).join("\n"));
+  return hasPrompt && hasBanner;
 }
 
 /**
