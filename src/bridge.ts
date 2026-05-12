@@ -206,6 +206,29 @@ interface PendingPeerInbound {
   ts: number;
 }
 const pendingPeerInbound = new Map<string, PendingPeerInbound>();
+
+/**
+ * v2.0.16+ inter-agent 消息看门狗。每当 bridge 把一条来自**另一个 agent / master**
+ * 的消息投递到某个 agent 的 ws（send_to_agent / pushback / reply→别agent频道 forward
+ * 任一路径都经过 deliverToLocal），记一条 (接收 agent channelId) → { fromLabel, retries }。
+ *
+ * 清除：那个 agent 下一次调 `reply()`（任意频道）或 `send_to_agent`（= 它在回应/
+ * 行动）。
+ *
+ * Stop hook 兜底：如果一轮结束时这条还在（agent 既没 reply 也没 send_to_agent —
+ * 大概率是收到消息后啥也没干或没报告），bridge 注一条 `[⚠️ ...]` nudge 到那 agent 的
+ * ws 提醒它处理 + 用 reply() 报告。最多 nudge 2 次（retries 到 2 就放弃，不无限循环）。
+ *
+ * 修「agent 收到 inter-agent 消息后无动于衷」这个 LLM 行为层的兜底。注意这是兜底，
+ * 不是 100% 保证 —— LLM 可能 nudge 之后还是不理，2 次后就不再打扰。
+ */
+interface PendingInterAgentMsg {
+  fromLabel: string;
+  retries: number;
+  ts: number;
+}
+const pendingInterAgentMsg = new Map<string, PendingInterAgentMsg>();
+
 const typingSafetyTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const TYPING_SAFETY_TIMEOUT_MS = 30 * 60 * 1000; // 30 分钟
 
@@ -339,6 +362,17 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
       pendingThreads.set(env.meta.threadId, {
         request: env,
         targetWs: to.ws,
+        ts: Date.now(),
+      });
+    }
+    // v2.0.16+: 来自另一个 agent / master 的消息（send_to_agent / pushback /
+    // reply→别agent forward 都经这里），记看门狗 pending。peer 消息（from.kind=peer）
+    // 不记 —— 那走 PEER DIRECT header，有 reply([DIRECT]) 的明确指引，且回路是
+    // pendingPeerInbound 那条线。
+    if (env.from.kind === "local" && env.from.ws !== to.ws) {
+      pendingInterAgentMsg.set(to.channelId, {
+        fromLabel: env.from.agentName || "另一个 agent",
+        retries: 0,
         ts: Date.now(),
       });
     }
@@ -2425,6 +2459,14 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
             pendingPeerInbound.delete(fromChannelId);
             console.log(`✅ peer inbound 已被 agent 正确 reply 到 ${peerInbound.sharedChannelId}，清 pending`);
           }
+          // v2.0.16+: agent 调了 reply()（任意频道）= 它在回应/行动，清掉 inter-agent
+          // 看门狗，Stop hook 不会再 nudge。清这个 ws 名下所有 channel key（master 挂
+          // #control + #agent-exchange 两个）。
+          for (const [chId, info] of clients.entries()) {
+            if (info.ws === ws && pendingInterAgentMsg.delete(chId)) {
+              console.log(`✅ inter-agent 看门狗清掉（${chId} 调了 reply()）`);
+            }
+          }
         }
         const fromEndpoint: RouterLocalEndpoint = {
           kind: "local",
@@ -2619,6 +2661,13 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         let fromName = msg.fromName || "";
         for (const [chId, info] of clients.entries()) {
           if (info.ws === ws) { fromChannelId = chId; break; }
+        }
+        // v2.0.16+: agent 调了 send_to_agent = 它在行动/回应，清掉 inter-agent 看门狗。
+        // 清这个 ws 名下所有 channel key（master 挂 #control + #agent-exchange）。
+        for (const [chId, info] of clients.entries()) {
+          if (info.ws === ws && pendingInterAgentMsg.delete(chId)) {
+            console.log(`✅ inter-agent 看门狗清掉（${chId} 调了 send_to_agent）`);
+          }
         }
 
         // v1.9.22+: 解析 target，支持 peer: 语法：
@@ -3484,6 +3533,12 @@ setInterval(() => {
       console.log(`🧹 pendingPeerInbound stale: 清掉 agent=${pending.localAgentName} (peer=${pending.peerBotName})`);
     }
   }
+  for (const [channelId, pending] of pendingInterAgentMsg.entries()) {
+    if (now - pending.ts > STALE_MS) {
+      pendingInterAgentMsg.delete(channelId);
+      console.log(`🧹 pendingInterAgentMsg stale: 清掉 ${channelId}（来自 ${pending.fromLabel}）`);
+    }
+  }
 }, 60_000).unref();
 
 /** 返回跟 channelId 共享同一个 ws 的所有其他 channelId（不含自身）。
@@ -3667,6 +3722,53 @@ async function handleHookRequest(req: Request): Promise<Response> {
                 pendingPeerInbound.delete(cid);
               } catch (e) {
                 console.error("PEER INBOUND DRAIN (兜底) 失败:", e);
+              }
+            }
+
+            // v2.0.16+ inter-agent 看门狗: 这一轮结束时如果 cid 还挂着 inter-agent
+            // 消息 pending（agent 既没 reply 也没 send_to_agent —— 大概率收到消息后
+            // 啥也没干或没报告），注一条 nudge 到它的 ws 提醒处理 + reply() 报告。
+            // 最多 nudge 2 次（retries 到 2 放弃，不无限循环）。
+            const iaPending = pendingInterAgentMsg.get(cid);
+            if (iaPending) {
+              if (iaPending.retries >= 2) {
+                pendingInterAgentMsg.delete(cid);
+                console.log(`⚠️ inter-agent 看门狗放弃（${cid} nudge 2 次仍无响应，来自 ${iaPending.fromLabel}）`);
+              } else {
+                const stopClientForNudge = clients.get(cid);
+                if (stopClientForNudge) {
+                  try {
+                    const nudgeText = [
+                      `[⚠️ 你上一轮收到来自 ${iaPending.fromLabel} 的消息，但这一轮结束了，既没用 reply() 报告也没 send_to_agent 回应。`,
+                      `如果你已经处理了那条消息 —— 用 reply() 到自己频道告诉用户你做了什么。`,
+                      `如果还没处理 —— 现在处理；处理完用 reply() 报告；如果是问你的就 send_to_agent 回 ${iaPending.fromLabel}。`,
+                      `不要再静默 end_turn。]`,
+                    ].join("\n");
+                    // 标记这个 channel 最近一条消息源是 agent/系统，避免 nudge 被处理后
+                    // 的 Stop hook 误 @ 用户。
+                    lastMessageSource.set(cid, "agent");
+                    await deliver({
+                      from: { kind: "bridge", label: "ia-watchdog" },
+                      to: { kind: "local", channelId: cid, ws: stopClientForNudge.ws, cwd: stopClientForNudge.cwd },
+                      intent: "notification",
+                      content: nudgeText,
+                      meta: {
+                        messageId: `ia_nudge_${Date.now()}`,
+                        triggerKind: "bridge_synth",
+                        ts: new Date().toISOString(),
+                        threadId: newThreadId(),
+                      },
+                    });
+                    iaPending.retries += 1;
+                    console.log(`📨 inter-agent 看门狗 nudge #${iaPending.retries} → ${cid}（来自 ${iaPending.fromLabel}）`);
+                    recordMetric("ia_watchdog_nudge", { channelId: cid, meta: { from: iaPending.fromLabel, retry: String(iaPending.retries) } });
+                  } catch (e) {
+                    console.error("inter-agent 看门狗 nudge 失败:", e);
+                  }
+                } else {
+                  // agent 的 ws 没了 → 清掉 pending，没法 nudge
+                  pendingInterAgentMsg.delete(cid);
+                }
               }
             }
           } catch { /* non-critical */ }
