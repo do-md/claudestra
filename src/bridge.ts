@@ -391,6 +391,13 @@ async function deliverToPeer(env: RouterEnvelope, to: RouterPeerEndpoint): Promi
  * 支持 chunking / reply_to / files / components（通过 meta 透传 discordReply）。
  * content 不自动 @ 用户 —— Stop hook 有独立的完成通知负责 @，这里 body 里的
  * mention 留给调用方自己控制（比如 reply handler 直接发 agent 写的 text）。
+ *
+ * v2.0.15+ 额外职责：如果 to.channelId 其实是**某个 agent 的频道**（注册在
+ * clients 里），而且发消息的是**另一个** local agent（不是 master、不是这个频道
+ * 自己的 agent），那除了贴 Discord，还会 forward 一份给那个 agent 的 claude ws ——
+ * 否则它根本收不到。修 `reply(chat_id=别agent频道)` 通知对方但对方完全看不见的
+ * 架构漏洞：把「agent 间通信」收敛到 deliverToLocal 一处，不管 agent 用
+ * send_to_agent 还是误用 reply(chat_id=对方频道)，对方都会通过 deliverToLocal 收到。
  */
 async function deliverToUser(env: RouterEnvelope, to: RouterUserEndpoint): Promise<RouterDelivery> {
   try {
@@ -402,9 +409,62 @@ async function deliverToUser(env: RouterEnvelope, to: RouterUserEndpoint): Promi
       env.meta.components as any,
       env.meta.files,
     );
+    // v2.0.15+ cross-agent forward —— 见函数注释
+    if (env.from.kind === "local") {
+      const fromLocal = env.from;
+      const isFromMaster = !!CONTROL_CHANNEL_ID && clients.get(CONTROL_CHANNEL_ID)?.ws === fromLocal.ws;
+      const targetClient = clients.get(to.channelId);
+      if (!isFromMaster && targetClient && targetClient.ws !== fromLocal.ws) {
+        forwardReplyToAgentClaude(fromLocal, env.content, to.channelId, targetClient)
+          .catch((e) => console.error("reply→别agent频道 forward 异常:", e));
+      }
+    }
     return { envelope: env, outcome: { kind: "sent", discordMessageIds: ids } };
   } catch (e) {
     return { envelope: env, outcome: { kind: "error", error: e as Error } };
+  }
+}
+
+/**
+ * v2.0.15+: 把一条 agent reply 到「别的 agent 的频道」的消息，额外 forward 一份给
+ * 那个 agent 的 claude ws（除了已经贴了的 Discord）。走 deliverToLocal → 自动加
+ * `[🤖 来自 X]` 前缀，跟 send_to_agent 等价。fire-and-forget，best-effort。
+ */
+async function forwardReplyToAgentClaude(
+  fromEndpoint: RouterLocalEndpoint,
+  content: string,
+  targetChannelId: string,
+  targetClient: ClientInfo,
+): Promise<void> {
+  let fromAgentName = fromEndpoint.agentName;
+  let targetAgentName: string | undefined;
+  // reply handler 构造 fromEndpoint 时通常没填 agentName，这里查 registry 补上让
+  // renderContentForLocal 的 "[🤖 来自 X]" 准确；查不到就 fallback "agent"。
+  try {
+    const list = await runManager("list");
+    const agents = (list.agents || []) as any[];
+    if (!fromAgentName) fromAgentName = agents.find((a) => a.channelId === fromEndpoint.channelId)?.name;
+    targetAgentName = agents.find((a) => a.channelId === targetChannelId)?.name;
+  } catch { /* non-critical */ }
+  const fwdEnv: RouterEnvelope = {
+    from: { kind: "local", agentName: fromAgentName, channelId: fromEndpoint.channelId, ws: fromEndpoint.ws },
+    to: { kind: "local", agentName: targetAgentName, channelId: targetChannelId, ws: targetClient.ws, cwd: targetClient.cwd },
+    intent: "notification",
+    content: content.replace(/<@!?\d+>\s*/g, "").trim(),
+    meta: {
+      messageId: `reply_fwd_${Date.now()}`,
+      triggerKind: "agent_tool",
+      ts: new Date().toISOString(),
+      threadId: newThreadId(),
+    },
+  };
+  const fwd = await deliver(fwdEnv);
+  if (fwd.outcome.kind === "sent") {
+    lastMessageSource.set(targetChannelId, "agent");
+    console.log(`📨 reply→别agent频道: ${fromAgentName || "?"} 的消息同时 forward 给 ${targetAgentName || targetChannelId} 的 claude`);
+    recordMetric("reply_cross_agent_forward", { channelId: targetChannelId, meta: { from: fromAgentName || "" } });
+  } else if (fwd.outcome.kind === "error") {
+    console.error("reply→别agent频道 forward 失败:", fwd.outcome.error);
   }
 }
 

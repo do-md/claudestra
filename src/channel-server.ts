@@ -377,6 +377,8 @@ When a user selects from a menu, you'll receive: [select:unique_id:selected_valu
       name: "send_to_agent",
       description: `Send a message to another agent. Use for agent-to-agent collaboration — 包括跨 Claudestra peer 调用。
 
+**⚠️ 通知 / 询问别的 agent 一律用这个工具，不要用 \`reply(chat_id=对方频道)\`。** \`reply\` 是「发到 Discord 频道给人看」的，发到别的 agent 的频道时 v2.0.15 之前对方 claude 进程**根本收不到**（只贴了 Discord，没 forward 给对方 ws），对方会"无动于衷"。v2.0.15+ 已经兜底也会 forward 了，但 \`send_to_agent\` 才是正路 —— 它有 pushBack 推回、有 \`expecting\` 上下文注入、对方 claude 一定收到。
+
 **target 格式**（v1.9.22+ 新增 peer 语法）：
 - \`"agent_name"\` 或 \`"predict"\` — 本地 agent（自动补 "agent-" 前缀）
 - \`"peer:claudestra_ahh.future_data"\` — peer claudestra_ahh 的 future_data agent（长格式）
