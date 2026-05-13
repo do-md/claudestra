@@ -516,10 +516,19 @@ async function renderContentForLocal(env: RouterEnvelope): Promise<string> {
     return env.content;
   }
 
-  // 本地 agent → agent 转发（send_to_agent 那套）
+  // 本地 agent → agent 转发（send_to_agent / pushback / reply→别agent forward）。
+  // v2.0.17+: 前缀从纯 "[🤖 来自 X]" 改成 imperative framing —— 实测 LLM 对
+  // "[来自 X]" 这种 informational 包装容易当 FYI 处理（默默 ack / 转告用户但不行动）。
+  // 明确告诉它：这是要你处理的，处理完必须 reply() 报告（或 send_to_agent 回 X）。
   if (from.kind === "local") {
     const fromName = from.agentName ?? "agent";
-    return `[🤖 来自 ${fromName}]\n${env.content}`;
+    return [
+      `[🤖 来自 ${fromName} 的消息 —— 这是要你处理的，不是 FYI。`,
+      `处理完用 reply() 到你自己频道报告你做了什么（如果是问你问题，就 send_to_agent 回 ${fromName}）。`,
+      `就算判断它只是知会，也至少 reply() 一句"收到"，不要静默 end_turn。]`,
+      ``,
+      env.content,
+    ].join("\n");
   }
 
   // inbound（user / peer）—— 要不要加 header 取决于两件事：
