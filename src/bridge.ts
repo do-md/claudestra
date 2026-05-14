@@ -2270,6 +2270,51 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         return;
       }
 
+      // v2.0.19+: AskUserQuestion 的 Submit / Cancel 按钮
+      if (id.startsWith("auq:")) {
+        try {
+          const { auqStates, buildAuqKeystrokes, clearAuqState } =
+            await import("./bridge/ask-user-question.js");
+          const parts = id.split(":");
+          const auqChannel = parts[1];
+          const action = parts[2];
+          const state = auqStates.get(auqChannel);
+          if (!state) {
+            await interaction.editReply({ content: `⚠️ AskUserQuestion 状态已过期，请等 agent 重新发起。`, components: [] }).catch(() => {});
+            return;
+          }
+          if (action === "submit") {
+            const keys = buildAuqKeystrokes(state);
+            // 一次 tmux send-keys 批量发，tmux 内部按顺序处理键序列；比一键一调用快得多
+            if (keys.length > 0) {
+              await tmuxRaw(["send-keys", "-t", state.tmuxTarget, ...keys]);
+            }
+            const summary = state.selections.map((sel, i) => {
+              if (sel.length === 0) return `Q${i + 1}: (none)`;
+              const labels = sel.map((oi) => state.questions[i].options[oi]?.label || `?${oi}`).join(", ");
+              return `Q${i + 1}: ${labels}`;
+            }).join("\n");
+            await interaction.editReply({
+              content: `✅ 已提交 AskUserQuestion 选择：\n${summary}`,
+              components: [],
+            }).catch(() => {});
+            recordMetric("auq_submit", { channelId: auqChannel, meta: { questions: String(state.questions.length) } });
+            clearAuqState(auqChannel);
+          } else if (action === "cancel") {
+            await tmuxRaw(["send-keys", "-t", state.tmuxTarget, "Escape"]);
+            await interaction.editReply({
+              content: `❌ 已取消 AskUserQuestion（发了 Esc 给 agent）`,
+              components: [],
+            }).catch(() => {});
+            recordMetric("auq_cancel", { channelId: auqChannel });
+            clearAuqState(auqChannel);
+          }
+        } catch (e) {
+          console.error("AUQ button 处理异常:", e);
+        }
+        return;
+      }
+
       // 管理按钮
       const mgmtResult = await handleMgmtButton(id, channelId, interaction.message?.id, discord);
       if (mgmtResult) {
@@ -2328,6 +2373,29 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       const id = interaction.customId;
       const value = interaction.values[0];
       await interaction.deferUpdate().catch(() => {});
+
+      // v2.0.19+: AskUserQuestion 的 select menu —— 用户选完更新 state，等 Submit 按钮
+      // 一并把 selections 翻译成 keystroke 发到 TUI。
+      if (id.startsWith("auq:") && /:q\d+$/.test(id)) {
+        try {
+          const { auqStates } = await import("./bridge/ask-user-question.js");
+          const parts = id.split(":");
+          const auqChannel = parts[1];
+          const qIdxStr = parts[2].slice(1); // q0 -> 0
+          const qIdx = parseInt(qIdxStr, 10);
+          const state = auqStates.get(auqChannel);
+          if (state && Number.isInteger(qIdx) && qIdx >= 0 && qIdx < state.questions.length) {
+            // interaction.values 是 string[]，每个是 option index 字符串
+            state.selections[qIdx] = interaction.values
+              .map((v) => parseInt(v, 10))
+              .filter((n) => Number.isInteger(n) && n >= 0 && n < state.questions[qIdx].options.length);
+            console.log(`🎛 AUQ Q${qIdx + 1} 选了 ${state.selections[qIdx].length} 项 (channel=${auqChannel})`);
+          }
+        } catch (e) {
+          console.error("AUQ select 处理异常:", e);
+        }
+        return;
+      }
 
       // TUI modal 选择器
       if (id.startsWith("modal:")) {
@@ -3548,6 +3616,15 @@ setInterval(() => {
       console.log(`🧹 pendingInterAgentMsg stale: 清掉 ${channelId}（来自 ${pending.fromLabel}）`);
     }
   }
+  // v2.0.19+: AskUserQuestion state，留 30 min 给用户慢慢选
+  import("./bridge/ask-user-question.js").then(({ auqStates }) => {
+    for (const [channelId, state] of auqStates.entries()) {
+      if (now - state.ts > 30 * 60_000) {
+        auqStates.delete(channelId);
+        console.log(`🧹 auqStates stale: 清掉 ${channelId}（${state.questions.length} 问，30min 没 submit）`);
+      }
+    }
+  }).catch(() => { /* non-critical */ });
 }, 60_000).unref();
 
 /** 返回跟 channelId 共享同一个 ws 的所有其他 channelId（不含自身）。

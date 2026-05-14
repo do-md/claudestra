@@ -185,6 +185,24 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
         if (entry.type === "assistant") {
           const content = entry.message?.content;
           if (!Array.isArray(content)) continue;
+
+          // v2.0.19+: AskUserQuestion (Claude Code 内建) 弹多选 modal —— Discord 用户
+          // 没法 tmux attach 按键。识别到就把 questions 渲染成 Discord select menu。
+          // 渲染完跳过本 assistant entry 的其他处理（不进 textQueue / tools），由
+          // AUQ 自己的交互回路驱动。
+          try {
+            const { detectAskUserQuestion, postAskUserQuestionMessage, auqStates } =
+              await import("./ask-user-question.js");
+            const questions = detectAskUserQuestion(content);
+            if (questions && !auqStates.has(state.channelId)) {
+              const tmuxTarget = `master:${state.agentName}`;
+              postAskUserQuestionMessage(discord, state.channelId, tmuxTarget, questions)
+                .catch((e) => console.error("AUQ post 失败:", e));
+              console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) → posted Discord components for ${state.agentName}`);
+              continue; // 跳过本 entry 的 tool/text 处理
+            }
+          } catch (e) { /* non-critical */ }
+
           const hasReply = content.some((b: any) => b.type === "tool_use" && isHiddenTool(b.name));
           const hasNewTools = content.some((b: any) => b.type === "tool_use" && b.name && !isHiddenTool(b.name));
 
