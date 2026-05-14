@@ -131,11 +131,32 @@ function getJsonlPath(cwd: string, sessionId: string): string {
 
 /**
  * 处理 jsonl 新增数据：读新字节、解析 entry、推 tool/text 到队列。
- * 并发时以 state.processing 作锁。hoist 到模块级，Stop hook 也能直接调来"强制
- * 吃完 jsonl 再 flush"（见 drainChannelWatcher）。
+ * 并发时以 state.processing 作锁，**且后到的调用必须等前一次跑完**（而不是 bail）—
+ * 见下面 v2.0.18 注释。hoist 到模块级，Stop hook 也能直接调来"强制吃完 jsonl 再
+ * flush"（见 drainChannelWatcher）。
  */
 async function processNewData(state: WatcherState, discord: Client): Promise<void> {
-  if (state.processing) return;
+  // v2.0.18+ race fix: 之前是 `if (state.processing) return` 直接 bail。问题：
+  // Claude Code 写入 jsonl → fs.watch fire → 第一次 processNewData 进 await stat /
+  // await read 阶段（async I/O，要十几到上百 ms）→ 期间 Stop hook 抵达 →
+  // drainChannelWatcher 调 processNewData 看到 state.processing=true 立刻 return →
+  // drain 跑到 flushText 时 textQueue 还是空（第一次 push 还没发生）→ 用户只看到
+  // 「✅ 完成」空通知。
+  //
+  // 改成"等上一次跑完再做"。两路 processNewData 序列化：第一次 push 完了第二次
+  // 才进，第二次的 newStat 看到 lastSize 已被更新，没新数据，直接退出 —— 但此时
+  // textQueue 已经被第一次填好了，drain 后续的 flush 就能拿到。
+  //
+  // 锁等待带 5s 上限防 hang（理论上不应该；processNewData 内部 await 都是 fs / parse，
+  // 不会卡住）。
+  const lockWaitStart = Date.now();
+  while (state.processing) {
+    if (Date.now() - lockWaitStart > 5000) {
+      console.error(`⚠️ processNewData 等锁超过 5s 放弃，agent=${state.agentName}`);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
   state.processing = true;
   try {
     const newStat = await stat(state.jsonlPath);
