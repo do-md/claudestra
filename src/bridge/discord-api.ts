@@ -2,7 +2,7 @@
  * Discord API 操作：发消息、获取历史、反应、编辑、创建/删除频道
  */
 
-import { TextChannel, type Client } from "discord.js";
+import { TextChannel, PermissionFlagsBits, type Client } from "discord.js";
 import { buildComponents } from "./components.js";
 
 let botUserId: string | null = null;
@@ -153,21 +153,63 @@ export async function discordCreateChannel(
       (c) => c.name === categoryName && c.type === 4
     );
     if (!cat) {
-      // category 不存在，自动创建
+      // category 不存在，自动创建。注意：新建 category 也要 deny 已知的 peer bot，
+      // 否则之后 category 下面的频道继承"无 override" → peer 默认可见。
       cat = await guild.channels.create({
         name: categoryName,
         type: 4, // GuildCategory
+        permissionOverwrites: await buildPeerDenyOverrides(guild),
       });
     }
     parentId = cat?.id;
   }
 
+  // v2.0.20+ 新频道创建时直接带 peer bot 的 deny ViewChannel overrides，避免新建的
+  // agent 频道被 peer 可见。之前的 scopePeerToAgentExchange 只在 peer 加入瞬间扫一次
+  // 当时已存在的频道；以后通过 manager.ts create 新建的频道没在那一次循环里、
+  // category 也可能在 peer scope 之后才生 → peer 默认能看到。这里在 create 时
+  // 直接显式 deny 兜住。
   const ch = await guild.channels.create({
     name,
     parent: parentId,
     topic: `Claude Code agent channel`,
+    permissionOverwrites: await buildPeerDenyOverrides(guild),
   });
   return ch.id;
+}
+
+/**
+ * v2.0.20+ 读 peers.json 列出所有已知 peer bot，找到他们在本 guild 的 managed
+ * role，返回适合塞到 `guild.channels.create({ permissionOverwrites })` 的数组：
+ * 每个 peer role 都 deny ViewChannel。peers.json 没条目就返回空数组。
+ *
+ * 注意只 deny ViewChannel —— 不动 SendMessages 之类，让 #agent-exchange 的允许
+ * 路径单独管理。
+ */
+async function buildPeerDenyOverrides(guild: any): Promise<any[]> {
+  try {
+    const { readPeers } = await import("../lib/peers.js");
+    const peers = await readPeers();
+    if (!peers.peerBots || peers.peerBots.length === 0) return [];
+    const overrides: any[] = [];
+    for (const pb of peers.peerBots) {
+      let role = guild.roles?.cache?.find?.(
+        (r: any) => r.managed && r.tags?.botId === pb.id
+      );
+      if (!role) {
+        try { await guild.roles?.fetch?.(); } catch { /* non-critical */ }
+        role = guild.roles?.cache?.find?.(
+          (r: any) => r.managed && r.tags?.botId === pb.id
+        );
+      }
+      if (role) {
+        overrides.push({ id: role.id, deny: [PermissionFlagsBits.ViewChannel] });
+      }
+    }
+    return overrides;
+  } catch {
+    return [];
+  }
 }
 
 export async function discordDeleteChannel(
