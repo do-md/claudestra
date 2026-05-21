@@ -55,6 +55,8 @@ export const BUILTIN_COMMANDS: BuiltinCmd[] = [
   { name: "stats", invokeName: "stats", description: "使用统计（每日用量、历史、streak）", options: [], argBuilder: () => "" },
   { name: "reload-plugins", invokeName: "reload-plugins", description: "重载所有 plugin 以应用更改", options: [], argBuilder: () => "" },
   { name: "sandbox", invokeName: "sandbox", description: "切换 sandbox 模式", options: [], argBuilder: () => "" },
+  { name: "tasks", invokeName: "tasks", description: "列出 / 管理后台任务", options: [], argBuilder: () => "" },
+  { name: "release-notes", invokeName: "release-notes", description: "显示 Claude Code 更新日志", options: [], argBuilder: () => "" },
 
   // —— 动作 ——
   {
@@ -70,6 +72,34 @@ export const BUILTIN_COMMANDS: BuiltinCmd[] = [
     description: "分析当前 diff 找安全漏洞",
     options: [],
     argBuilder: () => "",
+  },
+  {
+    name: "code-review",
+    invokeName: "code-review",
+    description: "多 agent 代码审查（逻辑错误/安全漏洞/回归），可选传 PR",
+    options: [{ name: "pr", description: "PR 号或 URL", type: "string" }],
+    argBuilder: simpleStringArg("pr"),
+  },
+  {
+    name: "goal",
+    invokeName: "goal",
+    description: "设定目标，Claude 跨轮次工作直到达成（clear 清除）",
+    options: [{ name: "condition", description: "目标达成条件，或 clear 清除", type: "string" }],
+    argBuilder: simpleStringArg("condition"),
+  },
+  {
+    name: "branch",
+    invokeName: "branch",
+    description: "从当前对话此处分叉一个分支（alias /fork）",
+    options: [{ name: "name", description: "分支名（可选）", type: "string" }],
+    argBuilder: simpleStringArg("name"),
+  },
+  {
+    name: "export",
+    invokeName: "export",
+    description: "导出当前对话为纯文本（带文件名直接写文件）",
+    options: [{ name: "filename", description: "输出文件名（可选）", type: "string" }],
+    argBuilder: simpleStringArg("filename"),
   },
   {
     name: "plan",
