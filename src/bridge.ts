@@ -2155,10 +2155,17 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       ];
       if (promptBtnPrefixes.some((p) => id.startsWith(p))) {
         const [action, targetChannelId] = id.split(":");
-        // 按钮对应的 Claude Code 选项键
-        const keyMap: Record<string, string> = {
-          perm_allow: "1", perm_allow_session: "2", perm_deny: "3",
-          session_summary: "1", session_full: "2", session_noask: "3",
+        // 按钮对应的 Claude Code 按键**序列**。
+        // v2.0.22+: session-idle modal 不接受 digit 跳转（按 "2" 不会跳到 option 2，
+        // Enter 还是确认高亮的 option 1 = 从摘要恢复 = compact）。改用 arrow nav：
+        // 光标默认在 option 1，Down 一次到 2，两次到 3。perm 弹窗保留 digit（实测可用）。
+        const keySeqMap: Record<string, string[]> = {
+          perm_allow: ["1", "Enter"],
+          perm_allow_session: ["2", "Enter"],
+          perm_deny: ["3", "Enter"],
+          session_summary: ["Enter"],              // option 1（高亮默认）
+          session_full: ["Down", "Enter"],         // ↓ 到 option 2
+          session_noask: ["Down", "Down", "Enter"],// ↓↓ 到 option 3
         };
         const labelMap: Record<string, string> = {
           perm_allow: "✅ 已允许",
@@ -2168,10 +2175,10 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
           session_full: "📜 恢复完整会话",
           session_noask: "🔕 不再询问",
         };
-        const key = keyMap[action];
+        const keySeq = keySeqMap[action] || ["Enter"];
         const isPermBtn = action.startsWith("perm_");
         const isIdleBtn = action.startsWith("session_");
-        console.log(`🔔 弹窗响应: channel=${targetChannelId} action=${action} key=${key}`);
+        console.log(`🔔 弹窗响应: channel=${targetChannelId} action=${action} keys=${keySeq.join(" ")}`);
         try {
           const listResult = await runManager("list");
           const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
@@ -2201,7 +2208,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
           }
 
           const proc = Bun.spawn(
-            ["tmux", "-S", TMUX_SOCK, "send-keys", "-t", `master:${agent.name}`, key, "Enter"],
+            ["tmux", "-S", TMUX_SOCK, "send-keys", "-t", `master:${agent.name}`, ...keySeq],
             { stdout: "pipe", stderr: "pipe" }
           );
           await proc.exited;

@@ -448,13 +448,18 @@ async function cmdCreate(
     await tmuxSendLine(target, cmd);
 
     // 4. 轮询等待就绪 — 60s budget，与 restart 的 startClaudeInWindow 对齐
+    let sessionIdlePicked = false;
     for (let i = 0; i < 120; i++) {
       await Bun.sleep(500);
       const pane = await captureLast(tmuxName, 10);
-      // Session 闲置弹窗 → watcher 会通知用户，这里当成就绪返回
+      // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不卡着等用户点按钮
       if (detectSessionIdlePrompt(pane)) {
-        ready = true;
-        break;
+        if (!sessionIdlePicked) {
+          await pickFullResume(target);
+          sessionIdlePicked = true;
+          await Bun.sleep(1500);
+        }
+        continue;
       }
       if (hasPromptToConfirm(pane)) {
         await tmuxRaw(["send-keys", "-t", target, "Enter"]);
@@ -608,13 +613,18 @@ async function cmdResume(
     await tmuxSendLine(target, cmd);
 
     // 轮询等待 — 60s budget，与 restart 的 startClaudeInWindow 对齐
+    let sessionIdlePicked = false;
     for (let i = 0; i < 120; i++) {
       await Bun.sleep(500);
       const pane = await captureLast(tmuxName, 10);
-      // Session 闲置弹窗 → watcher 会通知用户，这里当成就绪返回
+      // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不卡着等用户点按钮
       if (detectSessionIdlePrompt(pane)) {
-        ready = true;
-        break;
+        if (!sessionIdlePicked) {
+          await pickFullResume(target);
+          sessionIdlePicked = true;
+          await Bun.sleep(1500);
+        }
+        continue;
       }
       if (hasPromptToConfirm(pane)) {
         await tmuxRaw(["send-keys", "-t", target, "Enter"]);
@@ -859,6 +869,23 @@ function isAtShell(pane: string): boolean {
  */
 const hasPromptToConfirm = (pane: string) => isAutoConfirmableModal(pane);
 
+/**
+ * v2.0.22+: 检测到 session-idle 弹窗时自动选「恢复完整会话」(option 2)。
+ *
+ *   ❯ 1. Resume from summary (recommended)   ← 默认高亮 = compact，丢上下文
+ *     2. Resume full session as-is            ← 我们要的
+ *     3. Don't ask me again
+ *
+ * 这个 modal **不接受 digit 跳转**（按 "2" 没用，Enter 还是确认高亮的 option 1），
+ * 只能 arrow nav：Down 一次到 option 2 再 Enter。startClaudeInWindow / cmdCreate /
+ * cmdResume 三个就绪轮询都用它，不再卡着等用户点 Discord 按钮。
+ */
+async function pickFullResume(target: string) {
+  await tmuxRaw(["send-keys", "-t", target, "Down"]);
+  await Bun.sleep(150);
+  await tmuxRaw(["send-keys", "-t", target, "Enter"]);
+}
+
 /** 优雅退出一个 Claude Code agent，处理所有确认弹窗 */
 async function gracefulExit(name: string): Promise<boolean> {
   const target = windowTarget(name);
@@ -948,6 +975,7 @@ async function startClaudeInWindow(
   await tmuxSendLine(target, claudeCmd);
 
   // 轮询处理各种确认提示，最多等 60 秒
+  let sessionIdlePicked = false;
   for (let i = 0; i < 120; i++) {
     await Bun.sleep(500);
     const pane = await captureLast(name, 10);
@@ -955,10 +983,15 @@ async function startClaudeInWindow(
     // Claude Code 就绪
     if (isClaudeReady(pane)) return true;
 
-    // Session 闲置弹窗 → 不自动确认，交给 permission-watcher 通知用户
-    // 当作"就绪"返回，cmdCreate/cmdResume 会保存 registry，watcher 会发 Discord 按钮
+    // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不再卡着等用户点按钮。
+    // picked 标记防止重复发键；发完给加载留窗口，下轮再判 ready。
     if (detectSessionIdlePrompt(pane)) {
-      return true;
+      if (!sessionIdlePicked) {
+        await pickFullResume(target);
+        sessionIdlePicked = true;
+        await Bun.sleep(1500);
+      }
+      continue;
     }
 
     // 有确认提示 → 按 Enter
