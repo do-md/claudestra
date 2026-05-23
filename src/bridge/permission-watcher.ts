@@ -20,8 +20,16 @@ import { runManager } from "./management.js";
 
 const POLL_INTERVAL_MS = 8_000;
 
+// v2.0.23+: session-idle 兜底 grace。manager.ts/launcher.ts 启动路径会自动选
+// 「恢复完整会话」，几秒内消掉 modal。watcher 不该抢在它前面发按钮（重启时
+// 每个 agent 都会闪一下 modal → 一堆 @ 你的噪音通知，但 modal 早被自动消了）。
+// 只有 modal 撑过这个 grace 还在（说明自动选真失败了）才发按钮兜底。
+const SESSION_IDLE_GRACE_MS = 20_000;
+
 // channelId → 最近一次通知的 modal key。防止同一弹窗重复推送。
 const lastNotified = new Map<string, string>();
+// channelId → 首次看到 session-idle modal 的时间戳（grace 计时用）
+const sessionIdleFirstSeen = new Map<string, number>();
 // channelId → Discord 消息 ID（用于点击按钮后编辑）
 export const permissionMessages = new Map<string, string>();
 
@@ -57,6 +65,20 @@ async function checkAgent(
   // 两种弹窗共用一个 channel 级别的 slot，同时只会有一种出现
   const sessionIdleDesc = detectSessionIdlePrompt(pane);
   const permissionDesc = sessionIdleDesc ? null : detectRuntimePermissionPrompt(pane);
+
+  // v2.0.23+: session-idle grace —— 启动路径会自动选「完整恢复」消掉 modal。
+  // modal 没撑过 grace 就不发按钮（避免重启 race 噪音）；撑过了才兜底。
+  if (!sessionIdleDesc) {
+    sessionIdleFirstSeen.delete(channelId);
+  } else {
+    const firstSeen = sessionIdleFirstSeen.get(channelId);
+    if (firstSeen === undefined) {
+      sessionIdleFirstSeen.set(channelId, Date.now());
+      return; // 第一次看到，给自动选留时间，先不发
+    }
+    if (Date.now() - firstSeen < SESSION_IDLE_GRACE_MS) return; // 还在 grace 内
+    // 撑过 grace 仍在 → 自动选大概率失败，往下走正常发按钮兜底
+  }
 
   const key = computeModalKey(sessionIdleDesc, permissionDesc);
   if (!key) {
@@ -146,4 +168,5 @@ export function startPermissionWatcher(
 export function clearPermissionMessage(channelId: string) {
   permissionMessages.delete(channelId);
   lastNotified.delete(channelId);
+  sessionIdleFirstSeen.delete(channelId);
 }

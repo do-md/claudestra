@@ -2084,6 +2084,24 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         return;
       }
 
+      // v2.0.23+: agent 掉线（claude 退到 shell）的重启按钮
+      if (id.startsWith("wedge_restart:")) {
+        const agentName = id.slice("wedge_restart:".length);
+        try {
+          await interaction.followUp({ content: `🔄 正在重启 ${agentName}...`, ephemeral: true }).catch(() => {});
+          const result = await runManager("restart", agentName);
+          clearWedgeState(agentName);
+          const ok = result?.ok;
+          await interaction.followUp({
+            content: ok ? `✅ ${agentName} 已重启` : `❌ 重启失败: ${result?.error || result?.message || "未知错误"}`,
+            ephemeral: true,
+          }).catch(() => {});
+        } catch (e) {
+          await interaction.followUp({ content: `❌ 重启失败: ${(e as Error).message}`, ephemeral: true }).catch(() => {});
+        }
+        return;
+      }
+
       // 打断按钮
       if (id.startsWith("interrupt:")) {
         const targetChannelId = id.slice("interrupt:".length);

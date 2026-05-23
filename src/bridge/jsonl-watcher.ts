@@ -124,9 +124,25 @@ async function flushText(state: WatcherState, discord: Client) {
   state.tools = state.tools.filter(t => !t.done);
 }
 
-function getJsonlPath(cwd: string, sessionId: string): string {
+export function getJsonlPath(cwd: string, sessionId: string): string {
   const dir = "-" + cwd.replace(/^\//, "").replace(/\//g, "-");
   return join(process.env.HOME || "~", ".claude", "projects", dir, `${sessionId}.jsonl`);
+}
+
+/**
+ * agent session jsonl 的最近写入时间（ms epoch），没有则 null。
+ *
+ * 用于 wedge-watcher 判断 agent 是否真在干活：Claude 思考 / 调工具时 jsonl 一直
+ * 在追加，mtime 会很新。只看 tmux pane 指纹会把"思考中但屏幕暂时没变"误判成卡死，
+ * jsonl mtime 是权威进度信号。
+ */
+export async function getJsonlMtime(cwd: string, sessionId: string): Promise<number | null> {
+  try {
+    const s = await stat(getJsonlPath(cwd, sessionId));
+    return s.mtimeMs;
+  } catch {
+    return null;
+  }
 }
 
 /**

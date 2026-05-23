@@ -36,6 +36,7 @@ import {
   detectSessionIdlePrompt,
   clearShellInitPrompts,
   isClaudeReady,
+  isAtShell,
 } from "./lib/tmux-helper.js";
 import {
   buildClaudeCommand,
@@ -845,24 +846,6 @@ async function cmdRename(oldName: string, newName: string) {
  * 用户反馈 v1.7.4 的坑：oh-my-zsh "robbyrussell" 主题用 ➜，原来的
  * /[%$]/ 正则认不出来导致 restart 永远"启动超时"。
  */
-function isAtShell(pane: string): boolean {
-  const nonEmpty = pane.split("\n").filter((l) => l.trim());
-  const tail = nonEmpty.slice(-5).join("\n");
-  // 如果底部有 Claude Code TUI 标志，肯定不在 shell
-  if (/bypass permissions|esc to interrupt|esc to cancel/i.test(tail)) return false;
-  if (/^\s*❯\s*\d+\./m.test(tail)) return false;
-  const lastLine = nonEmpty.pop() || "";
-  // 常见 shell prompt 收尾字符：$ (bash/sh)、% (zsh default)、# (root)、> (fish/cmd)、
-  // ❯ (starship / pure 主题 — 依赖上面的 Claude TUI exclusion 判断不是 Claude 的输入框)、
-  // » (pure)、λ (lambda prompt)
-  if (/[%$#>❯»λ]\s*$/.test(lastLine)) return true;
-  // oh-my-zsh robbyrussell 主题：prompt 不一定以 ➜ 结尾，常见形式是
-  // "➜  <dir> git:(<branch>) ✗" 之类，结尾是 `)` / `✗` / 路径文字。
-  // 只要最后一行里包含 `➜  <非空>`（箭头+空格+目录），就当作在 shell。
-  if (/➜\s+\S/.test(lastLine)) return true;
-  return false;
-}
-
 /**
  * Agent 用：几何识别 modal 自动确认；session-idle 不自动按（permission-watcher
  * 会发 Discord 按钮让用户决定）。
@@ -954,11 +937,15 @@ async function gracefulExit(name: string): Promise<boolean> {
   return isAtShell(check);
 }
 
-/** 在已有的 tmux window 里启动 Claude Code，处理所有确认弹窗 */
+/**
+ * 在已有的 tmux window 里启动 Claude Code，处理所有确认弹窗。
+ * 返回 ready（是否就绪）+ recoveredFullSession（是否自动选了「恢复完整会话」，
+ * 用于给频道发一条正面"已恢复"信号，取代 watcher 的按钮噪音）。
+ */
 async function startClaudeInWindow(
   name: string,
   claudeCmd: string
-): Promise<boolean> {
+): Promise<{ ready: boolean; recoveredFullSession: boolean }> {
   const target = windowTarget(name);
 
   // 确保在 shell 提示符
@@ -967,7 +954,7 @@ async function startClaudeInWindow(
     // 等一下 shell
     await Bun.sleep(2000);
     const retry = await captureLast(name, 3);
-    if (!isAtShell(retry)) return false;
+    if (!isAtShell(retry)) return { ready: false, recoveredFullSession: false };
   }
 
   // 发送启动命令前先清掉 shell init 阶段可能存在的 Y/n 交互（oh-my-zsh / homebrew）
@@ -981,7 +968,7 @@ async function startClaudeInWindow(
     const pane = await captureLast(name, 10);
 
     // Claude Code 就绪
-    if (isClaudeReady(pane)) return true;
+    if (isClaudeReady(pane)) return { ready: true, recoveredFullSession: sessionIdlePicked };
 
     // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不再卡着等用户点按钮。
     // picked 标记防止重复发键；发完给加载留窗口，下轮再判 ready。
@@ -1006,7 +993,7 @@ async function startClaudeInWindow(
   // 严格条件 isClaudeReady 同时要求 ❯ 和 "bypass permissions"，避免 ❯ 出现在
   // "❯ 1. I am using this for local development" 这类选项菜单里被误判。
   const final = await captureLast(name, 10);
-  return isClaudeReady(final);
+  return { ready: isClaudeReady(final), recoveredFullSession: sessionIdlePicked };
 }
 
 async function cmdRestart(name?: string) {
@@ -1083,10 +1070,21 @@ async function cmdRestart(name?: string) {
     const started = await startClaudeInWindow(tmuxName, cmd);
     results.push({
       name: tmuxName,
-      ok: started,
-      error: started ? undefined : "启动超时",
+      ok: started.ready,
+      error: started.ready ? undefined : "启动超时",
       recreated: recreated || undefined,
     });
+
+    // v2.0.23+: 自动恢复了完整会话 → 给该 agent 频道发一条正面"已恢复"信号，
+    // 取代 permission-watcher 那条让人摸不清状态的 session-idle 按钮消息。
+    // 只在确实命中 session-idle 弹窗时发；普通秒级重启不打扰。
+    if (started.ready && started.recoveredFullSession) {
+      await bridgeRequest({
+        type: "reply",
+        chatId: info.channelId,
+        text: `✅ ${displayName} 已重启，自动恢复完整会话（无 compact，上下文保留）`,
+      }).catch(() => { /* 通知失败不影响重启结果 */ });
+    }
   }
 
   // 重启后做一次完整 skill 重扫（每个 agent cwd 可能项目级 skill 有变动）

@@ -9,6 +9,8 @@ import {
   isAutoConfirmableModal,
   isClaudeReady,
   paneLooksIdle,
+  isAtShell,
+  detectSessionIdlePrompt,
 } from "../src/lib/tmux-helper.js";
 
 describe("parseModalOptions", () => {
@@ -415,5 +417,124 @@ Enter to confirm · Esc to cancel
   ⏵⏵ bypass permissions on (shift+tab to cycle)
 `;
     expect(paneLooksIdle(pane)).toBe(true);
+  });
+});
+
+describe("isAtShell", () => {
+  // 核心 bug：starship / pure 主题 shell 提示符就是 ❯，跟 claude 输入框同符号。
+  // claude 退出后 pane 停在 shell ❯，必须判成 at-shell（掉线），不能当成 claude
+  // 卡死（wedge-watcher 之前对这种每小时误报）。
+  test("starship/pure shell 提示符 ❯ 结尾 → true", () => {
+    const pane = `
+❯ /exit
+  ⎿  Catch you later!
+
+~/repos/router ❯`;
+    expect(isAtShell(pane)).toBe(true);
+  });
+
+  test("裸 ❯ shell 提示符 → true", () => {
+    expect(isAtShell(`❯`)).toBe(true);
+  });
+
+  test("zsh 默认 % 结尾 → true", () => {
+    expect(isAtShell(`shawn@mac repos %`)).toBe(true);
+  });
+
+  test("bash $ 结尾 → true", () => {
+    expect(isAtShell(`user@host:~/dir$`)).toBe(true);
+  });
+
+  test("oh-my-zsh robbyrussell ➜ → true", () => {
+    expect(isAtShell(`➜  router git:(main) ✗`)).toBe(true);
+  });
+
+  test("claude 在跑（有 bypass banner）→ false，即使行尾是 ❯", () => {
+    const pane = `
+─── router ──
+❯
+─────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`;
+    expect(isAtShell(pane)).toBe(false);
+  });
+
+  test("claude 跑工具中（esc to interrupt）→ false", () => {
+    const pane = `
+✶ Working... (5s)
+─── router ──
+❯ ▎
+  ⏵⏵ bypass permissions on · esc to interrupt`;
+    expect(isAtShell(pane)).toBe(false);
+  });
+
+  test("session-idle 选项菜单（❯ 1.）→ false（claude 在跑的 modal）", () => {
+    const pane = `
+This session is 5h old.
+❯ 1. Resume from summary
+  2. Resume full session`;
+    expect(isAtShell(pane)).toBe(false);
+  });
+});
+
+describe("detectSessionIdlePrompt", () => {
+  test("真 session-idle 弹窗（底部，无 banner）→ 返回描述", () => {
+    const pane = `
+some scrollback
+This session is 5h 6m old and 485.2k tokens.
+Resuming the full session will consume a substantial portion of your usage limits.
+
+❯ 1. Resume from summary (recommended)
+  2. Resume full session as-is
+  3. Don't ask me again
+
+Enter to confirm · Esc to cancel`;
+    const desc = detectSessionIdlePrompt(pane);
+    expect(desc).not.toBeNull();
+    expect(desc).toContain("5h 6m old");
+  });
+
+  test("核心 bug：屏幕显示检测器自己的测试源码 + claude 在跑 → null", () => {
+    // owner 编辑 modal-parser.test.ts，pane 里显示着这段 fixture（含 ❯ 1. Resume
+    // from summary），但底部是 claude 正常运行的 bypass banner。不能误判成真弹窗。
+    const pane = `
+  test("session-idle", () => {
+    const pane = \`
+    ❯ 1. Resume from summary
+      2. Resume full session\`;
+  });
+─── claudestra ──
+❯ ▎
+─────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`;
+    expect(detectSessionIdlePrompt(pane)).toBeNull();
+  });
+
+  test("modal 文字 + 底部 esc to interrupt（claude 工作中）→ null", () => {
+    const pane = `
+✶ Editing... showing diff with ❯ 1. Resume from summary
+  2. Resume full session as-is
+─── agent ──
+❯ ▎
+  ⏵⏵ bypass permissions on · esc to interrupt`;
+    expect(detectSessionIdlePrompt(pane)).toBeNull();
+  });
+
+  test("modal 文字在 scrollback、底部已是纯 shell → null", () => {
+    // 现实：claude 退出后 modal 文字被推到上面，最后几行是 shell 输出 + 提示符
+    const pane = `
+This session is 5h old and 100k tokens.
+❯ 1. Resume from summary
+  2. Resume full session as-is
+  3. Don't ask me again
+output line one
+output line two
+output line three
+output line four
+shawn@mac ~/repos/router %`;
+    expect(detectSessionIdlePrompt(pane)).toBeNull();
+  });
+
+  test("无 modal 文字 → null", () => {
+    expect(detectSessionIdlePrompt(`just normal output\n❯ ▎`)).toBeNull();
   });
 });

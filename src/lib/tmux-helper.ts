@@ -171,6 +171,35 @@ export function isClaudeReady(pane: string): boolean {
 }
 
 /**
+ * Claude Code 是否已退出、pane 停在 shell 提示符。
+ *
+ * 关键：用户的 zsh 主题（starship / pure）shell 提示符就是 `❯`，跟 Claude Code
+ * 的输入框符号一样。所以**先**用 Claude TUI 标志（bypass permissions / esc to
+ * interrupt / ❯ N. 选项菜单）排除"claude 还在跑"，**再**看最后一行是不是常见
+ * shell prompt 收尾字符。两步顺序不能反，否则 shell 的 ❯ 会被当成 claude 输入框。
+ *
+ * 用途：wedge-watcher 靠它区分"claude 卡住"（要救援）和"claude 已退出到 shell"
+ * （是掉线，不是卡死，发 Esc/C-c 没用）。launch / gracefulExit 也用它判 shell 就绪。
+ */
+export function isAtShell(pane: string): boolean {
+  const nonEmpty = pane.split("\n").filter((l) => l.trim());
+  const tail = nonEmpty.slice(-5).join("\n");
+  // 如果底部有 Claude Code TUI 标志，肯定不在 shell
+  if (/bypass permissions|esc to interrupt|esc to cancel/i.test(tail)) return false;
+  if (/^\s*❯\s*\d+\./m.test(tail)) return false;
+  const lastLine = nonEmpty.pop() || "";
+  // 常见 shell prompt 收尾字符：$ (bash/sh)、% (zsh default)、# (root)、> (fish/cmd)、
+  // ❯ (starship / pure 主题 — 依赖上面的 Claude TUI exclusion 判断不是 Claude 的输入框)、
+  // » (pure)、λ (lambda prompt)
+  if (/[%$#>❯»λ]\s*$/.test(lastLine)) return true;
+  // oh-my-zsh robbyrussell 主题：prompt 不一定以 ➜ 结尾，常见形式是
+  // "➜  <dir> git:(<branch>) ✗" 之类，结尾是 `)` / `✗` / 路径文字。
+  // 只要最后一行里包含 `➜  <非空>`（箭头+空格+目录），就当作在 shell。
+  if (/➜\s+\S/.test(lastLine)) return true;
+  return false;
+}
+
+/**
  * 检测 pane 上是否有"可以安全自动按 Enter 确认"的 modal。
  *
  * 先用 parseModalOptions 做几何识别（必须有 ❯ 标记的选项菜单）。检测到 modal
@@ -204,15 +233,32 @@ export function isAutoConfirmableModal(
  * 返回弹窗描述，没有返回 null。
  */
 export function detectSessionIdlePrompt(pane: string): string | null {
-  if (!pane.includes("❯ 1.")) return null;
+  const lines = pane.split("\n");
+  // v2.0.23+: 只看 pane 底部 —— 真 session-idle 弹窗总在最底下。之前 pane.includes
+  // 扫**全 pane**，会把 scrollback 里显示的代码 / 输出当成真弹窗误报。实测：owner 编辑
+  // 本检测器自己的测试 fixture（"❯ 1. Resume from summary" 之类）时，claudestra 的屏幕
+  // 上就显示着这段源码，detectSessionIdlePrompt 把它当成真弹窗，permission-watcher
+  // 发了条假的"session 已闲置"通知。parseModalOptions 早就只看底部 30 行，这里对齐。
+  const tail = lines.slice(-20).join("\n");
+  if (!tail.includes("❯ 1.")) return null;
   // Claude Code 的 session resume 提示特征文字
-  if (pane.includes("Resume from summary") || pane.includes("Resuming the full session")) {
-    // 提取说明行（"This session is 21h 6m old and 913.2k tokens"）
-    const m = pane.match(/This session is ([\s\S]+?tokens?)\./i)
-      || pane.match(/This session is ([^\n]+)/i);
-    return m ? m[1].trim().slice(0, 150) : "Session 闲置提示";
+  if (!(tail.includes("Resume from summary") || tail.includes("Resuming the full session"))) {
+    return null;
   }
-  return null;
+  // v2.0.23+: 负向 guard —— 真弹窗会盖住输入框，底部不会有 bypass / esc-to-interrupt
+  // 状态栏。claude 正常运行时这俩永远钉在最底下；如果底部还有它们，说明那段 modal
+  // 文字只是屏幕上显示的内容（源码 / 工具输出），claude 没真弹窗。
+  const lastFew = lines.slice(-8).join("\n");
+  if (/bypass permissions|esc to interrupt/i.test(lastFew)) return null;
+  // v2.0.23+: 底部已是 shell 提示符 → claude 已退出，那段 modal 文字只是 scrollback
+  // 残留（比如从弹窗按 Esc 退出后）。真弹窗有 "❯ N." 选项 / "Esc to cancel"，
+  // isAtShell 对它必返回 false，所以这条只挡"已退到 shell"的残留误判。
+  if (isAtShell(pane)) return null;
+
+  // 提取说明行（"This session is 21h 6m old and 913.2k tokens"）
+  const m = tail.match(/This session is ([\s\S]+?tokens?)\./i)
+    || tail.match(/This session is ([^\n]+)/i);
+  return m ? m[1].trim().slice(0, 150) : "Session 闲置提示";
 }
 
 /**
