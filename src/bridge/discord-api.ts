@@ -2,7 +2,7 @@
  * Discord API 操作：发消息、获取历史、反应、编辑、创建/删除频道
  */
 
-import { TextChannel, PermissionFlagsBits, type Client } from "discord.js";
+import { TextChannel, PermissionFlagsBits, OverwriteType, type Client } from "discord.js";
 import { buildComponents } from "./components.js";
 
 let botUserId: string | null = null;
@@ -179,34 +179,27 @@ export async function discordCreateChannel(
 }
 
 /**
- * v2.0.20+ 读 peers.json 列出所有已知 peer bot，找到他们在本 guild 的 managed
- * role，返回适合塞到 `guild.channels.create({ permissionOverwrites })` 的数组：
- * 每个 peer role 都 deny ViewChannel。peers.json 没条目就返回空数组。
+ * 读 peers.json 列出所有已知 peer bot，返回 deny ViewChannel 的 permissionOverwrites，
+ * 供 `guild.channels.create({ permissionOverwrites })` 用。peers.json 没条目返回空数组。
  *
- * 注意只 deny ViewChannel —— 不动 SendMessages 之类，让 #agent-exchange 的允许
- * 路径单独管理。
+ * v2.2.0+ 关键修复：**按 peer bot 的 user id 直接 deny（member overwrite）**，不再去
+ * 查它的 managed role。之前查 role 用 `guild.roles.cache.find(... tags.botId ...)`，
+ * bridge 刚重启时 guild role 缓存是冷的 → 查不到 role → 返回空 → 新建的 agent 频道
+ * 没带 deny → **被 peer bot 看见**（owner 实测：重启后建的测试频道全被 peer 拿到访问）。
+ * bot user id 从 peers.json 直接拿，永远可靠，不依赖任何缓存。
+ *
+ * 只 deny ViewChannel —— 不动 SendMessages，#agent-exchange 的 allow 单独管理。
  */
-async function buildPeerDenyOverrides(guild: any): Promise<any[]> {
+async function buildPeerDenyOverrides(_guild: any): Promise<any[]> {
   try {
     const { readPeers } = await import("../lib/peers.js");
     const peers = await readPeers();
     if (!peers.peerBots || peers.peerBots.length === 0) return [];
-    const overrides: any[] = [];
-    for (const pb of peers.peerBots) {
-      let role = guild.roles?.cache?.find?.(
-        (r: any) => r.managed && r.tags?.botId === pb.id
-      );
-      if (!role) {
-        try { await guild.roles?.fetch?.(); } catch { /* non-critical */ }
-        role = guild.roles?.cache?.find?.(
-          (r: any) => r.managed && r.tags?.botId === pb.id
-        );
-      }
-      if (role) {
-        overrides.push({ id: role.id, deny: [PermissionFlagsBits.ViewChannel] });
-      }
-    }
-    return overrides;
+    return peers.peerBots.map((pb) => ({
+      id: pb.id,
+      type: OverwriteType.Member,
+      deny: [PermissionFlagsBits.ViewChannel],
+    }));
   } catch {
     return [];
   }
