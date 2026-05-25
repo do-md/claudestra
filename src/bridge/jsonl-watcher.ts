@@ -145,6 +145,35 @@ export async function getJsonlMtime(cwd: string, sessionId: string): Promise<num
   }
 }
 
+// v2.2.0+: auto-deny 通知去重。一次 deny 可能只产生一条 tool_result，但 agent 之后
+// 又试别的被拦操作会再产生 → 15s 窗口内每个 channel 只弹一次「临时放行」按钮。
+const lastAutoDenyPost = new Map<string, number>();
+async function maybePostAutoDeny(discord: Client, state: WatcherState, reason: string) {
+  const now = Date.now();
+  if (now - (lastAutoDenyPost.get(state.channelId) || 0) < 15_000) return;
+  lastAutoDenyPost.set(state.channelId, now);
+  try {
+    const { buildComponents } = await import("./components.js");
+    const text = [
+      `🚫 **${state.agentName}** 一个操作被 auto 模式拦下了`,
+      reason ? `原因：${reason}` : "",
+      `如果这确实是你要做的，点下面临时放行（切 bypass）并让它重试。`,
+    ].filter(Boolean).join("\n");
+    const components = buildComponents([
+      {
+        type: "buttons",
+        buttons: [
+          { id: `auto_allow:${state.channelId}`, label: "临时放行并重试", emoji: "⚡", style: "primary" },
+        ],
+      },
+    ]);
+    await discordReply(discord, state.channelId, text, undefined, components);
+    console.log(`🚫 auto-deny 通知 agent=${state.agentName} reason="${reason.slice(0, 60)}"`);
+  } catch (e) {
+    console.error("auto-deny 通知失败:", e);
+  }
+}
+
 /**
  * 处理 jsonl 新增数据：读新字节、解析 entry、推 tool/text 到队列。
  * 并发时以 state.processing 作锁，**且后到的调用必须等前一次跑完**（而不是 bail）—
@@ -185,6 +214,26 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
     for (const line of newData.split("\n").filter((l) => l.trim())) {
       try {
         const entry = JSON.parse(line);
+
+        // v2.2.0+: auto-mode classifier 拦截检测。被拦的操作在 jsonl 里是一条
+        // type:"user" 的 tool_result（is_error），内容稳定含 "denied by the Claude
+        // Code auto mode classifier. Reason: …"。检测到 → 频道弹「临时放行」按钮。
+        if (entry.type === "user") {
+          const uc = entry.message?.content;
+          if (Array.isArray(uc)) {
+            for (const b of uc) {
+              if (
+                b?.type === "tool_result" &&
+                typeof b.content === "string" &&
+                /denied by the Claude Code auto mode classifier/i.test(b.content)
+              ) {
+                const rm = b.content.match(/Reason:\s*([\s\S]+?)(?:\.\s+If you|\.\.|$)/i);
+                const reason = rm ? rm[1].trim().replace(/\s+/g, " ").slice(0, 220) : "";
+                maybePostAutoDeny(discord, state, reason).catch(() => {});
+              }
+            }
+          }
+        }
 
         // 显示思考时长（仅展示，不用于完成判断）
         if (entry.type === "system" && entry.subtype === "turn_duration" && entry.durationMs) {

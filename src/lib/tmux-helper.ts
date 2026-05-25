@@ -213,6 +213,45 @@ export function isAtShell(pane: string): boolean {
   return false;
 }
 
+// ────────────────────────────────────────────────
+// 运行时权限模式检测 + Shift+Tab 循环（v2.2.0+ 临时放行功能用）
+// ────────────────────────────────────────────────
+//
+// Claude Code TUI 的 Shift+Tab 按这个顺序循环切换 permission mode（实测，需启动带
+// --allow-dangerously-skip-permissions 才会包含 bypass）：
+//   auto → default → acceptEdits → plan → bypassPermissions → (回到 auto)
+// 用于「auto 拦截 → 一键临时切 bypass 重试 → 切回」：算出从当前模式到目标模式要
+// 按几下 Shift+Tab。
+export const PERMISSION_MODE_CYCLE = [
+  "auto",
+  "default",
+  "acceptEdits",
+  "plan",
+  "bypassPermissions",
+] as const;
+
+/** 从 pane 底部 banner 判断当前 permission mode。default 模式没 banner（只有 ❯）。 */
+export function detectPermissionMode(pane: string): string | null {
+  const tail = pane.split("\n").slice(-6).join("\n");
+  if (/auto mode on/i.test(tail)) return "auto";
+  if (/accept edits on/i.test(tail)) return "acceptEdits";
+  if (/plan mode on/i.test(tail)) return "plan";
+  if (/bypass permissions on/i.test(tail)) return "bypassPermissions";
+  // 无 mode banner 但在 ready 提示符 → default 模式（无 banner）
+  if (/❯/.test(pane.split("\n").slice(-5).join("\n"))) return "default";
+  return null;
+}
+
+/** 从 current 模式切到 target 模式需要按几下 Shift+Tab（沿 PERMISSION_MODE_CYCLE）。
+ *  任一模式不在循环里返回 -1。 */
+export function btabStepsTo(current: string, target: string): number {
+  const ci = (PERMISSION_MODE_CYCLE as readonly string[]).indexOf(current);
+  const ti = (PERMISSION_MODE_CYCLE as readonly string[]).indexOf(target);
+  if (ci < 0 || ti < 0) return -1;
+  const n = PERMISSION_MODE_CYCLE.length;
+  return (ti - ci + n) % n;
+}
+
 /**
  * 检测 pane 上是否有"可以安全自动按 Enter 确认"的 modal。
  *

@@ -227,6 +227,12 @@ export function buildClaudeCommand(opts: LaunchOptions): string {
     parts.push("--dangerously-skip-permissions");
   } else {
     parts.push("--permission-mode", shellEscape(mode));
+    // v2.2.0+: 让 bypass 成为「可运行时切到的选项」（默认仍是上面的 mode）。这样
+    // auto 拦截危险操作后，bridge 能用 Shift+Tab 把 agent 临时切到 bypass 重试，
+    // 不用重启。没这个 flag，bypass 不在 Shift+Tab 循环里、运行时切不过去。
+    // agent 自己提不了权（auto classifier 硬拦自我绕过），只有用户经 Discord 按钮
+    // → bridge → tmux 发 Shift+Tab 才切得动。
+    parts.push("--allow-dangerously-skip-permissions");
   }
 
   if (opts.resumeId) {

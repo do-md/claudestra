@@ -11,6 +11,9 @@ import {
   paneLooksIdle,
   isAtShell,
   detectSessionIdlePrompt,
+  detectPermissionMode,
+  btabStepsTo,
+  PERMISSION_MODE_CYCLE,
 } from "../src/lib/tmux-helper.js";
 
 describe("parseModalOptions", () => {
@@ -570,5 +573,53 @@ describe("多权限模式 banner（v2.0.24 泛化）", () => {
   test("auto 模式跑工具中（esc to interrupt）→ paneLooksIdle false", () => {
     const pane = mk("⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt");
     expect(paneLooksIdle(pane)).toBe(false);
+  });
+});
+
+describe("detectPermissionMode / btabStepsTo（v2.2.0 临时放行）", () => {
+  const mk = (banner: string) => `
+─── agent ──
+❯ ▎
+─────────────
+  ${banner} · ← for agents`;
+
+  test("各模式 banner → 正确 mode", () => {
+    expect(detectPermissionMode(mk("⏵⏵ auto mode on (shift+tab to cycle)"))).toBe("auto");
+    expect(detectPermissionMode(mk("⏵⏵ accept edits on (shift+tab to cycle)"))).toBe("acceptEdits");
+    expect(detectPermissionMode(mk("⏸ plan mode on (shift+tab to cycle)"))).toBe("plan");
+    expect(detectPermissionMode(mk("⏵⏵ bypass permissions on (shift+tab to cycle)"))).toBe("bypassPermissions");
+  });
+
+  test("default 模式（无 banner，只有 ❯）→ default", () => {
+    expect(detectPermissionMode(`some output\n❯ ▎`)).toBe("default");
+  });
+
+  test("纯 shell / 无 ❯ → null", () => {
+    expect(detectPermissionMode(`shawn@mac ~/repos %`)).toBeNull();
+  });
+
+  test("cycle 顺序固定 auto→default→acceptEdits→plan→bypassPermissions", () => {
+    expect([...PERMISSION_MODE_CYCLE]).toEqual([
+      "auto", "default", "acceptEdits", "plan", "bypassPermissions",
+    ]);
+  });
+
+  test("btabStepsTo: auto→bypass = 4，bypass→auto = 1", () => {
+    expect(btabStepsTo("auto", "bypassPermissions")).toBe(4);
+    expect(btabStepsTo("bypassPermissions", "auto")).toBe(1);
+  });
+
+  test("btabStepsTo: 同模式 = 0", () => {
+    expect(btabStepsTo("auto", "auto")).toBe(0);
+  });
+
+  test("btabStepsTo: acceptEdits→bypass = 2，plan→bypass = 1", () => {
+    expect(btabStepsTo("acceptEdits", "bypassPermissions")).toBe(2);
+    expect(btabStepsTo("plan", "bypassPermissions")).toBe(1);
+  });
+
+  test("btabStepsTo: 未知模式 → -1", () => {
+    expect(btabStepsTo("auto", "nope")).toBe(-1);
+    expect(btabStepsTo("nope", "auto")).toBe(-1);
   });
 });
