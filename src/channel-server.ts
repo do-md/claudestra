@@ -48,7 +48,28 @@ let requestCounter = 0;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 
+// v2.2.0+: keepalive —— 定期给 bridge 发 ping，重置 Bun 的 ws idleTimeout，避免空闲
+// 连接被关。bridge 收到 type:"ping" 不做实质处理（收到本身就重置 idle），可回 pong。
+let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+function startKeepalive() {
+  stopKeepalive();
+  keepaliveTimer = setInterval(() => {
+    if (bridgeWs && bridgeWs.readyState === WebSocket.OPEN) {
+      try { bridgeWs.send(JSON.stringify({ type: "ping" })); } catch { /* non-critical */ }
+    }
+  }, 25_000);
+}
+function stopKeepalive() {
+  if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+}
+
 function connectBridge(): Promise<void> {
+  // v2.2.0+: 每次新连接前重置 replaced latch。replaced 是模块级变量，之前从不重置，
+  // 一旦收到过一次（哪怕是重连竞态里发给上一条 ws 的）"replaced"，标记就永久 true，
+  // 之后**任何**断开都会 process.exit(0) → channel-server 进程死掉、Claude Code 不
+  // 自动 respawn → agent 跟 Discord 彻底断、只能手动 /mcp。这里在每次新连接开始时
+  // 清掉残留 latch，只让「当前这条连接确实被取代」时才退出。
+  replaced = false;
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(BRIDGE_URL);
 
@@ -66,6 +87,9 @@ function connectBridge(): Promise<void> {
           cwd: process.cwd(),
         })
       );
+      // v2.2.0+: keepalive ping，防止空闲连接被 Bun idleTimeout 关掉（无 keepalive 时
+      // 长时间不说话的 agent 连接会被关，触发反复重连 flap）。每 25s 发一次。
+      startKeepalive();
     };
 
     ws.onmessage = (event) => {
@@ -121,17 +145,19 @@ function connectBridge(): Promise<void> {
     ws.onclose = (event) => {
       bridgeWs = null;
       registered = false;
+      stopKeepalive();
       // 断开时清理所有未完成请求，避免泄漏
       for (const [id, pending] of pendingRequests.entries()) {
         pending.reject(new Error("Bridge 连接断开"));
         pendingRequests.delete(id);
       }
 
-      // 仅当 bridge 明确告诉我们"你被新连接取代了"（replaced 标记）才退出。
-      // code 1000 只意味着对端干净关闭（比如 bridge 重启），这时应该重连而不是退出 ——
-      // 之前 code 1000 也 exit(0) 的逻辑导致 bridge 重启 = 所有 channel-server 集体死亡，
-      // Claude Code 的 MCP 不会自动 respawn，于是 agent 跟 Discord 的连接彻底断掉。
-      if (replaced) {
+      // 仅当 bridge 明确告诉我们"你被新连接取代了"才退出。判定用**专用 close code
+      // 4001**（v2.2.0+），不再依赖 "replaced" 消息能否在 close 之前送达 —— 之前
+      // bridge 用 close(1000) + 一条 "replaced" 消息，两者有竞态：close 先到时
+      // replaced 标记还没置上 → 误重连，置上后又永久 latch（见 connectBridge 注释）。
+      // code 1000 仍只意味着对端干净关闭（如 bridge 重启）→ 应重连，不退出。
+      if (replaced || event.code === 4001) {
         console.error("👋 channel-server 退出（被新连接取代）");
         process.exit(0);
       }

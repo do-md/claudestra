@@ -2481,18 +2481,25 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
   }
 
   switch (msg.type) {
+    case "ping": {
+      // v2.2.0+: keepalive。收到本身就重置了 Bun 的 ws idleTimeout；回个 pong
+      // 让 channel-server 那侧的 idle 也重置。无需其它处理。
+      try { ws.send(JSON.stringify({ type: "pong" })); } catch { /* non-critical */ }
+      return;
+    }
     case "register": {
       const old = clients.get(msg.channelId);
       if (old && old.ws !== ws) {
         console.log(`🔄 频道 ${msg.channelId} 重新注册 — 主动关闭旧连接`);
-        // 主动关闭旧的 ws：发送 "replaced" 通知 + close(1000)。
-        // 旧 channel-server 收到 close code 1000 后会知道是被取代而非异常，
-        // 不会自动重连，直接 exit。这样彻底消除重复注册的 orphan ws。
+        // 主动关闭旧的 ws：发送 "replaced" 通知 + close(**4001**)。
+        // v2.2.0+: 用专用 close code 4001（不是 1000）。旧 channel-server 凭 close code
+        // 就能判定"被取代 → exit"，不依赖 "replaced" 消息能否赶在 close 前送达（竞态）。
+        // 1000 留给"bridge 干净重启"语义（→ channel-server 重连，不退出）。
         try {
           old.ws.send(JSON.stringify({ type: "replaced", reason: "channel re-registered" }));
         } catch { /* non-critical */ }
         try {
-          old.ws.close(1000, "replaced by newer registration");
+          old.ws.close(4001, "replaced by newer registration");
         } catch { /* non-critical */ }
       }
       clients.set(msg.channelId, { ws, channelId: msg.channelId, userId: msg.userId, cwd: msg.cwd });
@@ -4079,6 +4086,9 @@ const server = Bun.serve({
     return new Response("Claude Orchestrator Bridge", { status: 200 });
   },
   websocket: {
+    // v2.2.0+: 抬高 idleTimeout（Bun 默认 120s）。配合 channel-server 每 25s 的
+    // keepalive ping，空闲 agent 的连接不会被关 → 不再 flap。255 是 Bun 上限。
+    idleTimeout: 255,
     open(ws) {
       console.log("🔌 新的 channel-server 连接");
     },
