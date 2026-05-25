@@ -82,6 +82,42 @@ export const DISALLOWED_PRESETS: Record<string, readonly string[]> = {
 
 export const DEFAULT_PRESET = "default";
 
+// ────────────────────────────────────────────────
+// 权限模式（Claude Code --permission-mode）
+// ────────────────────────────────────────────────
+//
+// Claude Code 2.1.x 的 `--permission-mode <mode>`：
+//   default          — 正常逐个问权限
+//   acceptEdits      — 自动接受文件编辑，其余照问
+//   auto             — classifier 判定：安全操作自动批，危险操作弹权限框（→ 我们的
+//                      permission-watcher 转成 Discord 批准按钮），极危险直接拒。比
+//                      bypass 安全得多，是新建交互 agent 的默认。
+//   bypassPermissions— 跳过所有权限检查（= 老的 --dangerously-skip-permissions）。
+//   dontAsk          — 不弹框，按规则静默放行/拒绝
+//   plan             — 只读 plan 模式
+//
+// disallowedTools 黑名单与 permission-mode 正交，两者叠加：黑名单永远是硬拦截。
+
+export const PERMISSION_MODES = [
+  "default",
+  "acceptEdits",
+  "auto",
+  "bypassPermissions",
+  "dontAsk",
+  "plan",
+] as const;
+
+export type PermissionMode = (typeof PERMISSION_MODES)[number];
+
+export function isKnownPermissionMode(m: string): boolean {
+  return (PERMISSION_MODES as readonly string[]).includes(m);
+}
+
+// 启动路径未显式指定 permissionMode 时的回退。= 老行为（bypass），保证向后兼容：
+// 本 feature 之前建的 agent registry 里没有 permissionMode 字段，restart 时回退到
+// 这个，行为不变。新建交互 agent 由 manager.ts cmdCreate 显式传 "auto"。
+export const DEFAULT_PERMISSION_MODE: PermissionMode = "bypassPermissions";
+
 export function listPresets(): string[] {
   return Object.keys(DISALLOWED_PRESETS);
 }
@@ -131,6 +167,13 @@ export interface LaunchOptions {
   /** 原始字符串覆盖（空格分隔的 entries） */
   disallowedRaw?: string;
   /**
+   * 权限模式（`--permission-mode <mode>`）。见 PERMISSION_MODES。
+   * 不传 → DEFAULT_PERMISSION_MODE（bypassPermissions，保持老行为）。
+   * bypassPermissions 走经过验证的 `--dangerously-skip-permissions`，其余走
+   * `--permission-mode`。
+   */
+  permissionMode?: string;
+  /**
    * Session-scoped effort level（`--effort <level>`，只影响本 Claude Code session，
    * 不写到全局 user config）。支持 low / medium / high / xhigh / max。
    * 没传就不加 flag → Claude Code 用 `~/.claude/settings.json` 的全局 effortLevel。
@@ -167,12 +210,24 @@ export function buildClaudeCommand(opts: LaunchOptions): string {
           raw: opts.disallowedRaw,
         });
 
+  const mode =
+    (opts.permissionMode && opts.permissionMode.trim()) || DEFAULT_PERMISSION_MODE;
+
   const parts: string[] = [
     "claude",
     "--dangerously-load-development-channels",
     `server:${MCP_NAME}`,
-    "--dangerously-skip-permissions",
   ];
+
+  // bypassPermissions 走经过验证的 --dangerously-skip-permissions（语义相同，且它
+  // 还顺带跳过 workspace trust dialog）；其余模式走 --permission-mode <mode>。
+  // 非 bypass 模式启动期若弹 trust dialog，由 manager/launcher 的启动轮询
+  // (isAutoConfirmableModal 几何识别) 自动 Enter 确认。
+  if (mode === "bypassPermissions") {
+    parts.push("--dangerously-skip-permissions");
+  } else {
+    parts.push("--permission-mode", shellEscape(mode));
+  }
 
   if (opts.resumeId) {
     parts.push("--resume", shellEscape(opts.resumeId));

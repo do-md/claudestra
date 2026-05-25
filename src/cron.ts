@@ -257,8 +257,11 @@ async function executeJob(job: CronJob): Promise<void> {
   }
 
   try {
-    // 1. 创建 agent
-    const createResult = await runManager("create", agentName, job.dir, `cron: ${job.name}`);
+    // 1. 创建 agent —— cron 是无人值守，用 bypassPermissions（auto 模式遇到 soft_deny
+    //    会弹权限框等批准，但没人在场 → 任务卡死）。
+    const createResult = await runManager(
+      "create", agentName, job.dir, `cron: ${job.name}`, "--mode", "bypassPermissions"
+    );
     if (!createResult.ok) {
       throw new Error(`创建 agent 失败: ${createResult.error}`);
     }

@@ -120,6 +120,20 @@ export async function clearShellInitPrompts(
  * 选项菜单（"❯ 1. xxx"）情况：模式 1 当然不匹配；模式 2 不会匹配因为 modal
  * 通常没有 bypass banner（modal 覆盖输入框）。两种都返回 false，正确。
  */
+/**
+ * Claude Code TUI 底部模式状态栏正则。不同 `--permission-mode` 文案不同：
+ *   bypass      → "⏵⏵ bypass permissions on (shift+tab to cycle)"
+ *   auto        → "⏵⏵ auto mode on (shift+tab to cycle)"
+ *   acceptEdits → "⏵⏵ accept edits on (shift+tab to cycle)"
+ *   plan        → "⏸ plan mode on (shift+tab to cycle)"
+ * 共同稳定子串是 "(shift+tab to cycle)"。default 模式无 banner（我们不给 agent 用）。
+ *
+ * v2.0.24+：旧代码只认 "bypass permissions"，导致 auto/acceptEdits/plan 模式的 agent
+ * 永远不被判就绪/idle → 启动 60s 超时。统一成「任一模式 banner」。保留 "bypass
+ * permissions" 分支兼容老 pane / 测试 fixture。
+ */
+export const CC_MODE_BANNER_RE = /shift\+tab to cycle|bypass permissions/i;
+
 /** 纯函数版：给定 pane 文本判断是否 idle。便于单测。 */
 export function paneLooksIdle(pane: string): boolean {
   const lines = pane.split("\n");
@@ -134,7 +148,7 @@ export function paneLooksIdle(pane: string): boolean {
   // 输入框下面 1-2 行 = 真 idle 时一定在 last 10。
   const last10Joined = lines.slice(-10).join("\n");
   const hasPrompt = /❯/.test(last5.join("\n"));
-  const hasBanner = /bypass permissions/.test(last10Joined);
+  const hasBanner = CC_MODE_BANNER_RE.test(last10Joined);
   const isWorking = /esc to interrupt/i.test(last10Joined);
   return hasPrompt && hasBanner && !isWorking;
 }
@@ -166,7 +180,7 @@ export function isClaudeReady(pane: string): boolean {
   // restart 流程里 startClaudeInWindow 的 polling 第一次轮询就误以为 ready，跳过
   // hasPromptToConfirm 分支没机会按 Enter，dev-channels modal 永远卡在那儿。
   const hasPrompt = /❯/.test(lines.slice(-5).join("\n"));
-  const hasBanner = /bypass permissions/.test(lines.slice(-10).join("\n"));
+  const hasBanner = CC_MODE_BANNER_RE.test(lines.slice(-10).join("\n"));
   return hasPrompt && hasBanner;
 }
 
@@ -184,8 +198,8 @@ export function isClaudeReady(pane: string): boolean {
 export function isAtShell(pane: string): boolean {
   const nonEmpty = pane.split("\n").filter((l) => l.trim());
   const tail = nonEmpty.slice(-5).join("\n");
-  // 如果底部有 Claude Code TUI 标志，肯定不在 shell
-  if (/bypass permissions|esc to interrupt|esc to cancel/i.test(tail)) return false;
+  // 如果底部有 Claude Code TUI 标志（任一模式 banner / 跑工具 / modal），肯定不在 shell
+  if (CC_MODE_BANNER_RE.test(tail) || /esc to interrupt|esc to cancel/i.test(tail)) return false;
   if (/^\s*❯\s*\d+\./m.test(tail)) return false;
   const lastLine = nonEmpty.pop() || "";
   // 常见 shell prompt 收尾字符：$ (bash/sh)、% (zsh default)、# (root)、> (fish/cmd)、
@@ -249,7 +263,7 @@ export function detectSessionIdlePrompt(pane: string): string | null {
   // 状态栏。claude 正常运行时这俩永远钉在最底下；如果底部还有它们，说明那段 modal
   // 文字只是屏幕上显示的内容（源码 / 工具输出），claude 没真弹窗。
   const lastFew = lines.slice(-8).join("\n");
-  if (/bypass permissions|esc to interrupt/i.test(lastFew)) return null;
+  if (CC_MODE_BANNER_RE.test(lastFew) || /esc to interrupt/i.test(lastFew)) return null;
   // v2.0.23+: 底部已是 shell 提示符 → claude 已退出，那段 modal 文字只是 scrollback
   // 残留（比如从弹窗按 Esc 退出后）。真弹窗有 "❯ N." 选项 / "Esc to cancel"，
   // isAtShell 对它必返回 false，所以这条只挡"已退到 shell"的残留误判。

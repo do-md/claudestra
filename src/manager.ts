@@ -45,6 +45,8 @@ import {
   isKnownPreset,
   DISALLOWED_PRESETS,
   DEFAULT_PRESET,
+  PERMISSION_MODES,
+  isKnownPermissionMode,
 } from "./lib/claude-launch.js";
 import { printTmuxGuide } from "./lib/tmux-guide.js";
 
@@ -76,6 +78,13 @@ interface AgentInfo {
    * `~/.claude/settings.json` 全局 effortLevel。改完要 restart 才生效。
    */
   effort?: string;
+  /**
+   * 权限模式（default/acceptEdits/auto/bypassPermissions/dontAsk/plan），由启动时
+   * 通过 `--permission-mode`（bypass 走 `--dangerously-skip-permissions`）传给
+   * Claude Code。新建交互 agent 默认 auto；cron 用 bypass。空 = 老 agent（feature
+   * 之前建的）→ 启动时回退 bypass，行为不变。改完要 restart 才生效。
+   */
+  permissionMode?: string;
 }
 
 interface Registry {
@@ -359,6 +368,23 @@ function extractEffortFlag(args: string[]): { rest: string[]; effort?: string } 
   return { rest, effort };
 }
 
+/** 从 argv 提取 --mode <permission-mode>，支持 --mode=foo */
+function extractModeFlag(args: string[]): { rest: string[]; mode?: string } {
+  const rest: string[] = [];
+  let mode: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--mode") {
+      mode = args[++i];
+    } else if (a.startsWith("--mode=")) {
+      mode = a.slice("--mode=".length);
+    } else {
+      rest.push(a);
+    }
+  }
+  return { rest, mode };
+}
+
 // ============================================================
 // 命令实现
 // ============================================================
@@ -369,6 +395,7 @@ async function cmdCreate(
   purpose: string = "",
   perms: { preset?: string; disallowedRaw?: string } = {},
   effort?: string,
+  permissionMode?: string,
 ) {
   assertValidNewName(name);
   const tmuxName = normalizeName(name);
@@ -387,6 +414,17 @@ async function cmdCreate(
     output({
       ok: false,
       error: `未知的 effort level: "${effort}"。可用: ${KNOWN_EFFORT_LEVELS.join(", ")}`,
+    });
+    return;
+  }
+
+  // 新建交互 agent 默认 auto（classifier，安全操作自动批、危险操作走 Discord 批准）。
+  // cron 等无人值守场景由调用方显式传 --mode bypassPermissions。
+  const mode = (permissionMode && permissionMode.trim()) || "auto";
+  if (!isKnownPermissionMode(mode)) {
+    output({
+      ok: false,
+      error: `未知的权限模式: "${mode}"。可用: ${PERMISSION_MODES.join(", ")}`,
     });
     return;
   }
@@ -442,6 +480,7 @@ async function cmdCreate(
       disallowedPreset: perms.preset,
       disallowedRaw: perms.disallowedRaw,
       effort,
+      permissionMode: mode,
     });
     // 新 tmux window 起来后 .zshrc / .bashrc 可能弹 oh-my-zsh / homebrew 的 Y/n
     // update prompt，会吞掉 send-keys 第一个字符。先清掉再发命令。
@@ -496,6 +535,7 @@ async function cmdCreate(
     disallowedPreset: perms.preset,
     disallowedRaw: perms.disallowedRaw,
     effort,
+    permissionMode: mode,
   };
   await saveRegistry(reg);
 
@@ -510,6 +550,7 @@ async function cmdCreate(
     ready,
     preset: perms.preset || DEFAULT_PRESET,
     effort: effort || "(inherits ~/.claude/settings.json)",
+    permissionMode: mode,
     message: ready
       ? `Agent ${tmuxName} 已创建，Discord 频道 #${channelName} 已就绪`
       : `Agent ${tmuxName} 已创建，但 Claude Code 可能还在启动中`,
@@ -524,6 +565,7 @@ async function cmdResume(
   dir?: string,
   perms: { preset?: string; disallowedRaw?: string } = {},
   effort?: string,
+  permissionMode?: string,
 ) {
   if (!UUID_RE.test(sessionId)) {
     throw new Error(`非法 sessionId: "${sessionId}"（应为 UUID 格式）`);
@@ -544,6 +586,16 @@ async function cmdResume(
     output({
       ok: false,
       error: `未知的 effort level: "${effort}"。可用: ${KNOWN_EFFORT_LEVELS.join(", ")}`,
+    });
+    return;
+  }
+
+  // resume 也是交互 agent，默认 auto；可被 --mode 覆盖。
+  const mode = (permissionMode && permissionMode.trim()) || "auto";
+  if (!isKnownPermissionMode(mode)) {
+    output({
+      ok: false,
+      error: `未知的权限模式: "${mode}"。可用: ${PERMISSION_MODES.join(", ")}`,
     });
     return;
   }
@@ -609,6 +661,7 @@ async function cmdResume(
       disallowedPreset: perms.preset,
       disallowedRaw: perms.disallowedRaw,
       effort,
+      permissionMode: mode,
     });
     await clearShellInitPrompts(target);
     await tmuxSendLine(target, cmd);
@@ -662,6 +715,7 @@ async function cmdResume(
     disallowedPreset: perms.preset,
     disallowedRaw: perms.disallowedRaw,
     effort,
+    permissionMode: mode,
   };
   await saveRegistry(reg);
 
@@ -712,6 +766,7 @@ async function cmdResume(
     channelName,
     sessionId,
     ready,
+    permissionMode: mode,
     message: ready
       ? `Agent ${tmuxName} 已恢复，Discord 频道 #${channelName} 已就绪`
       : `Agent ${tmuxName} 已恢复，但 Claude Code 可能还在启动中`,
@@ -1065,6 +1120,9 @@ async function cmdRestart(name?: string) {
       disallowedPreset: info.disallowedPreset,
       disallowedRaw: info.disallowedRaw,
       effort: info.effort,
+      // 老 agent（feature 前建的）info.permissionMode 为空 → buildClaudeCommand
+      // 回退 bypassPermissions，行为不变。新 agent 沿用 registry 里存的模式。
+      permissionMode: info.permissionMode,
     });
 
     const started = await startClaudeInWindow(tmuxName, cmd);
@@ -1549,6 +1607,97 @@ async function cmdEffort(sub: string, ...rest: string[]) {
     ok: true,
     agent: tmuxName,
     effort: level,
+    hint: `已写入 registry。要让 ${tmuxName} 立即生效，跑: bun src/manager.ts restart ${tmuxName.replace(AGENT_PREFIX, "")}`,
+  });
+}
+
+/**
+ * mode 子命令 —— 查看 / 改 agent 的权限模式（--permission-mode）。
+ * 用法对齐 cmdEffort：
+ *   mode list                列出所有 agent 的模式
+ *   mode get <agent>         查单个
+ *   mode <agent> <mode>      改（= mode set <agent> <mode>）
+ * 改完要 restart 才生效（是启动 flag）。
+ */
+async function cmdMode(sub: string, ...rest: string[]) {
+  if (!sub || sub === "list") {
+    const reg = await loadRegistry();
+    const rows = Object.entries(reg.agents)
+      .filter(([, info]) => info.status === "active")
+      .map(([name, info]) => ({
+        name,
+        permissionMode: info.permissionMode || "(bypass, 老 agent)",
+      }));
+    output({
+      ok: true,
+      agents: rows,
+      validModes: PERMISSION_MODES,
+      hint: "(bypass, 老 agent) = feature 前建的，启动回退 bypassPermissions",
+    });
+    return;
+  }
+
+  if (sub === "get") {
+    const [name] = rest;
+    if (!name) {
+      output({ ok: false, error: "用法: mode get <name>" });
+      return;
+    }
+    const tmuxName = normalizeName(name);
+    const reg = await loadRegistry();
+    const info = reg.agents[tmuxName];
+    if (!info) {
+      output({ ok: false, error: `找不到 agent: ${tmuxName}` });
+      return;
+    }
+    output({
+      ok: true,
+      agent: tmuxName,
+      permissionMode: info.permissionMode || "(bypass, 老 agent)",
+    });
+    return;
+  }
+
+  // 默认形式：mode <agent> <mode> 或 mode set <agent> <mode>
+  let agentName: string;
+  let modeVal: string;
+  if (sub === "set") {
+    [agentName, modeVal] = rest;
+  } else {
+    agentName = sub;
+    modeVal = rest[0];
+  }
+
+  if (!agentName || !modeVal) {
+    output({
+      ok: false,
+      error: "用法: mode <agent> <mode>｜mode get <agent>｜mode list",
+      validModes: PERMISSION_MODES,
+    });
+    return;
+  }
+
+  if (!isKnownPermissionMode(modeVal)) {
+    output({
+      ok: false,
+      error: `未知的权限模式: "${modeVal}"。可用: ${PERMISSION_MODES.join(", ")}`,
+    });
+    return;
+  }
+
+  const tmuxName = normalizeName(agentName);
+  const reg = await loadRegistry();
+  const info = reg.agents[tmuxName];
+  if (!info) {
+    output({ ok: false, error: `找不到 agent: ${tmuxName}` });
+    return;
+  }
+  info.permissionMode = modeVal;
+  await saveRegistry(reg);
+  output({
+    ok: true,
+    agent: tmuxName,
+    permissionMode: modeVal,
     hint: `已写入 registry。要让 ${tmuxName} 立即生效，跑: bun src/manager.ts restart ${tmuxName.replace(AGENT_PREFIX, "")}`,
   });
 }
@@ -2193,32 +2342,34 @@ const [cmd, ...args] = process.argv.slice(2);
 try {
 switch (cmd) {
   case "create": {
-    const { rest: afterEffort, effort } = extractEffortFlag(args);
+    const { rest: afterMode, mode } = extractModeFlag(args);
+    const { rest: afterEffort, effort } = extractEffortFlag(afterMode);
     const { rest: posArgs, preset, disallowedRaw } = extractPermFlags(afterEffort);
     const [name, dir, ...purposeParts] = posArgs;
     if (!name || !dir) {
       output({
         ok: false,
-        error: 'create <name> <dir> [purpose] [--preset <preset>] [--disallowed "..."] [--effort <level>]',
+        error: 'create <name> <dir> [purpose] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>]',
       });
       break;
     }
-    await cmdCreate(name, dir, purposeParts.join(" "), { preset, disallowedRaw }, effort);
+    await cmdCreate(name, dir, purposeParts.join(" "), { preset, disallowedRaw }, effort, mode);
     break;
   }
 
   case "resume": {
-    const { rest: afterEffort, effort } = extractEffortFlag(args);
+    const { rest: afterMode, mode } = extractModeFlag(args);
+    const { rest: afterEffort, effort } = extractEffortFlag(afterMode);
     const { rest: posArgs, preset, disallowedRaw } = extractPermFlags(afterEffort);
     const [name, sessionId, dir] = posArgs;
     if (!name || !sessionId) {
       output({
         ok: false,
-        error: 'resume <name> <sessionId> [dir] [--preset <preset>] [--disallowed "..."] [--effort <level>]',
+        error: 'resume <name> <sessionId> [dir] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>]',
       });
       break;
     }
-    await cmdResume(name, sessionId, dir, { preset, disallowedRaw }, effort);
+    await cmdResume(name, sessionId, dir, { preset, disallowedRaw }, effort, mode);
     break;
   }
 
@@ -2411,6 +2562,12 @@ switch (cmd) {
   case "effort": {
     const [sub, ...rest] = args;
     await cmdEffort(sub || "list", ...rest);
+    break;
+  }
+
+  case "mode": {
+    const [sub, ...rest] = args;
+    await cmdMode(sub || "list", ...rest);
     break;
   }
 

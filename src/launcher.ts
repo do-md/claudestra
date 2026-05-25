@@ -22,6 +22,7 @@ import {
   tmuxSendLine,
   isAutoConfirmableModal,
   detectSessionIdlePrompt,
+  CC_MODE_BANNER_RE,
   listAgentWindows,
   windowTarget,
   clearShellInitPrompts,
@@ -493,7 +494,7 @@ async function main() {
       // 进程检查失败（window 丢了？），用文本兜底
       const nonEmpty = pane.split("\n").filter((l) => l.trim());
       const tail = nonEmpty.slice(-5).join("\n");
-      const hasClaudeTui = /bypass permissions|esc to interrupt/i.test(tail);
+      const hasClaudeTui = CC_MODE_BANNER_RE.test(tail) || /esc to interrupt/i.test(tail);
       const lastLine = nonEmpty.pop() || "";
       deadAtShell =
         !hasClaudeTui &&

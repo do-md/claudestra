@@ -108,10 +108,18 @@ bun ../src/manager.ts effort get <名称>                       # 看单个 agen
 bun ../src/manager.ts effort <名称> xhigh                     # 设置 agent 的 effort（要 restart 生效）
 bun ../src/manager.ts effort reset <名称>                     # 清除 → 跟 ~/.claude/settings.json 全局走
 
-# 新建 agent 时也能直接指定权限 / effort
+# 每个 agent 独立的权限模式（default / acceptEdits / auto / bypassPermissions / dontAsk / plan）
+# auto = Claude Code classifier：安全操作自动批、危险操作弹框 → bridge 转 Discord 批准按钮（新建交互 agent 默认）
+# bypassPermissions = 老的 --dangerously-skip-permissions，全自动跑（cron 用这个）
+bun ../src/manager.ts mode list                              # 看所有 agent 的权限模式
+bun ../src/manager.ts mode get <名称>                         # 看单个 agent 的模式
+bun ../src/manager.ts mode <名称> auto                        # 改模式（要 restart 生效）
+
+# 新建 agent 时也能直接指定权限 / effort / 权限模式
 bun ../src/manager.ts create <名称> <目录> [用途] --preset readonly
 bun ../src/manager.ts create <名称> <目录> [用途] --disallowed "Bash(curl:*) Bash(wget:*)"
 bun ../src/manager.ts create <名称> <目录> [用途] --effort xhigh
+bun ../src/manager.ts create <名称> <目录> [用途] --mode bypassPermissions   # 不指定默认 auto
 ```
 
 ## Discord 交互指南
@@ -445,6 +453,31 @@ set / reset 之后必须 `restart <name>` 才能生效（Claude Code 启动 flag
 ⚠️ 改完 effort **必须 restart** 该 agent 才生效（Claude Code 启动 flag 只读一次）。set / reset 后告知用户「需要 restart 生效」，然后执行 restart。
 
 合法 level：`low` / `medium` / `high` / `xhigh` / `max` / `auto`。其他字符串会被 CLI 拒绝。
+
+## 权限模式（每个 agent 的 --permission-mode）
+
+每个 agent 可以独立选 Claude Code 的权限模式，由启动时传给 Claude Code：
+
+- **auto**（新建交互 agent 默认）— Claude Code 的 classifier：只读 / 项目内文件改 / 装已声明依赖等安全操作自动批；force push / 推 main / prod 部署 / rm -rf / git reset --hard / 装乱七八糟的包 / 改 .claude 配置等危险操作会弹权限框 → bridge 的 permission-watcher 转成 Discord 批准按钮；数据外泄等直接拒。比 bypass 安全得多。
+- **bypassPermissions** — 老的 `--dangerously-skip-permissions`，跳过所有检查全自动跑。**cron / 无人值守**场景用这个（auto 遇到危险操作会等批准，没人在场会卡死）。
+- **acceptEdits** — 自动接受文件编辑，其余照问。
+- **plan** — 只读 plan 模式。
+- **default** / **dontAsk** — 一般用不到。
+
+用户自然语言映射：
+
+- "把 xxx 改成 auto 模式" / "xxx 用安全模式" → `mode xxx auto`
+- "xxx 全自动跑别问我" / "xxx 用 bypass" → `mode xxx bypassPermissions`
+- "看看 xxx 什么权限模式" → `mode get xxx`
+- "列一下大家的权限模式" → `mode list`
+- "新建一个全自动的 agent" → `create <name> <dir> <purpose> --mode bypassPermissions`
+- "新建一个 agent"（没特别说）→ 默认就是 auto，不用加 `--mode`
+
+⚠️ 改完 mode **必须 restart** 该 agent 才生效（启动 flag 只读一次）。告知用户后再 restart。
+
+⚠️ 注意区分：这个 `--mode` 是**权限模式**（create / mode 子命令用）；peer-expose 的 `--mode direct|via_master` 是**路由模式**，两码事。
+
+合法 mode：`default` / `acceptEdits` / `auto` / `bypassPermissions` / `dontAsk` / `plan`。
 
 ## 重启 vs 重建（重要区别！）
 

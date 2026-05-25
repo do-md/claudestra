@@ -1,0 +1,71 @@
+/**
+ * claude-launch 权限模式（--permission-mode）测试
+ *
+ * 重点锁住：
+ *   - bypassPermissions 走 --dangerously-skip-permissions（不是 --permission-mode）
+ *   - 其余模式走 --permission-mode <mode>
+ *   - 未指定 → 回退 bypassPermissions（向后兼容老 agent）
+ *   - 模式校验
+ */
+
+import { describe, test, expect } from "bun:test";
+import {
+  buildClaudeCommand,
+  isKnownPermissionMode,
+  PERMISSION_MODES,
+  DEFAULT_PERMISSION_MODE,
+} from "../src/lib/claude-launch.ts";
+
+const base = { channelId: "123", bridgeUrl: "ws://localhost:3847" };
+
+describe("isKnownPermissionMode", () => {
+  test("已知模式全过", () => {
+    for (const m of PERMISSION_MODES) expect(isKnownPermissionMode(m)).toBe(true);
+  });
+  test("未知模式 false", () => {
+    expect(isKnownPermissionMode("yolo")).toBe(false);
+    expect(isKnownPermissionMode("")).toBe(false);
+    expect(isKnownPermissionMode("Auto")).toBe(false); // 大小写敏感
+  });
+  test("默认模式是 bypassPermissions（向后兼容）", () => {
+    expect(DEFAULT_PERMISSION_MODE).toBe("bypassPermissions");
+  });
+});
+
+describe("buildClaudeCommand permission mode", () => {
+  test("auto → --permission-mode auto，不带 skip-permissions", () => {
+    const cmd = buildClaudeCommand({ ...base, permissionMode: "auto" });
+    expect(cmd).toContain("--permission-mode auto");
+    expect(cmd).not.toContain("--dangerously-skip-permissions");
+  });
+
+  test("bypassPermissions → --dangerously-skip-permissions，不带 --permission-mode", () => {
+    const cmd = buildClaudeCommand({ ...base, permissionMode: "bypassPermissions" });
+    expect(cmd).toContain("--dangerously-skip-permissions");
+    expect(cmd).not.toContain("--permission-mode");
+  });
+
+  test("未指定 → 回退 bypass（= 老行为）", () => {
+    const cmd = buildClaudeCommand({ ...base });
+    expect(cmd).toContain("--dangerously-skip-permissions");
+    expect(cmd).not.toContain("--permission-mode");
+  });
+
+  test("acceptEdits / plan / dontAsk / default 都走 --permission-mode", () => {
+    for (const m of ["acceptEdits", "plan", "dontAsk", "default"]) {
+      const cmd = buildClaudeCommand({ ...base, permissionMode: m });
+      expect(cmd).toContain(`--permission-mode ${m}`);
+      expect(cmd).not.toContain("--dangerously-skip-permissions");
+    }
+  });
+
+  test("空串 / 全空白 → 回退 bypass", () => {
+    expect(buildClaudeCommand({ ...base, permissionMode: "" })).toContain("--dangerously-skip-permissions");
+    expect(buildClaudeCommand({ ...base, permissionMode: "   " })).toContain("--dangerously-skip-permissions");
+  });
+
+  test("dev-channels flag 永远在（跟权限模式正交）", () => {
+    const cmd = buildClaudeCommand({ ...base, permissionMode: "auto" });
+    expect(cmd).toContain("--dangerously-load-development-channels");
+  });
+});

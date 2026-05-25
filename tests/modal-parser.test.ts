@@ -538,3 +538,37 @@ shawn@mac ~/repos/router %`;
     expect(detectSessionIdlePrompt(`just normal output\n❯ ▎`)).toBeNull();
   });
 });
+
+describe("多权限模式 banner（v2.0.24 泛化）", () => {
+  // 不同 --permission-mode 底部 banner 文案不同；旧代码只认 "bypass permissions"
+  // 导致 auto/acceptEdits/plan 模式 agent 永远不就绪。这里锁住三函数都认所有模式。
+  const mk = (banner: string) => `
+─── agent ──
+❯ ▎
+─────────────
+  ${banner} · ← for agents`;
+
+  const banners = [
+    "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    "⏵⏵ auto mode on (shift+tab to cycle)",
+    "⏵⏵ accept edits on (shift+tab to cycle)",
+    "⏸ plan mode on (shift+tab to cycle)",
+  ];
+
+  for (const b of banners) {
+    test(`isClaudeReady 认: ${b.slice(0, 20)}…`, () => {
+      expect(isClaudeReady(mk(b))).toBe(true);
+    });
+    test(`paneLooksIdle 认: ${b.slice(0, 20)}…`, () => {
+      expect(paneLooksIdle(mk(b))).toBe(true);
+    });
+    test(`isAtShell 对 ${b.slice(0, 20)}… 返回 false（claude 在跑）`, () => {
+      expect(isAtShell(mk(b))).toBe(false);
+    });
+  }
+
+  test("auto 模式跑工具中（esc to interrupt）→ paneLooksIdle false", () => {
+    const pane = mk("⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt");
+    expect(paneLooksIdle(pane)).toBe(false);
+  });
+});
