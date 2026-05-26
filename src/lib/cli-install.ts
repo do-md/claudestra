@@ -85,15 +85,49 @@ exec ${JSON.stringify(bunPath)} ${JSON.stringify(cliScript)} "$@"
  * 为啥不直接让 plist 跑 `/bin/sh -c "pm2 start ..."`：macOS 给新 LaunchAgent 弹的
  * 「App 后台活动」通知会显示 ProgramArguments[0]（"sh"），用户看不出是啥。
  * 包一层有名字的脚本，通知就显示 "claudestra-autostart"，一眼能认出是 Claudestra 的。
+ *
+ * 脚本三步：
+ *   1. `pm2 start ecosystem.config.cjs` —— bridge / launcher / cron 三个 daemon
+ *   2. 等 master tmux session 由 launcher 建好（最多 30s 轮询）
+ *   3. 异步 `nohup ... manager.ts restart` —— 把 registry 里所有 active worker
+ *      agent 全拉回（v2.0.22 的 full-resume 保上下文）。nohup + disown 让它
+ *      脱离本脚本，LaunchAgent 快速退出，restart 在后台慢慢跑（每 agent ~30s）。
  */
-async function writeAutostartScript(repoRoot: string, pm2Path: string): Promise<string> {
+async function writeAutostartScript(
+  repoRoot: string,
+  pm2Path: string,
+  bunPath: string,
+): Promise<string> {
   const home = homedir();
   const target = `${home}/.bun/bin/claudestra-autostart`;
   await mkdir(`${home}/.bun/bin`, { recursive: true });
+  const SOCK = "/tmp/claude-orchestrator/master.sock";
   const content = `#!/usr/bin/env bash
 # claudestra-autostart — boot/login 时由 LaunchAgent 调用
-# 启动 Claudestra 的三个 pm2 daemon（来自 ecosystem.config.cjs，git 里的源真相）
-exec ${JSON.stringify(pm2Path)} start ${JSON.stringify(`${repoRoot}/ecosystem.config.cjs`)}
+# 1) 起 pm2 三个 daemon  2) 等 master tmux session  3) 异步把所有 worker agent 拉回
+
+PM2=${JSON.stringify(pm2Path)}
+BUN=${JSON.stringify(bunPath)}
+ECOSYSTEM=${JSON.stringify(`${repoRoot}/ecosystem.config.cjs`)}
+MANAGER=${JSON.stringify(`${repoRoot}/src/manager.ts`)}
+SOCK=${JSON.stringify(SOCK)}
+LOG=/tmp/claudestra-autostart-restart.log
+
+# 1. 起 pm2 daemon（bridge / launcher / cron-scheduler）
+"$PM2" start "$ECOSYSTEM"
+
+# 2. 等 master tmux session 被 launcher 建好；最多 30s
+for i in $(seq 1 30); do
+  if tmux -S "$SOCK" has-session -t master 2>/dev/null; then break; fi
+  sleep 1
+done
+
+# 3. 异步把所有 active worker agent 从 registry 拉回（full-resume 保上下文）
+#    nohup + & + disown：LaunchAgent 不等它跑完，restart 在后台慢慢跑
+#    (每 agent ~30s，10 个 agent ~5min)
+nohup "$BUN" "$MANAGER" restart >"$LOG" 2>&1 </dev/null &
+disown 2>/dev/null || true
+exit 0
 `;
   await writeFile(target, content);
   await chmod(target, 0o755);
@@ -203,7 +237,7 @@ export async function installClaudestraCli(repoRoot: string): Promise<InstallCli
 
   // 2a. 写有名字的 boot 脚本（macOS 通知里显示 "claudestra-autostart" 而不是 "sh"）
   try {
-    result.autostartScript = await writeAutostartScript(repoRoot, pm2Path);
+    result.autostartScript = await writeAutostartScript(repoRoot, pm2Path, bunPath);
   } catch (e) {
     errors.push(`写 autostart 脚本失败: ${(e as Error).message}`);
     return result;
