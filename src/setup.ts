@@ -896,39 +896,41 @@ async function stepFinalize(cfg: Config): Promise<void> {
     return;
   }
 
-  // 6. pm2 startup — 开机自启。需要 sudo，捕获 pm2 输出里的 sudo 命令后问用户要不要自动跑。
-  write(`${c.dim}▶${c.reset} ${t("配置 pm2 开机自启", "Configure pm2 boot startup")}… `);
-  const startupProbe = await run(["pm2", "startup"]);
-  // pm2 startup 会输出一条 "sudo env PATH=... pm2 startup <init>" 命令
-  const sudoMatch = (startupProbe.out + "\n" + (startupProbe.err || "")).match(/^\s*(sudo [^\n]+)$/m);
-  if (!sudoMatch) {
-    // 可能已经配置过了，或者 pm2 没给出 sudo 命令
-    print(`${c.green}✓${c.reset}  ${c.dim}${t("(已配置或无需配置)", "(already configured or not required)")}${c.reset}`);
-    await run(["pm2", "save"], { cwd: REPO_ROOT });
-    return;
-  }
-  print(`${c.yellow}${t("需要 sudo", "sudo needed")}${c.reset}`);
-  br();
-  print(`${c.dim}${t("pm2 要写一个开机自启脚本，需要 sudo 密码。命令如下：", "pm2 needs sudo to write a boot-startup script. Command:")}${c.reset}`);
-  print(`  ${c.cyan}${sudoMatch[1]}${c.reset}`);
-  br();
-  if (await confirm(t("要我帮你跑这条 sudo 命令吗？", "Run this sudo command for you?"), true)) {
-    // 直接用 shell 跑（继承当前 TTY 让 sudo 能提示密码）
-    const proc = Bun.spawn(["/bin/bash", "-c", sudoMatch[1]], {
-      stdin: "inherit",
-      stdout: "inherit",
-      stderr: "inherit",
-    });
-    await proc.exited;
-    if (proc.exitCode === 0) {
-      ok(t("pm2 开机自启已配置", "pm2 boot startup configured"));
-      await run(["pm2", "save"], { cwd: REPO_ROOT });
+  // 6. v2.3.0+: 装 `claudestra` 命令到 ~/.bun/bin + 配 user-level LaunchAgent 开机自启
+  // 用 ecosystem.config.cjs（git 里的源真相）启动，**不用 sudo、不用 pm2 save 维护**。
+  // 老的 pm2.<user>.plist（如果之前 pm2 startup 装过）会被 unload + .bak 掉。
+  write(`${c.dim}▶${c.reset} ${t("装 claudestra 命令 + 配开机自启", "Install claudestra CLI + boot autostart")}… `);
+  try {
+    const { installClaudestraCli } = await import("./lib/cli-install.js");
+    const r = await installClaudestraCli(REPO_ROOT);
+    if (r.errors.length > 0) {
+      print(`${c.red}✗${c.reset}`);
+      for (const e of r.errors) warn(e);
     } else {
-      warn(t("sudo 命令没成功，可以以后手工跑上面那条（或重跑 bun run setup）", "sudo command failed. Run it manually later, or rerun bun run setup"));
+      print(`${c.green}✓${c.reset}`);
+      ok(t(
+        `命令装在 ${c.cyan}${r.cliWrapper}${c.reset}（以后直接打 ${c.bold}claudestra${c.reset} 就行）`,
+        `Wrote ${c.cyan}${r.cliWrapper}${c.reset} (just type ${c.bold}claudestra${c.reset} from anywhere)`,
+      ));
+      ok(t(
+        `LaunchAgent 装在 ${c.cyan}${r.plistPath}${c.reset}（开机自启，不用 sudo）`,
+        `LaunchAgent at ${c.cyan}${r.plistPath}${c.reset} (boot autostart, no sudo needed)`,
+      ));
+      if (r.oldPm2Plist) {
+        hint(t(
+          `老的 pm2 startup plist 已卸 + 备份成 ${c.cyan}${r.oldPm2Plist.backed}${c.reset}`,
+          `Old pm2 startup plist unloaded + backed up to ${c.cyan}${r.oldPm2Plist.backed}${c.reset}`,
+        ));
+      }
+      for (const w of r.warnings) warn(w);
     }
-  } else {
-    hint(t(`稍后手工跑：${c.cyan}${sudoMatch[1]}${c.reset}`, `Run manually later: ${c.cyan}${sudoMatch[1]}${c.reset}`));
-    hint(t(`然后再跑：${c.cyan}pm2 save${c.reset}`, `Then run: ${c.cyan}pm2 save${c.reset}`));
+  } catch (e) {
+    print(`${c.red}✗${c.reset}`);
+    warn(t(`装 claudestra CLI 失败: ${(e as Error).message}`, `claudestra CLI install failed: ${(e as Error).message}`));
+    hint(t(
+      "可以以后单跑：bun src/manager.ts install-cli",
+      "Run later: bun src/manager.ts install-cli",
+    ));
   }
 }
 
@@ -951,9 +953,8 @@ function stepDone(cfg: Config): void {
   print(`  ${c.cyan}pm2 logs discord-bridge${c.reset}  ${c.dim}${t("(看 bridge 日志)", "(bridge logs)")}${c.reset}`);
   print(`  ${c.cyan}pm2 logs master-launcher${c.reset} ${c.dim}${t("(看大总管启动日志)", "(master launcher logs)")}${c.reset}`);
   br();
-  print(`${c.bold}${t("开机自启（推荐跑一次）:", "Boot autostart (recommended):")}${c.reset}`);
-  print(`  ${c.cyan}pm2 startup${c.reset}  ${c.dim}${t("(它会打印一条 sudo 命令，复制跑一下)", "(prints a sudo command — copy and run)")}${c.reset}`);
-  print(`  ${c.cyan}pm2 save${c.reset}`);
+  print(`${c.bold}${t("以后随时把整套拉起来 + 进 master TUI:", "Bring everything up + attach to master TUI anytime:")}${c.reset}`);
+  print(`  ${c.cyan}claudestra${c.reset}  ${c.dim}${t("(自动起 pm2 + 在 iTerm 里 tmux attach；机器重启后服务也会自动回来)", "(auto-starts pm2 + tmux-attaches in iTerm; services also auto-restart on boot)")}${c.reset}`);
   br();
 
   // tmux 教程

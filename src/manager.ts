@@ -2571,6 +2571,28 @@ switch (cmd) {
     break;
   }
 
+  case "install-cli": {
+    // v2.3.0+: 把 `claudestra` 命令装到 PATH + 配 LaunchAgent 开机自启。
+    // 给现有装机的人；首次 setup.ts 安装末尾也会跑这同一份逻辑。
+    const { installClaudestraCli } = await import("./lib/cli-install.js");
+    const REPO = `${import.meta.dir}/..`;
+    const result = await installClaudestraCli(REPO);
+    if (result.errors.length > 0) {
+      output({ ok: false, error: result.errors.join("; "), warnings: result.warnings, result });
+    } else {
+      output({
+        ok: true,
+        cliWrapper: result.cliWrapper,
+        autostartScript: result.autostartScript,
+        plistPath: result.plistPath,
+        oldPm2Plist: result.oldPm2Plist,
+        warnings: result.warnings,
+        hint: "打 `claudestra` 试试 —— 自动起 pm2 + 进 master TUI。重启机器后服务也会自动起来。",
+      });
+    }
+    break;
+  }
+
   case "tmux-help":
   case "tmux":
     printTmuxGuide();
