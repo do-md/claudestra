@@ -1812,17 +1812,25 @@ async function cmdUpdate() {
   await Bun.sleep(1500); // 给 launcher 稳定
   await tmuxRaw(["send-keys", "-t", `${MASTER_SESSION}:0`, "/exit", "Enter"]).catch(() => {});
 
-  // 7. pm2 save — 让当前进程列表持久化（开机自启时 pm2 resurrect 会读它）
+  // 7. v2.3.1+: 自动装 / 刷新 `claudestra` CLI 命令 + user-level LaunchAgent
+  //    （开机自启走 ecosystem.config.cjs，告别 `pm2 save` 维护，老 pm2.<user>.plist
+  //    会被 unload + .bak 备份）。Idempotent —— 每次 update 重写同一份文件无害；
+  //    旧用户升到 v2.3.1+ 第一次就把新东西自动铺好，不用手动跑 install-cli。
+  const { installClaudestraCli } = await import("./lib/cli-install.js");
+  const cliInstall = await installClaudestraCli(REPO_ROOT);
+
+  // 8. pm2 save — 兜底（万一 install-cli 失败、用户仍在跑老的 pm2 resurrect 流程，
+  //    至少 dump 是新的）。install-cli 成功时这步没意义但也无害。
   await Bun.spawn(["pm2", "save"], { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" }).exited;
 
-  // 8. 检查 pm2 startup 是否已经配过（开机自启的 init 脚本）；没配给 hint
-  const startupWarning = await checkPm2Startup();
-
-  // 8b. 有 warning 就主动推到 #control —— JSON 输出字段几乎没人看（launcher
-  // 的 auto-update 是 detached 子进程，master 里 Bash 调用的 stdout 也经常
-  // 被卷走），只有真把消息送到 Discord，用户才会知道要去跑那条 sudo 命令。
-  if (startupWarning) {
-    await notifyPm2StartupWarning(startupWarning).catch(() => {});
+  // 9. 只有 install-cli 失败时才检查老 pm2 startup（成功时新 LaunchAgent 已接管，
+  //    再问 "你 pm2 startup 配了没" 反而误导）
+  let startupWarning: string | null = null;
+  if (cliInstall.errors.length > 0) {
+    startupWarning = await checkPm2Startup();
+    if (startupWarning) {
+      await notifyPm2StartupWarning(startupWarning).catch(() => {});
+    }
   }
 
   output({
@@ -1831,6 +1839,10 @@ async function cmdUpdate() {
     to: release.tag,
     message: `已更新到 ${release.tag} 并重启 pm2 服务`,
     masterReRendered: rendered,
+    cliInstalled: cliInstall.errors.length === 0,
+    cliWrapper: cliInstall.cliWrapper || undefined,
+    cliErrors: cliInstall.errors.length > 0 ? cliInstall.errors : undefined,
+    cliWarnings: cliInstall.warnings.length > 0 ? cliInstall.warnings : undefined,
     pm2StartupWarning: startupWarning,
     pm2StartupNotified: !!startupWarning,
   });
