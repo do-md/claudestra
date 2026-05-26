@@ -153,13 +153,18 @@ async function maybePostAutoDeny(discord: Client, state: WatcherState, reason: s
   if (now - (lastAutoDenyPost.get(state.channelId) || 0) < 15_000) return;
   lastAutoDenyPost.set(state.channelId, now);
   try {
-    const { buildComponents } = await import("./components.js");
     const text = [
       `🚫 **${state.agentName}** 一个操作被 auto 模式拦下了`,
       reason ? `原因：${reason}` : "",
       `如果这确实是你要做的，点下面临时放行（切 bypass）并让它重试。`,
     ].filter(Boolean).join("\n");
-    const components = buildComponents([
+    // 直接传 **raw** components 给 discordReply，它内部自己 buildComponents 一次。
+    // v2.2.0~v2.3.2 这里曾自己 buildComponents 一次再传给 discordReply → 双重 build：
+    // discordReply 第二次拿到的是 ActionRowBuilder（不是 raw {type:"buttons"...}），
+    // buildComponents 两个分支都不命中 → 返回空数组 → 按钮没附上去。owner 在 alipan
+    // 频道实测：两条 deny 文字都到了，但 `GET /channels/.../messages/<id>` 返回的
+    // `components` 为 `[]`，确认双重 build 吃掉了按钮。
+    await discordReply(discord, state.channelId, text, undefined, [
       {
         type: "buttons",
         buttons: [
@@ -167,7 +172,6 @@ async function maybePostAutoDeny(discord: Client, state: WatcherState, reason: s
         ],
       },
     ]);
-    await discordReply(discord, state.channelId, text, undefined, components);
     console.log(`🚫 auto-deny 通知 agent=${state.agentName} reason="${reason.slice(0, 60)}"`);
   } catch (e) {
     console.error("auto-deny 通知失败:", e);
