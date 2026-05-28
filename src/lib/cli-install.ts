@@ -103,21 +103,99 @@ function buildEnvPath(): string {
 
 /**
  * 把 `claudestra` 命令装到 ~/.local/bin（XDG 主路径）+ symlink 到 ~/.bun/bin。
- * 两个目录覆盖绝大多数用户 PATH 配置，确保打 `claudestra` 至少有一个能找到。
+ *
+ * v2.4.1+：纯 bash wrapper，**自己**做 daemon 健康检查 + tmux attach。
+ * 之前 v2.4.0 是 bun cli/claudestra.ts 跑 spawnSync 调 tmux —— iTerm 的 tmux -CC
+ * 集成需要 tmux 是 iTerm 直接子进程才会切到 native tabs 模式，绕一层 bun
+ * spawnSync 之后 iTerm 不识别 control 协议 → 看到普通 tmux attach。
+ * 改成 bash `exec tmux -CC ...` 替换当前进程，tmux 字节流直送 iTerm PTY。
  */
-async function writeCliWrapper(repoRoot: string, bunPath: string): Promise<string> {
+async function writeCliWrapper(repoRoot: string, _bunPath: string): Promise<string> {
   const home = homedir();
   const primary = `${home}/.local/bin/claudestra`;
   const fallback = `${home}/.bun/bin/claudestra`;
   await mkdir(`${home}/.local/bin`, { recursive: true });
   await mkdir(`${home}/.bun/bin`, { recursive: true });
-  const cliScript = `${repoRoot}/src/cli/claudestra.ts`;
+  const daemonLabels = DAEMONS.map((d) => `"${d.label}"`).join(" ");
   const content = `#!/usr/bin/env bash
-# claudestra — Claudestra one-shot launcher (Claudestra-installed, v2.4.0+)
-# 一打这条命令就把 launchd 三个 daemon 拉起来（没跑的就 bootstrap）+ tmux attach 到 master TUI。
-CLAUDESTRA_REPO=${JSON.stringify(repoRoot)} \\
-CLAUDESTRA_SOCK=${JSON.stringify(TMUX_SOCK)} \\
-exec ${JSON.stringify(bunPath)} ${JSON.stringify(cliScript)} "$@"
+# claudestra — one-shot launcher (Claudestra-installed, v2.4.1+)
+# 流程：
+#   1) launchctl 检查 3 个 daemon，没 load 的 bootstrap
+#   2) 已在 tmux 嵌套，提示 + 退出
+#   3) 在 iTerm：exec tmux -CC（iTerm 集成需要 tmux 是 iTerm 直接子进程）
+#   4) 不在 iTerm：osascript 唤起 iTerm 新窗口跑 attach
+set -u
+
+REPO=${JSON.stringify(repoRoot)}
+SOCK=${JSON.stringify(TMUX_SOCK)}
+DAEMONS=(${daemonLabels})
+PLIST_DIR="$HOME/Library/LaunchAgents"
+ATTACH=(tmux -S "$SOCK" -CC attach -t master)
+
+UID_NUM=$(/usr/bin/id -u)
+
+CI=$'\\033[2m▶\\033[0m'
+CO=$'\\033[32m✓\\033[0m'
+CW=$'\\033[33m⚠\\033[0m'
+CF=$'\\033[31m✗\\033[0m'
+CB=$'\\033[1;36m'
+CR=$'\\033[0m'
+
+echo "\${CB}🚀 Claudestra\${CR} \\033[2m↗ $REPO\\033[0m"
+
+missing=()
+for d in "\${DAEMONS[@]}"; do
+  /bin/launchctl list "$d" >/dev/null 2>&1 || missing+=("$d")
+done
+
+if [ \${#missing[@]} -eq 0 ]; then
+  echo "$CO launchd daemon 都在 (\${DAEMONS[*]})"
+else
+  echo "$CI daemon 缺 \${#missing[@]}/\${#DAEMONS[@]}（\${missing[*]}），bootstrap…"
+  fail=0
+  for d in "\${missing[@]}"; do
+    plist="$PLIST_DIR/$d.plist"
+    /bin/launchctl bootout "gui/$UID_NUM" "$plist" >/dev/null 2>&1 || true
+    if ! /bin/launchctl bootstrap "gui/$UID_NUM" "$plist" 2>/dev/null; then
+      echo "$CF bootstrap $d 失败 — 查 plist: $plist"
+      fail=1
+    fi
+  done
+  [ "$fail" -eq 1 ] && exit 1
+  echo "$CO daemon 都起来了"
+fi
+
+# 已在 tmux 里：不嵌套 attach
+if [ -n "\${TMUX:-}" ]; then
+  echo "$CI 已在 tmux 里 (\${TMUX%%,*})，跳过 attach 避免嵌套"
+  echo "    要进 master TUI：在 iTerm 外层（非 tmux）shell 里再跑 claudestra；"
+  echo "    或者手动：\${ATTACH[*]}"
+  exit 0
+fi
+
+# 在 iTerm：exec 替换当前进程，让 tmux 直接成为 iTerm 子进程（-CC 协议字节直送 PTY）
+if [ "\${TERM_PROGRAM:-}" = "iTerm.app" ]; then
+  echo "$CI 在 iTerm，exec tmux -CC（iTerm 集成会切到 native tabs）"
+  exec "\${ATTACH[@]}"
+fi
+
+# 不在 iTerm：osascript 唤起 iTerm 新窗口跑 attach
+echo "$CI 不在 iTerm，AppleScript 唤起 iTerm 新窗口…"
+ATTACH_STR="\${ATTACH[*]}"
+/usr/bin/osascript <<APPLESCRIPT
+tell application "iTerm"
+  activate
+  set newWindow to (create window with default profile)
+  tell current session of newWindow to write text "$ATTACH_STR"
+end tell
+APPLESCRIPT
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "$CO 已在 iTerm 打开新窗口并 attach 到 master"
+else
+  echo "$CF osascript 失败，手动跑：\${ATTACH[*]}"
+fi
+exit "$rc"
 `;
   // 老版本可能在 primary 写过 symlink（甚至 ~/.local/bin <-> ~/.bun/bin 循环），
   // writeFile 会 ELOOP；先 unlink 容错再写真实文件。
