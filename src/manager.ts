@@ -31,6 +31,7 @@ import {
   tmuxCapture,
   isIdle,
   listAgentWindows as listAgentWindowsShared,
+  listWindowIdsByName,
   ensureSocketDir,
   isAutoConfirmableModal,
   detectSessionIdlePrompt,
@@ -1087,20 +1088,33 @@ async function cmdRestart(name?: string) {
       continue;
     }
 
-    // 1. 如果 window 还活着，先尝试优雅退出；失败/window 不存在时强制 kill-window + 重建
+    // 1. 看同名 window 数量决定路径。永远不要用 ambiguous name target 做 kill
+    //    —— v2.4.2 之前这里走 `kill-window -t master:<name>`，tmux 遇到多份同名
+    //    会报 "more than one window" 错误，外层 `.catch(() => {})` 吞掉错误后
+    //    无条件 new-window，导致 launcher periodic 每分钟净增 1 个 zombie。
     //    关键：永远不创建新 Discord 频道，复用 info.channelId
     let recreated = false;
-    const windowAlive = liveWindows.includes(tmuxName) || (await windowExists(tmuxName));
-    if (windowAlive) {
+    const dupIds = await listWindowIdsByName(tmuxName);
+
+    if (dupIds.length === 0) {
+      // 真 dead，直接 new
+      recreated = true;
+    } else if (dupIds.length === 1) {
+      // 正常一份 —— 优雅退出，失败 by-id kill 这一份再 new
       const exited = await gracefulExit(tmuxName);
       if (!exited) {
-        console.log(`[restart] ${tmuxName} 优雅退出超时，kill-window + 重建 tmux window`);
-        await tmuxRaw(["kill-window", "-t", windowTarget(tmuxName)]).catch(() => {});
+        console.log(`[restart] ${tmuxName} 优雅退出超时，kill-window @${dupIds[0]} + 重建`);
+        await tmuxRaw(["kill-window", "-t", dupIds[0]]).catch(() => {});
         await Bun.sleep(500);
         recreated = true;
       }
     } else {
-      // window 已经不存在（之前可能被 gracefulExit 或其他原因杀掉了） → 直接重建
+      // 多份 zombie（历史 race / restart 死循环遗留）—— 全部 by-id kill 再 new
+      console.log(`[restart] ${tmuxName} 发现 ${dupIds.length} 个同名 zombie window，全部 kill 后重建`);
+      for (const id of dupIds) {
+        await tmuxRaw(["kill-window", "-t", id]).catch(() => {});
+      }
+      await Bun.sleep(500);
       recreated = true;
     }
 

@@ -412,6 +412,33 @@ export async function listAgentWindows(): Promise<string[]> {
   return windows.filter((w) => w.startsWith(AGENT_PREFIX));
 }
 
+/**
+ * 给定一个 agent window name，返回所有同名 window 的稳定 `@<id>` 列表。
+ *
+ * 为啥要 by id：tmux 用 `session:name` 当 target 时，多 window 同名会
+ * 报 "more than one window"；用 `@<id>` 永远唯一。kill 这种破坏性操作
+ * 必须 by id 才能避免 ambiguous 错误被 catch 吞掉、把杀的对象搞错。
+ *
+ * 返回长度：
+ *   0 = 没有该名字的 window（agent 真 dead）
+ *   1 = 正常一份
+ *  ≥2 = zombie 累积（restart 死循环 + 静默吞错的历史遗留），调用方应该全杀重建
+ */
+export async function listWindowIdsByName(name: string): Promise<string[]> {
+  const out = await tmuxRaw([
+    "list-windows",
+    "-t", MASTER_SESSION,
+    "-F", "#{window_name}\t#{window_id}",
+  ]);
+  if (!out) return [];
+  const ids: string[] = [];
+  for (const line of out.split("\n")) {
+    const [winName, id] = line.split("\t");
+    if (winName === name && id) ids.push(id);
+  }
+  return ids;
+}
+
 /** master session 是否存在 */
 export async function masterSessionExists(): Promise<boolean> {
   const out = await tmuxRaw(["list-sessions", "-F", "#{session_name}"]);
