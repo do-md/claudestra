@@ -1797,84 +1797,39 @@ async function cmdUpdate() {
   );
   await migrateProc.exited;
 
-  // 6. pm2 restart（bridge + launcher + cron-scheduler）
-  const pm2Proc = Bun.spawn(["pm2", "restart", "ecosystem.config.cjs"], {
-    cwd: REPO_ROOT,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  await new Response(pm2Proc.stdout).text();
-  await pm2Proc.exited;
+  // v2.4.0+: 不再 pm2 restart。install-cli 用 launchctl bootout+bootstrap 来
+  // reload 三个 daemon plist，每次都生效新代码；如果检测到老 pm2 进程也会顺手
+  // stop 掉避免双跑。pm2 从启动链彻底解耦。
 
   // 6b. 告诉正在跑的 master Claude Code 退出，launcher 会用新 CLAUDE.md 重启它
-  //     （pm2 restart 只重启 bridge/launcher/cron 三个后台进程，不会动 tmux 里的 master session —
-  //      不这么做的话老 master 会继续跑着旧的 CLAUDE.md 上下文）
-  await Bun.sleep(1500); // 给 launcher 稳定
+  //     （daemon reload 只重启 bridge/launcher/cron 三个后台进程，不会动 tmux 里
+  //      的 master session — 不这么做的话老 master 会继续跑着旧的 CLAUDE.md 上下文）
+  await Bun.sleep(500);
   await tmuxRaw(["send-keys", "-t", `${MASTER_SESSION}:0`, "/exit", "Enter"]).catch(() => {});
 
-  // 7. v2.3.1+: 自动装 / 刷新 `claudestra` CLI 命令 + user-level LaunchAgent
-  //    （开机自启走 ecosystem.config.cjs，告别 `pm2 save` 维护，老 pm2.<user>.plist
-  //    会被 unload + .bak 备份）。Idempotent —— 每次 update 重写同一份文件无害；
-  //    旧用户升到 v2.3.1+ 第一次就把新东西自动铺好，不用手动跑 install-cli。
+  // 7. install-cli —— 写 CLI wrapper + 3 个 daemon plist + 迁移老 pm2/老 autostart
+  //    plist + stop 老 pm2 daemon + launchctl bootstrap 三个新 plist（这一步等同于
+  //    重启 daemon，自动加载新代码）。Idempotent —— 每次 update 跑一次都安全；老用户
+  //    从 v2.3.x 升级到 v2.4.0 的第一次 update 就把所有迁移做完，全无感。
   const { installClaudestraCli } = await import("./lib/cli-install.js");
   const cliInstall = await installClaudestraCli(REPO_ROOT);
-
-  // 8. pm2 save — 兜底（万一 install-cli 失败、用户仍在跑老的 pm2 resurrect 流程，
-  //    至少 dump 是新的）。install-cli 成功时这步没意义但也无害。
-  await Bun.spawn(["pm2", "save"], { cwd: REPO_ROOT, stdout: "pipe", stderr: "pipe" }).exited;
-
-  // 9. 只有 install-cli 失败时才检查老 pm2 startup（成功时新 LaunchAgent 已接管，
-  //    再问 "你 pm2 startup 配了没" 反而误导）
-  let startupWarning: string | null = null;
-  if (cliInstall.errors.length > 0) {
-    startupWarning = await checkPm2Startup();
-    if (startupWarning) {
-      await notifyPm2StartupWarning(startupWarning).catch(() => {});
-    }
-  }
 
   output({
     ok: true,
     from: `v${local}`,
     to: release.tag,
-    message: `已更新到 ${release.tag} 并重启 pm2 服务`,
+    message: `已更新到 ${release.tag} 并 reload 三个 launchd daemon`,
     masterReRendered: rendered,
     cliInstalled: cliInstall.errors.length === 0,
     cliWrapper: cliInstall.cliWrapper || undefined,
+    daemons: cliInstall.daemons.map((d) => ({ label: d.label, loaded: d.loaded, warning: d.warning })),
+    pm2Stopped: cliInstall.pm2Stopped.length > 0 ? cliInstall.pm2Stopped : undefined,
+    oldAutostartPlist: cliInstall.oldAutostartPlist,
+    oldPm2StartupPlist: cliInstall.oldPm2StartupPlist,
+    migratedHookCommand: cliInstall.migratedHookCommand || undefined,
     cliErrors: cliInstall.errors.length > 0 ? cliInstall.errors : undefined,
     cliWarnings: cliInstall.warnings.length > 0 ? cliInstall.warnings : undefined,
-    pm2StartupWarning: startupWarning,
-    pm2StartupNotified: !!startupWarning,
   });
-}
-
-/**
- * 把 pm2 startup 缺失的提示推到 #control 频道。
- * 关键：前一步刚 pm2 restart 过 bridge，bridge 可能还没完成 Discord login，
- * 所以需要重试几次（最多 ~24s）而不是单次尝试。
- */
-async function notifyPm2StartupWarning(warning: string): Promise<void> {
-  const controlChannel = process.env.CONTROL_CHANNEL_ID || "";
-  if (!controlChannel) return;
-
-  const allowed = (process.env.ALLOWED_USER_IDS || "").split(",").filter(Boolean);
-  const mention = allowed.map((id) => `<@${id}>`).join(" ");
-  const text = [
-    `⚠️ **pm2 开机自启未配置** ${mention}`.trim(),
-    ``,
-    warning,
-    ``,
-    `不跑这个命令的话，机器重启后 Claudestra 服务（bridge/launcher/cron）不会自动回来。`,
-  ].join("\n");
-
-  for (let i = 0; i < 12; i++) {
-    try {
-      await bridgeRequest({ type: "reply", chatId: controlChannel, text });
-      return;
-    } catch {
-      await Bun.sleep(2000);
-    }
-  }
 }
 
 /**
@@ -1906,30 +1861,6 @@ async function renderMasterClaude(): Promise<{ rendered: boolean; reason?: strin
   } catch (e) {
     return { rendered: false, reason: (e as Error).message };
   }
-}
-
-/**
- * 检测 pm2 startup 是不是已经配置好（开机自启）。
- * macOS 看 ~/Library/LaunchAgents/pm2.<user>.plist；
- * Linux 看 /etc/systemd/system/pm2-<user>.service。
- * 没有就返回一条给用户的 hint 字符串，已有返回 null。
- */
-async function checkPm2Startup(): Promise<string | null> {
-  const { existsSync } = await import("fs");
-  const user = process.env.USER || "";
-  const home = process.env.HOME || "";
-  const macosPath = `${home}/Library/LaunchAgents/pm2.${user}.plist`;
-  const linuxPath = `/etc/systemd/system/pm2-${user}.service`;
-  if (existsSync(macosPath) || existsSync(linuxPath)) return null;
-
-  // 跑一次 pm2 startup 看看它会打什么 sudo 命令，喂给用户
-  const proc = Bun.spawn(["pm2", "startup"], { stdout: "pipe", stderr: "pipe" });
-  const out = await new Response(proc.stdout).text();
-  const err = await new Response(proc.stderr).text();
-  await proc.exited;
-  const match = (out + "\n" + err).match(/^\s*(sudo [^\n]+)$/m);
-  if (!match) return null;
-  return `pm2 开机自启未配置。请跑一次下面的 sudo 命令，机器重启后服务才会自动回来：\n${match[1]}`;
 }
 
 async function cmdInviteLink(args: string[]) {
@@ -2595,11 +2526,14 @@ switch (cmd) {
       output({
         ok: true,
         cliWrapper: result.cliWrapper,
-        autostartScript: result.autostartScript,
-        plistPath: result.plistPath,
-        oldPm2Plist: result.oldPm2Plist,
+        daemons: result.daemons.map((d) => ({ label: d.label, loaded: d.loaded, warning: d.warning })),
+        pm2Stopped: result.pm2Stopped.length > 0 ? result.pm2Stopped : undefined,
+        oldAutostartPlist: result.oldAutostartPlist,
+        oldPm2StartupPlist: result.oldPm2StartupPlist,
+        removedOldAutostartWrapper: result.removedOldAutostartWrapper || undefined,
+        migratedHookCommand: result.migratedHookCommand || undefined,
         warnings: result.warnings,
-        hint: "打 `claudestra` 试试 —— 自动起 pm2 + 进 master TUI。重启机器后服务也会自动起来。",
+        hint: "打 `claudestra` 试试 —— launchd 3 个 daemon + 进 master TUI。重启机器后服务也会自动起来。",
       });
     }
     break;

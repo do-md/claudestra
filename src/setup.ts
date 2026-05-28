@@ -815,13 +815,13 @@ async function stepFinalize(cfg: Config): Promise<void> {
 
   br();
 
-  // 自动跑依赖安装 + MCP 注册 + pm2 start
+  // 自动跑依赖安装 + MCP 注册 + 装 launchd daemon
   print(t("下面这些命令我可以直接帮你跑掉，一键启动:", "I can run these commands for you, one-click launch:"));
   print(`  ${c.dim}•${c.reset} ${c.cyan}bun install${c.reset}`);
   print(`  ${c.dim}•${c.reset} ${c.cyan}npx playwright install chromium${c.reset}  ${c.dim}${t("(终端截图用)", "(for terminal screenshots)")}${c.reset}`);
   print(`  ${c.dim}•${c.reset} ${c.cyan}claude mcp add ${cfg.MCP_NAME} ...${c.reset}  ${c.dim}${t("(注册 MCP server)", "(register MCP server)")}${c.reset}`);
   print(`  ${c.dim}•${c.reset} ${c.cyan}${t("注册 typing hooks", "register typing hooks")}${c.reset}  ${c.dim}${t("(写入 ~/.claude/settings.json)", "(write to ~/.claude/settings.json)")}${c.reset}`);
-  print(`  ${c.dim}•${c.reset} ${c.cyan}pm2 start ecosystem.config.cjs${c.reset}  ${c.dim}${t("(启动服务)", "(start services)")}${c.reset}`);
+  print(`  ${c.dim}•${c.reset} ${c.cyan}${t("装 claudestra 命令 + 3 个 launchd daemon", "install claudestra CLI + 3 launchd daemons")}${c.reset}  ${c.dim}${t("(开机自启 + KeepAlive)", "(boot autostart + KeepAlive)")}${c.reset}`);
   br();
 
   if (!(await confirm(t("要我一键帮你跑完吗？", "Run them all now?"), true))) {
@@ -832,7 +832,7 @@ async function stepFinalize(cfg: Config): Promise<void> {
     print(`  ${c.cyan}npx playwright install chromium${c.reset}`);
     print(`  ${c.cyan}claude mcp add ${cfg.MCP_NAME} -s user -- bun run ${REPO_ROOT}/src/channel-server.ts${c.reset}`);
     print(`  ${c.dim}# ${t("typing hooks: 手动编辑 ~/.claude/settings.json，或重跑 bun run setup", "typing hooks: edit ~/.claude/settings.json manually, or rerun bun run setup")}${c.reset}`);
-    print(`  ${c.cyan}pm2 start ecosystem.config.cjs${c.reset}`);
+    print(`  ${c.cyan}bun src/manager.ts install-cli${c.reset}  ${c.dim}${t("(写 launchd plist + 启 3 个 daemon)", "(write launchd plists + start 3 daemons)")}${c.reset}`);
     return;
   }
 
@@ -872,7 +872,10 @@ async function stepFinalize(cfg: Config): Promise<void> {
   }
 
   // 4. hooks (typing indicator) — 直接写 ~/.claude/settings.json
-  const hookCmd = `bun ${REPO_ROOT}/src/hooks/typing-hook.ts`;
+  //    用 bun 绝对路径。v2.4.0 切到 launchd 后 worker 的 /bin/sh PATH 不带 ~/.bun/bin，
+  //    用相对 "bun" 会 "command not found" 让 Stop hook 每次都报错。
+  const bunAbs = (await run(["/usr/bin/which", "bun"])).out.trim() || `${process.env.HOME}/.bun/bin/bun`;
+  const hookCmd = `${bunAbs} ${REPO_ROOT}/src/hooks/typing-hook.ts`;
   write(`${c.dim}▶${c.reset} ${t("注册 typing hooks", "Registering typing hooks")}… `);
   try {
     await registerHooks(hookCmd);
@@ -883,23 +886,11 @@ async function stepFinalize(cfg: Config): Promise<void> {
     hint(t("typing 指示器可能不会自动停止，需手动编辑 ~/.claude/settings.json", "Typing indicator may not auto-stop. Edit ~/.claude/settings.json manually."));
   }
 
-  // 5. pm2 start
-  write(`${c.dim}▶${c.reset} pm2 start ecosystem.config.cjs… `);
-  const pm2 = await run(["pm2", "start", "ecosystem.config.cjs"], { cwd: REPO_ROOT });
-  if (pm2.ok) {
-    print(`${c.green}✓${c.reset}`);
-    await run(["pm2", "save"], { cwd: REPO_ROOT });
-  } else {
-    print(`${c.red}✗${c.reset}`);
-    print(pm2.err || pm2.out);
-    warn(t("pm2 启动失败，试试: pm2 logs", "pm2 start failed — try: pm2 logs"));
-    return;
-  }
-
-  // 6. v2.3.0+: 装 `claudestra` 命令到 ~/.bun/bin + 配 user-level LaunchAgent 开机自启
-  // 用 ecosystem.config.cjs（git 里的源真相）启动，**不用 sudo、不用 pm2 save 维护**。
-  // 老的 pm2.<user>.plist（如果之前 pm2 startup 装过）会被 unload + .bak 掉。
-  write(`${c.dim}▶${c.reset} ${t("装 claudestra 命令 + 配开机自启", "Install claudestra CLI + boot autostart")}… `);
+  // 5. v2.4.0+: 装 `claudestra` 命令 + 3 个 user-level launchd plist 直管 daemon
+  //    （不再依赖 pm2 启动链 —— 之前 pm2 走 env-node 会被 brew 升级 icu4c 等弄废，
+  //    现在每个 daemon plist 直接调绝对路径的 bun 跑 .ts，唯一依赖 bun + launchd）。
+  //    迁移老 com.claudestra.autostart.plist + 老 pm2.<user>.plist + stop 老 pm2 daemon。
+  write(`${c.dim}▶${c.reset} ${t("装 claudestra 命令 + 3 个 launchd daemon", "Install claudestra CLI + 3 launchd daemons")}… `);
   try {
     const { installClaudestraCli } = await import("./lib/cli-install.js");
     const r = await installClaudestraCli(REPO_ROOT);
@@ -912,14 +903,26 @@ async function stepFinalize(cfg: Config): Promise<void> {
         `命令装在 ${c.cyan}${r.cliWrapper}${c.reset}（以后直接打 ${c.bold}claudestra${c.reset} 就行）`,
         `Wrote ${c.cyan}${r.cliWrapper}${c.reset} (just type ${c.bold}claudestra${c.reset} from anywhere)`,
       ));
-      ok(t(
-        `LaunchAgent 装在 ${c.cyan}${r.plistPath}${c.reset}（开机自启，不用 sudo）`,
-        `LaunchAgent at ${c.cyan}${r.plistPath}${c.reset} (boot autostart, no sudo needed)`,
-      ));
-      if (r.oldPm2Plist) {
+      for (const d of r.daemons) {
+        const status = d.loaded ? `${c.green}✓${c.reset} loaded` : `${c.yellow}⚠${c.reset} ${d.warning || ""}`;
+        ok(t(`${c.cyan}${d.label}${c.reset}  ${status}`, `${c.cyan}${d.label}${c.reset}  ${status}`));
+      }
+      if (r.oldAutostartPlist) {
         hint(t(
-          `老的 pm2 startup plist 已卸 + 备份成 ${c.cyan}${r.oldPm2Plist.backed}${c.reset}`,
-          `Old pm2 startup plist unloaded + backed up to ${c.cyan}${r.oldPm2Plist.backed}${c.reset}`,
+          `老 v2.3.x autostart plist 已 unload + 备份 → ${c.cyan}${r.oldAutostartPlist.backed}${c.reset}`,
+          `Old v2.3.x autostart plist unloaded + backed up → ${c.cyan}${r.oldAutostartPlist.backed}${c.reset}`,
+        ));
+      }
+      if (r.oldPm2StartupPlist) {
+        hint(t(
+          `老 pm2 startup plist 已 unload + 备份 → ${c.cyan}${r.oldPm2StartupPlist.backed}${c.reset}`,
+          `Old pm2 startup plist unloaded + backed up → ${c.cyan}${r.oldPm2StartupPlist.backed}${c.reset}`,
+        ));
+      }
+      if (r.pm2Stopped.length > 0) {
+        hint(t(
+          `老 pm2 daemon 已停 (${r.pm2Stopped.join(", ")})，避免跟 launchd 抢`,
+          `Stopped old pm2 daemons (${r.pm2Stopped.join(", ")}) to avoid clashing with launchd`,
         ));
       }
       for (const w of r.warnings) warn(w);
