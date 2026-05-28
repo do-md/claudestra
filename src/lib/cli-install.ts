@@ -237,6 +237,17 @@ function buildDaemonPlist(
     <string>${envPath}</string>
     <key>HOME</key>
     <string>${home}</string>
+    <!--
+      LANG/LC_ALL 必须注入 UTF-8 locale，否则 daemon 派生的子进程（tmux 尤其）
+      跑在 C locale 下会把 CJK 字符渲染成 '_' placeholder。导致 launcher 调
+      manager.ts list 时拿到的 tmux window name 跟 registry 里的真实 CJK name
+      不 match，永远判定 dead → 死循环 restart → zombie window 累积。
+      pm2 时代不出问题是因为 pm2 从 user shell 启动，继承了 LANG。
+    -->
+    <key>LANG</key>
+    <string>en_US.UTF-8</string>
+    <key>LC_ALL</key>
+    <string>en_US.UTF-8</string>
   </dict>
   <key>ProgramArguments</key>
   <array>
