@@ -2,7 +2,9 @@
  * Claude Code built-in slash commands — Discord 适配目录
  *
  * 来自 docs.claude.com/en/commands.md。只收那些在 Discord 桥里有意义的命令
- * （不包括 `/clear`, `/exit`, `/config` 等纯 TUI 或危险动作）。
+ * （不包括 `/exit`, `/config` 等纯 TUI 或危险动作）。
+ * v2.4.5+ 加 `/clear` —— 虽然原本归到"纯 TUI"分类，但它清 session in-memory
+ * context 这层副作用在 Discord 模式下有用（想从 fresh state 继续而不重启 agent）。
  *
  * 每条命令定义：
  *   - name: Discord slash 名（= CC slash 名，因为都是小写字母，无冲突）
@@ -57,6 +59,10 @@ export const BUILTIN_COMMANDS: BuiltinCmd[] = [
   { name: "sandbox", invokeName: "sandbox", description: "切换 sandbox 模式", options: [], argBuilder: () => "" },
   { name: "tasks", invokeName: "tasks", description: "列出 / 管理后台任务", options: [], argBuilder: () => "" },
   { name: "release-notes", invokeName: "release-notes", description: "显示 Claude Code 更新日志", options: [], argBuilder: () => "" },
+
+  // —— 状态管理 ——
+  // /clear 清当前 session 的 in-memory context（聊天历史保留在 jsonl，但下次 turn 从 fresh state 开始）
+  { name: "clear", invokeName: "clear", description: "清空当前 session 的上下文（fresh state 继续，不重启 agent）", options: [], argBuilder: () => "" },
 
   // —— 动作 ——
   {
