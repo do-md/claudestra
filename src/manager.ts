@@ -1841,6 +1841,7 @@ async function cmdUpdate() {
     oldAutostartPlist: cliInstall.oldAutostartPlist,
     oldPm2StartupPlist: cliInstall.oldPm2StartupPlist,
     migratedHookCommand: cliInstall.migratedHookCommand || undefined,
+    bumpedTmuxDashboardLimit: cliInstall.bumpedTmuxDashboardLimit,
     cliErrors: cliInstall.errors.length > 0 ? cliInstall.errors : undefined,
     cliWarnings: cliInstall.warnings.length > 0 ? cliInstall.warnings : undefined,
   });
@@ -2546,6 +2547,7 @@ switch (cmd) {
         oldPm2StartupPlist: result.oldPm2StartupPlist,
         removedOldAutostartWrapper: result.removedOldAutostartWrapper || undefined,
         migratedHookCommand: result.migratedHookCommand || undefined,
+        bumpedTmuxDashboardLimit: result.bumpedTmuxDashboardLimit,
         warnings: result.warnings,
         hint: "打 `claudestra` 试试 —— launchd 3 个 daemon + 进 master TUI。重启机器后服务也会自动起来。",
       });

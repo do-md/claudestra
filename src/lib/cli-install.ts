@@ -68,6 +68,8 @@ export interface InstallCliResult {
   removedOldAutostartWrapper: boolean;
   /** Claude Code 的 ~/.claude/settings.json 里 typing-hook command 是否被迁移成 bun 绝对路径 */
   migratedHookCommand: boolean;
+  /** iTerm 的 TmuxDashboardLimit 是否被调高（默认 10 → 200），从 oldValue → 200。null = iTerm 没装跳过；undefined = 已经 ≥ 200 无需改 */
+  bumpedTmuxDashboardLimit?: { from: number; to: number } | null;
   errors: string[];
   warnings: string[];
 }
@@ -391,6 +393,33 @@ async function migrateHookCommand(bunPath: string): Promise<boolean> {
   return true;
 }
 
+/**
+ * iTerm 默认 `TmuxDashboardLimit = 10`：tmux session windows 数 > 10 时 iTerm
+ * 把所有 windows 标 buried（不自动 open native tabs），让用户从 dashboard 手动
+ * 选 reveal。Claudestra 用户 worker 一旦超 10 个，attach 就看不到 native tabs，
+ * 还得逐个 reveal 极痛苦。
+ *
+ * v2.3.2 引入"reboot autostart 并发 restart 全部 worker"后这个 bug 才显现 ——
+ * pm2 时代用户慢慢一个个 create 不一定超 10；现在 reboot 一次性瞬间 11 个就
+ * 触发了 iTerm 的 throttle。
+ *
+ * 调到 200（基本无限制）。idempotent —— 已经 ≥ 200 就不改，让用户自己设的值
+ * 不被覆盖。iTerm 没装就跳过。
+ */
+async function bumpITermTmuxDashboardLimit(): Promise<{ from: number; to: number } | null | undefined> {
+  // 检查 iTerm 是否装了
+  if (!existsSync("/Applications/iTerm.app")) return null;
+  const TARGET = 200;
+  // defaults read 拿当前值（没设过 → 用 iTerm 默认 10）
+  const r = spawnSync("defaults", ["read", "com.googlecode.iterm2", "TmuxDashboardLimit"], { encoding: "utf8" });
+  const current = r.status === 0 ? parseInt((r.stdout || "").trim(), 10) : 10;
+  if (Number.isFinite(current) && current >= TARGET) return undefined;
+  const from = Number.isFinite(current) ? current : 10;
+  const w = spawnSync("defaults", ["write", "com.googlecode.iterm2", "TmuxDashboardLimit", "-int", String(TARGET)], { encoding: "utf8" });
+  if (w.status !== 0) return null;
+  return { from, to: TARGET };
+}
+
 /** v2.3.x 写过的 ~/.bun/bin/claudestra-autostart 现在没用了，清掉。 */
 async function removeOldAutostartWrapper(): Promise<boolean> {
   const target = `${homedir()}/.bun/bin/claudestra-autostart`;
@@ -457,6 +486,11 @@ export async function installClaudestraCli(repoRoot: string): Promise<InstallCli
   //     不然 worker 跑 hook 时 /bin/sh PATH 没 ~/.bun/bin，bun 找不到）
   try { result.migratedHookCommand = await migrateHookCommand(bunPath); }
   catch (e) { warnings.push(`迁移 hook command: ${(e as Error).message}`); }
+
+  // 5c) 调高 iTerm TmuxDashboardLimit（默认 10 让 > 10 windows 全 bury，参考
+  //     bumpITermTmuxDashboardLimit 注释里完整背景）
+  try { result.bumpedTmuxDashboardLimit = await bumpITermTmuxDashboardLimit(); }
+  catch (e) { warnings.push(`调 iTerm TmuxDashboardLimit: ${(e as Error).message}`); }
 
   // 6) bootstrap 3 个新 plist
   const uid = getUid();
