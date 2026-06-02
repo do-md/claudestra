@@ -938,6 +938,46 @@ discord.once("ready", async () => {
       console.error("定时 skill 重扫失败:", e);
     }
   }, 30 * 60_000);
+
+  // v2.4.6+: Discord gateway WS 健康看门狗。
+  // 现象：discord.js gateway WebSocket 偶尔静默断开（discord.js 内部 zombie state），
+  // client 不触发 reconnect、bridge 进程主循环还活着、HTTP /hook + outbound REST API
+  // 还能用，但收不到任何 messageCreate / interactionCreate event。用户看到 worker
+  // / master 对 Discord 消息无响应，但 agent reply() 出来的还能看到。
+  // 兜底：连续 5 次（5min）ws.status 不是 READY 就 process.exit(1)，launchd KeepAlive
+  // 自动拉起 bridge，走全新 ready setup 全部恢复。
+  let unhealthyTicks = 0;
+  setInterval(() => {
+    const status = (discord as any).ws?.status;
+    if (status === 0) {
+      unhealthyTicks = 0;
+    } else {
+      unhealthyTicks++;
+      console.warn(`⚠️ Discord gateway WS status=${status} (≠READY) — unhealthy ${unhealthyTicks}/5`);
+      if (unhealthyTicks >= 5) {
+        console.error(`💀 Discord gateway WS 持续 5 分钟非 READY — exit 让 launchd KeepAlive 重启 bridge`);
+        process.exit(1);
+      }
+    }
+  }, 60_000);
+});
+
+// v2.4.6+: shard 事件监听 — discord.js gateway 异常的诊断信号。
+// 这些事件本身不一定意味着真死了；触发 KeepAlive 重启交给上面的 5 分钟看门狗判定。
+discord.on("shardDisconnect" as any, (event: any, shardId: number) => {
+  console.warn(`⚠️ shard ${shardId} disconnect: code=${event?.code} reason="${event?.reason || ""}"`);
+});
+discord.on("shardError" as any, (error: Error, shardId: number) => {
+  console.error(`⚠️ shard ${shardId} error: ${error?.message}`);
+});
+discord.on("shardReconnecting" as any, (shardId: number) => {
+  console.log(`🔄 shard ${shardId} reconnecting…`);
+});
+discord.on("shardResume" as any, (shardId: number, replayed: number) => {
+  console.log(`✅ shard ${shardId} resumed (replayed ${replayed} events)`);
+});
+discord.on("shardReady" as any, (shardId: number) => {
+  console.log(`✅ shard ${shardId} ready`);
 });
 
 // ────────────────────────────────────────────────
