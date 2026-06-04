@@ -70,6 +70,8 @@ export interface InstallCliResult {
   migratedHookCommand: boolean;
   /** iTerm 的 TmuxDashboardLimit 是否被调高（默认 10 → 200），从 oldValue → 200。null = iTerm 没装跳过；undefined = 已经 ≥ 200 无需改 */
   bumpedTmuxDashboardLimit?: { from: number; to: number } | null;
+  /** ~/.claude/settings.json permissions.allow 加进去的 mcp__<MCP_NAME>__* 工具（已存在的不重加） */
+  allowedClaudestraTools?: { added: string[] } | null;
   errors: string[];
   warnings: string[];
 }
@@ -394,6 +396,69 @@ async function migrateHookCommand(bunPath: string): Promise<boolean> {
 }
 
 /**
+ * Claudestra 的 MCP 工具（reply / send_to_agent / react / fetch_messages /
+ * edit_message / list_shared_channels）在 Claude Code auto permission mode 下
+ * 会被 classifier 误判成"未经用户允许的对外发布"自动拒绝：
+ *
+ *   "Permission for this action was denied by the Claude Code auto mode classifier.
+ *    Reason: Posting a reply to an external chat the user never asked about
+ *    — unauthorized outbound submission under the user's identity."
+ *
+ * 但这些 MCP 工具就是 Claudestra agent 的核心任务（reply 给 Discord 用户是
+ * 主作业，不是"擅自发布"）。Claude Code 的 classifier 看不懂 Claudestra 语境，
+ * 必然误拦。
+ *
+ * 修：~/.claude/settings.json 的 permissions.allow 加 `mcp__<MCP_NAME>__*` 6 个
+ * 工具，让 auto classifier 跳过这些工具直接放行。idempotent —— 已存在的 entry
+ * 不重复加，其他用户自己加的 allow rule 完全保留。
+ */
+async function ensureClaudestraToolsAllowed(): Promise<{ added: string[] } | null> {
+  const settingsPath = `${homedir()}/.claude/settings.json`;
+  if (!existsSync(settingsPath)) return null;
+  let raw: string;
+  try { raw = await readFile(settingsPath, "utf-8"); } catch { return null; }
+  let settings: any;
+  try { settings = JSON.parse(raw); } catch { return null; }
+  if (!settings.permissions || typeof settings.permissions !== "object") {
+    settings.permissions = {};
+  }
+  if (!Array.isArray(settings.permissions.allow)) {
+    settings.permissions.allow = [];
+  }
+  // MCP_NAME 默认 "claudestra"；用户可通过 env 改，但 install-cli 跑时 process.env
+  // 已经是 user shell env（不是 launchd），能拿到正确值。读 .env 文件做兜底。
+  let mcpName = process.env.MCP_NAME || "";
+  if (!mcpName) {
+    try {
+      const envText = await readFile(`${homedir()}/repos/claude-orchestrator/.env`, "utf-8").catch(() => "");
+      const m = envText.match(/^MCP_NAME\s*=\s*(.+)$/m);
+      if (m) mcpName = m[1].trim().replace(/^["']|["']$/g, "");
+    } catch { /* */ }
+  }
+  if (!mcpName) mcpName = "claudestra";
+  const prefix = `mcp__${mcpName.replace(/-/g, "_")}__`;
+  const tools = [
+    `${prefix}reply`,
+    `${prefix}send_to_agent`,
+    `${prefix}react`,
+    `${prefix}fetch_messages`,
+    `${prefix}edit_message`,
+    `${prefix}list_shared_channels`,
+  ];
+  const existing = new Set<string>(settings.permissions.allow);
+  const added: string[] = [];
+  for (const t of tools) {
+    if (!existing.has(t)) {
+      settings.permissions.allow.push(t);
+      added.push(t);
+    }
+  }
+  if (added.length === 0) return null;
+  await writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+  return { added };
+}
+
+/**
  * iTerm 默认 `TmuxDashboardLimit = 10`：tmux session windows 数 > 10 时 iTerm
  * 把所有 windows 标 buried（不自动 open native tabs），让用户从 dashboard 手动
  * 选 reveal。Claudestra 用户 worker 一旦超 10 个，attach 就看不到 native tabs，
@@ -491,6 +556,12 @@ export async function installClaudestraCli(repoRoot: string): Promise<InstallCli
   //     bumpITermTmuxDashboardLimit 注释里完整背景）
   try { result.bumpedTmuxDashboardLimit = await bumpITermTmuxDashboardLimit(); }
   catch (e) { warnings.push(`调 iTerm TmuxDashboardLimit: ${(e as Error).message}`); }
+
+  // 5d) 把 mcp__claudestra__* 工具加到 settings.json permissions.allow，
+  //     避免 Claude Code auto mode classifier 把 reply / send_to_agent 等误判成
+  //     "未经用户允许的对外发布"自动拒绝（参考 ensureClaudestraToolsAllowed 注释）
+  try { result.allowedClaudestraTools = await ensureClaudestraToolsAllowed(); }
+  catch (e) { warnings.push(`allow mcp__claudestra__* 工具: ${(e as Error).message}`); }
 
   // 6) bootstrap 3 个新 plist
   const uid = getUid();
