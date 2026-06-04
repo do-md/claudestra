@@ -13,7 +13,14 @@ export async function getGitHubRepo(): Promise<string | null> {
   });
   const url = (await new Response(proc.stdout).text()).trim();
   await proc.exited;
-  const match = url.match(/github\.com[:/]([^/]+\/[^/.]+)/);
+  // 支持的 url 形式：
+  //   git@github.com:owner/repo.git                       (SSH 短)
+  //   https://github.com/owner/repo.git                   (HTTPS)
+  //   ssh://git@github.com/owner/repo.git                 (SSH 长)
+  //   ssh://git@ssh.github.com:443/owner/repo.git         (SSH over 443，gh CLI 默认配)
+  // 注意：`(?::\d+)?` 必须放在 host 跟分隔符之间，否则 [:/] 会先匹配 ':' 把 port
+  // 当成 owner（v2.4.6 之前 autoUpdate 在 SSH-443 环境永远失效就栽在这）。
+  const match = url.match(/github\.com(?::\d+)?[:/]([^/]+\/[^/.]+)/);
   return match ? match[1] : null;
 }
 
