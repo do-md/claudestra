@@ -1690,6 +1690,18 @@ discord.on("channelCreate", async (channel) => {
   if (channel.guild.id === DISCORD_GUILD_ID) return;
   const textCh = channel as TextChannel;
   if (typeof textCh.isTextBased !== "function" || !textCh.isTextBased()) return;
+  // v2.4.8+: 只通知有 bot-specific allow ViewChannel overwrite 的新频道。
+  // 否则对方 guild 里随便建个 #news / #us-stock 频道我们 bot 默认 inherit
+  // @everyone 的 ViewChannel 也能看到 → 误报"对方主动给我们权限"。Claudestra
+  // peer 用 discordCreateChannel 主动 share 时会显式 allow ViewChannel for our
+  // bot id，这种才算真 grant。
+  const me = textCh.guild.members.me;
+  const myOverwrite = me ? textCh.permissionOverwrites.cache.get(me.id) : null;
+  const explicitGrant = !!myOverwrite?.allow.has("ViewChannel");
+  if (!explicitGrant) {
+    console.log(`👀 外部 guild 新频道（无 bot-specific allow，忽略）: #${textCh.name} in ${textCh.guild?.name}`);
+    return;
+  }
   console.log(`🎉 外部 guild 新频道访问: #${textCh.name} in ${textCh.guild?.name}`);
   await notifyMaster(
     [
@@ -1725,8 +1737,13 @@ discord.on("channelUpdate", async (oldCh: any, newCh: any) => {
   const me = newCh.guild.members.me;
   if (!me) return;
   try {
-    const oldCanView = oldCh.permissionsFor(me)?.has("ViewChannel") ?? false;
-    const newCanView = newCh.permissionsFor(me)?.has("ViewChannel") ?? false;
+    // v2.4.8+: 用 bot-specific overwrite 是否 explicit allow ViewChannel 来判定，
+    // 不再用 effective permissionsFor —— 后者把对方 guild 改 @everyone 全员权限
+    // 也算成"对方 grant 我们 bot"，误报。
+    const oldOw = oldCh.permissionOverwrites?.cache?.get(me.id);
+    const newOw = newCh.permissionOverwrites?.cache?.get(me.id);
+    const oldCanView = !!oldOw?.allow?.has?.("ViewChannel");
+    const newCanView = !!newOw?.allow?.has?.("ViewChannel");
     if (!oldCanView && newCanView) {
       console.log(`🎉 外部 guild 新获授权: #${newCh.name} in ${newCh.guild.name}`);
       await notifyMaster(
