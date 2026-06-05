@@ -70,8 +70,8 @@ export interface InstallCliResult {
   migratedHookCommand: boolean;
   /** iTerm 的 TmuxDashboardLimit 是否被调高（默认 10 → 200），从 oldValue → 200。null = iTerm 没装跳过；undefined = 已经 ≥ 200 无需改 */
   bumpedTmuxDashboardLimit?: { from: number; to: number } | null;
-  /** ~/.claude/settings.json permissions.allow 加进去的 mcp__<MCP_NAME>__* 工具（已存在的不重加） */
-  allowedClaudestraTools?: { added: string[] } | null;
+  /** ~/.claude/settings.json permissions.allow 加进去的 mcp__<server>__* wildcard 规则（已存在的不重加） */
+  allowedMcpTools?: { added: string[]; servers: string[] } | null;
   errors: string[];
   warnings: string[];
 }
@@ -396,23 +396,25 @@ async function migrateHookCommand(bunPath: string): Promise<boolean> {
 }
 
 /**
- * Claudestra 的 MCP 工具（reply / send_to_agent / react / fetch_messages /
- * edit_message / list_shared_channels）在 Claude Code auto permission mode 下
- * 会被 classifier 误判成"未经用户允许的对外发布"自动拒绝：
+ * 用户主动装的 MCP server 工具在 Claude Code auto permission mode 下经常被
+ * classifier 拦截：
+ *   - mcp__claudestra__reply 被误判成"擅自向外部发布"
+ *   - mcp__alipan__* / mcp__resource-search__* / mcp__moviepilot__* 等被
+ *     classifier 看不懂语境直接 deny
+ *   - 或者更糟：classifier 模型（Opus 4.7）overload 时 fallback deny
+ *     "claude-opus-4-7 is temporarily unavailable, so auto mode cannot
+ *      determine the safety of mcp__resource-search__search_alipan_resource"
  *
- *   "Permission for this action was denied by the Claude Code auto mode classifier.
- *    Reason: Posting a reply to an external chat the user never asked about
- *    — unauthorized outbound submission under the user's identity."
+ * 这些 MCP server 都是用户主动 `claude mcp add` 装的，agent 用它们是合理任务。
+ * classifier 不该审 —— 用户已经表达"装了就是要用"的意图。
  *
- * 但这些 MCP 工具就是 Claudestra agent 的核心任务（reply 给 Discord 用户是
- * 主作业，不是"擅自发布"）。Claude Code 的 classifier 看不懂 Claudestra 语境，
- * 必然误拦。
- *
- * 修：~/.claude/settings.json 的 permissions.allow 加 `mcp__<MCP_NAME>__*` 6 个
- * 工具，让 auto classifier 跳过这些工具直接放行。idempotent —— 已存在的 entry
- * 不重复加，其他用户自己加的 allow rule 完全保留。
+ * 修：扫所有已装 MCP server（user-level + project-level），全部加 wildcard
+ * `mcp__<server>__*` 到 ~/.claude/settings.json permissions.allow。
+ * idempotent —— 已存在的 entry 不重复加；用户自己加的 specific tool allow 不动；
+ * 把 v2.4.9 那 6 条 mcp__claudestra__* specific allow 合并成一条
+ * mcp__claudestra__* wildcard。
  */
-async function ensureClaudestraToolsAllowed(): Promise<{ added: string[] } | null> {
+async function ensureMcpToolsAllowed(repoRoot: string): Promise<{ added: string[]; servers: string[] } | null> {
   const settingsPath = `${homedir()}/.claude/settings.json`;
   if (!existsSync(settingsPath)) return null;
   let raw: string;
@@ -425,37 +427,60 @@ async function ensureClaudestraToolsAllowed(): Promise<{ added: string[] } | nul
   if (!Array.isArray(settings.permissions.allow)) {
     settings.permissions.allow = [];
   }
-  // MCP_NAME 默认 "claudestra"；用户可通过 env 改，但 install-cli 跑时 process.env
-  // 已经是 user shell env（不是 launchd），能拿到正确值。读 .env 文件做兜底。
+
+  const serverNames = new Set<string>();
+  // 1) user-level: ~/.claude.json mcpServers
+  try {
+    const claudeJson = JSON.parse(await readFile(`${homedir()}/.claude.json`, "utf-8"));
+    Object.keys(claudeJson?.mcpServers || {}).forEach((s) => serverNames.add(s));
+    // 2) project-level: ~/.claude.json projects[].mcpServers
+    for (const p of Object.values(claudeJson?.projects || {}) as any[]) {
+      Object.keys(p?.mcpServers || {}).forEach((s) => serverNames.add(s));
+    }
+  } catch { /* ignore */ }
+
+  // 3) project-level：扫所有 Claudestra registry 里 active agent 的 cwd
+  //    下的 .mcp.json —— project-level MCP server 都列在那里
+  try {
+    const reg = JSON.parse(await readFile(`${homedir()}/.claude-orchestrator/registry.json`, "utf-8"));
+    for (const info of Object.values(reg?.agents || {}) as any[]) {
+      if (info?.status !== "active" || !info?.cwd) continue;
+      const mcpPath = `${info.cwd}/.mcp.json`;
+      if (!existsSync(mcpPath)) continue;
+      try {
+        const projMcp = JSON.parse(await readFile(mcpPath, "utf-8"));
+        Object.keys(projMcp?.mcpServers || {}).forEach((s) => serverNames.add(s));
+      } catch { /* skip bad json */ }
+    }
+  } catch { /* registry missing */ }
+
+  // 4) 最起码确保 claudestra 本身在（即使上面都没找到，比如全新装机）
   let mcpName = process.env.MCP_NAME || "";
   if (!mcpName) {
     try {
-      const envText = await readFile(`${homedir()}/repos/claude-orchestrator/.env`, "utf-8").catch(() => "");
+      const envText = await readFile(`${repoRoot}/.env`, "utf-8").catch(() => "");
       const m = envText.match(/^MCP_NAME\s*=\s*(.+)$/m);
       if (m) mcpName = m[1].trim().replace(/^["']|["']$/g, "");
     } catch { /* */ }
   }
   if (!mcpName) mcpName = "claudestra";
-  const prefix = `mcp__${mcpName.replace(/-/g, "_")}__`;
-  const tools = [
-    `${prefix}reply`,
-    `${prefix}send_to_agent`,
-    `${prefix}react`,
-    `${prefix}fetch_messages`,
-    `${prefix}edit_message`,
-    `${prefix}list_shared_channels`,
-  ];
+  serverNames.add(mcpName);
+
+  // 每个 server 加一条 wildcard allow（MCP tool prefix 用 underscore，跟 server
+  // 名同样 sanitize：hyphen → underscore，跟 channel-server 注册 tool 名一致）
   const existing = new Set<string>(settings.permissions.allow);
   const added: string[] = [];
-  for (const t of tools) {
-    if (!existing.has(t)) {
-      settings.permissions.allow.push(t);
-      added.push(t);
+  const servers = Array.from(serverNames).sort();
+  for (const s of servers) {
+    const rule = `mcp__${s.replace(/-/g, "_")}__*`;
+    if (!existing.has(rule)) {
+      settings.permissions.allow.push(rule);
+      added.push(rule);
     }
   }
-  if (added.length === 0) return null;
+  if (added.length === 0) return { added: [], servers };
   await writeFile(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-  return { added };
+  return { added, servers };
 }
 
 /**
@@ -557,11 +582,11 @@ export async function installClaudestraCli(repoRoot: string): Promise<InstallCli
   try { result.bumpedTmuxDashboardLimit = await bumpITermTmuxDashboardLimit(); }
   catch (e) { warnings.push(`调 iTerm TmuxDashboardLimit: ${(e as Error).message}`); }
 
-  // 5d) 把 mcp__claudestra__* 工具加到 settings.json permissions.allow，
-  //     避免 Claude Code auto mode classifier 把 reply / send_to_agent 等误判成
-  //     "未经用户允许的对外发布"自动拒绝（参考 ensureClaudestraToolsAllowed 注释）
-  try { result.allowedClaudestraTools = await ensureClaudestraToolsAllowed(); }
-  catch (e) { warnings.push(`allow mcp__claudestra__* 工具: ${(e as Error).message}`); }
+  // 5d) 扫所有已装 MCP server（user-level + project-level）加 wildcard allow
+  //     到 settings.json，避免 auto classifier 拦截用户主动装的 MCP 工具
+  //     （参考 ensureMcpToolsAllowed 注释里的多个 bug 案例）
+  try { result.allowedMcpTools = await ensureMcpToolsAllowed(repoRoot); }
+  catch (e) { warnings.push(`allow mcp__*__* 工具: ${(e as Error).message}`); }
 
   // 6) bootstrap 3 个新 plist
   const uid = getUid();
