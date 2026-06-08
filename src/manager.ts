@@ -419,9 +419,15 @@ async function cmdCreate(
     return;
   }
 
-  // 新建交互 agent 默认 auto（classifier，安全操作自动批、危险操作走 Discord 批准）。
-  // cron 等无人值守场景由调用方显式传 --mode bypassPermissions。
-  const mode = (permissionMode && permissionMode.trim()) || "auto";
+  // v2.4.11+: 新建 agent 默认 bypassPermissions（v2.1.0 - v2.4.10 默认 auto，回退）。
+  // 实测 auto classifier 在 Claudestra 语境下是负优化：classifier 模型（Opus 4.7）
+  // 过载会 fallback deny 全部 tool call、误判 reply 是"擅自向外发布"、每装一个新
+  // MCP server 都得 install-cli 重写 allow list、每次 tool call 加几百 ms 延迟。
+  // 真危险命令（rm -rf / git push --force / git reset --hard / chmod 777 等）已经
+  // 在 --disallowedTools 硬黑名单里跟 permission mode 正交，bypass 也拦得住。
+  // worker 都是 owner 主动 manager.ts create 创建 + agent prompt owner 写的，没
+  // "路过 agent 偷跑命令"的威胁模型。auto 净亏。
+  const mode = (permissionMode && permissionMode.trim()) || "bypassPermissions";
   if (!isKnownPermissionMode(mode)) {
     output({
       ok: false,
@@ -591,8 +597,8 @@ async function cmdResume(
     return;
   }
 
-  // resume 也是交互 agent，默认 auto；可被 --mode 覆盖。
-  const mode = (permissionMode && permissionMode.trim()) || "auto";
+  // v2.4.11+: resume 也回 bypassPermissions 默认（同 cmdCreate 注释里的理由）。
+  const mode = (permissionMode && permissionMode.trim()) || "bypassPermissions";
   if (!isKnownPermissionMode(mode)) {
     output({
       ok: false,
