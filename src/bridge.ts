@@ -964,8 +964,28 @@ discord.once("ready", async () => {
 
 // v2.4.6+: shard 事件监听 — discord.js gateway 异常的诊断信号。
 // 这些事件本身不一定意味着真死了；触发 KeepAlive 重启交给上面的 5 分钟看门狗判定。
+// v2.4.12+: 加 disconnect 频率看门狗 —— 5min ws.status 看门狗漏掉了"反复 disconnect
+// + 每次都立刻 resume"的情况（单次断连几秒钟，下次 tick 时 ws.status 已回 READY，
+// unhealthyTicks 清零）。但每次 disconnect 都会让 Discord 丢失短 TTL 事件，尤其
+// interaction event（3s 内必须 ack 否则 user 看到"交互失败"）。24h 内 10 次 disconnect
+// 累积起来 = 几十个 interaction 漏 dispatch = user 报"所有按钮都点不了"。
+// 阈值：30min 滑窗内累计 ≥3 次 disconnect 就 process.exit 让 launchd 重建全新连接。
+// 单次 disconnect→resume 是 Discord gateway 正常行为（区域迁移 / 网络抖动），不该触发。
+const reconnectTimestamps: number[] = [];
+const RECONNECT_WINDOW_MS = 30 * 60_000;
+const RECONNECT_THRESHOLD = 3;
 discord.on("shardDisconnect" as any, (event: any, shardId: number) => {
   console.warn(`⚠️ shard ${shardId} disconnect: code=${event?.code} reason="${event?.reason || ""}"`);
+  const now = Date.now();
+  reconnectTimestamps.push(now);
+  const cutoff = now - RECONNECT_WINDOW_MS;
+  while (reconnectTimestamps.length > 0 && reconnectTimestamps[0] < cutoff) {
+    reconnectTimestamps.shift();
+  }
+  if (reconnectTimestamps.length >= RECONNECT_THRESHOLD) {
+    console.error(`💀 30min 内 shard disconnect ${reconnectTimestamps.length} 次，interaction event 漏 dispatch 风险高 — exit 让 launchd KeepAlive 重建 gateway 连接`);
+    process.exit(1);
+  }
 });
 discord.on("shardError" as any, (error: Error, shardId: number) => {
   console.error(`⚠️ shard ${shardId} error: ${error?.message}`);
