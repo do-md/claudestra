@@ -427,7 +427,10 @@ async function cmdCreate(
   // 在 --disallowedTools 硬黑名单里跟 permission mode 正交，bypass 也拦得住。
   // worker 都是 owner 主动 manager.ts create 创建 + agent prompt owner 写的，没
   // "路过 agent 偷跑命令"的威胁模型。auto 净亏。
-  const mode = (permissionMode && permissionMode.trim()) || "bypassPermissions";
+  // v2.4.13+ 彻底把 "auto" 当 deprecated alias 归一到 bypassPermissions，老 registry
+  // 里残留的 `permissionMode: "auto"` 显式值也不再让它复活。
+  let mode = (permissionMode && permissionMode.trim()) || "bypassPermissions";
+  if (mode === "auto") mode = "bypassPermissions";
   if (!isKnownPermissionMode(mode)) {
     output({
       ok: false,
@@ -598,7 +601,9 @@ async function cmdResume(
   }
 
   // v2.4.11+: resume 也回 bypassPermissions 默认（同 cmdCreate 注释里的理由）。
-  const mode = (permissionMode && permissionMode.trim()) || "bypassPermissions";
+  // v2.4.13+: "auto" → bypassPermissions 归一，老 registry 里的显式 auto 不再复活。
+  let mode = (permissionMode && permissionMode.trim()) || "bypassPermissions";
+  if (mode === "auto") mode = "bypassPermissions";
   if (!isKnownPermissionMode(mode)) {
     output({
       ok: false,

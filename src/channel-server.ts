@@ -39,6 +39,7 @@ if (!CHANNEL_ID) {
 
 let bridgeWs: WebSocket | null = null;
 let registered = false;
+let wasRegistered = false; // v2.4.13+ grace-queue 用：只对"曾经活过"才入队，否则直接 reject
 let replaced = false; // bridge 通知此 channel-server 被新连接取代，跳过重连直接退出
 const pendingRequests = new Map<
   string,
@@ -47,6 +48,45 @@ const pendingRequests = new Map<
 let requestCounter = 0;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 60_000;
+
+// v2.4.13+ grace-period queue：WS 跟 bridge 断了的时候，新进来的 MCP 请求不立刻
+// reject，而是入队等 WS 重连后重发。这样 Claude Code 在短暂 WS flap（典型 2-5s）
+// 期间不会收到 "Bridge 连接断开" 错误，也就不会把 claudestra MCP 标 "disconnected"。
+// 实测 Claude Code 不会在 stdio EOF 时自动 respawn，也不会在 /mcp 触发时自动重连，
+// 所以 reply 工具一旦掉就只能用户手敲 /mcp + 菜单选重连。预防 > 治疗：让 channel-server
+// 在 WS gap 期间表现得像"慢一点的成功"而不是"快速的失败"。
+const GRACE_QUEUE_MS = 15_000;
+interface QueuedSender {
+  send: () => void;
+  reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+const queuedSenders: QueuedSender[] = [];
+
+function flushQueuedSenders() {
+  if (!queuedSenders.length) return;
+  console.error(`🔁 WS 恢复，flush ${queuedSenders.length} 个排队请求`);
+  // 拷贝后清空，避免 send 路径里再次入队产生死循环
+  const snapshot = queuedSenders.splice(0, queuedSenders.length);
+  for (const q of snapshot) {
+    clearTimeout(q.timer);
+    try {
+      q.send();
+    } catch (err) {
+      q.reject(err as Error);
+    }
+  }
+}
+
+function rejectQueuedSenders(reason: string) {
+  if (!queuedSenders.length) return;
+  console.error(`❌ ${reason}，reject ${queuedSenders.length} 个排队请求`);
+  const snapshot = queuedSenders.splice(0, queuedSenders.length);
+  for (const q of snapshot) {
+    clearTimeout(q.timer);
+    q.reject(new Error(reason));
+  }
+}
 
 // v2.2.0+: keepalive —— 定期给 bridge 发 ping，重置 Bun 的 ws idleTimeout，避免空闲
 // 连接被关。bridge 收到 type:"ping" 不做实质处理（收到本身就重置 idle），可回 pong。
@@ -102,6 +142,9 @@ function connectBridge(): Promise<void> {
 
       if (msg.type === "registered") {
         registered = true;
+        wasRegistered = true;
+        // v2.4.13+ WS 重连成功 → 把 grace 期间排队的请求全部重发
+        flushQueuedSenders();
         resolve();
         return;
       }
@@ -159,6 +202,8 @@ function connectBridge(): Promise<void> {
       // code 1000 仍只意味着对端干净关闭（如 bridge 重启）→ 应重连，不退出。
       if (replaced || event.code === 4001) {
         console.error("👋 channel-server 退出（被新连接取代）");
+        // 退出前 reject 所有排队请求（Claude Code 会立刻收到错误而不是等 15s 超时）
+        rejectQueuedSenders("channel-server 被新连接取代");
         process.exit(0);
       }
 
@@ -177,28 +222,63 @@ function connectBridge(): Promise<void> {
 
 function bridgeRequest(msg: any): Promise<any> {
   return new Promise((resolve, reject) => {
-    if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
-      reject(new Error("Bridge 未连接"));
+    // v2.4.13+ grace-queue：WS 断了但 channel-server 之前注册成功过 → 入队等重连，
+    // 而不是立刻 reject。让 Claude Code 在 WS flap 期间体验"慢一点的成功"而不是
+    // "立即失败"。失败会触发 Claude Code 把 MCP server 标 "disconnected"，必须用户
+    // 手敲 /mcp + 菜单选择才能恢复，这是我们要根除的痛点。
+    const wsReady = bridgeWs && bridgeWs.readyState === WebSocket.OPEN && registered;
+    if (!wsReady) {
+      if (!wasRegistered) {
+        // 初次连接都还没成功 → 入队也救不回来，直接 reject
+        reject(new Error("Bridge 未连接（channel-server 尚未初次注册）"));
+        return;
+      }
+      // 入队，给 15s 宽限等 WS 恢复
+      const entry: QueuedSender = {
+        send: () => doSend(msg, resolve, reject),
+        reject,
+        timer: setTimeout(() => {
+          const idx = queuedSenders.indexOf(entry);
+          if (idx >= 0) queuedSenders.splice(idx, 1);
+          reject(new Error(`Bridge 断开超 ${GRACE_QUEUE_MS}ms 没恢复`));
+        }, GRACE_QUEUE_MS),
+      };
+      queuedSenders.push(entry);
+      console.error(
+        `⏸ WS 断开，请求入队等重连（队列长度=${queuedSenders.length}）`
+      );
       return;
     }
-    const requestId = `req_${++requestCounter}`;
-    msg.requestId = requestId;
-    pendingRequests.set(requestId, { resolve, reject });
-    const timer = setTimeout(() => {
-      if (pendingRequests.has(requestId)) {
-        pendingRequests.delete(requestId);
-        reject(new Error("Bridge 请求超时"));
-      }
-    }, 30000);
-    try {
-      bridgeWs.send(JSON.stringify(msg));
-    } catch (err) {
-      // send 失败时同样清理，防止泄漏
-      clearTimeout(timer);
-      pendingRequests.delete(requestId);
-      reject(err as Error);
-    }
+    doSend(msg, resolve, reject);
   });
+}
+
+function doSend(
+  msg: any,
+  resolve: (v: any) => void,
+  reject: (e: Error) => void
+) {
+  if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
+    reject(new Error("Bridge 未连接（doSend 时 WS 不可用）"));
+    return;
+  }
+  const requestId = `req_${++requestCounter}`;
+  msg.requestId = requestId;
+  pendingRequests.set(requestId, { resolve, reject });
+  const timer = setTimeout(() => {
+    if (pendingRequests.has(requestId)) {
+      pendingRequests.delete(requestId);
+      reject(new Error("Bridge 请求超时"));
+    }
+  }, 30000);
+  try {
+    bridgeWs.send(JSON.stringify(msg));
+  } catch (err) {
+    // send 失败时同样清理，防止泄漏
+    clearTimeout(timer);
+    pendingRequests.delete(requestId);
+    reject(err as Error);
+  }
 }
 
 // ============================================================

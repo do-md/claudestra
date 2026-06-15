@@ -33,10 +33,11 @@ describe("isKnownPermissionMode", () => {
 });
 
 describe("buildClaudeCommand permission mode", () => {
-  test("auto → --permission-mode auto，不带 skip-permissions", () => {
+  test("auto → 归一到 bypassPermissions（v2.4.13+ 彻底 deprecated）", () => {
     const cmd = buildClaudeCommand({ ...base, permissionMode: "auto" });
-    expect(cmd).toContain("--permission-mode auto");
-    expect(cmd).not.toContain("--dangerously-skip-permissions");
+    expect(cmd).toContain("--dangerously-skip-permissions");
+    expect(cmd).not.toContain("--permission-mode auto");
+    expect(cmd).not.toContain("--permission-mode bypassPermissions");
   });
 
   test("bypassPermissions → --dangerously-skip-permissions，不带 --permission-mode", () => {

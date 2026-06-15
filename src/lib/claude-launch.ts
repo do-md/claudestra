@@ -89,19 +89,24 @@ export const DEFAULT_PRESET = "default";
 // Claude Code 2.1.x 的 `--permission-mode <mode>`：
 //   default          — 正常逐个问权限
 //   acceptEdits      — 自动接受文件编辑，其余照问
-//   auto             — classifier 判定：安全操作自动批，危险操作弹权限框（→ 我们的
-//                      permission-watcher 转成 Discord 批准按钮），极危险直接拒。比
-//                      bypass 安全得多，是新建交互 agent 的默认。
 //   bypassPermissions— 跳过所有权限检查（= 老的 --dangerously-skip-permissions）。
+//                      Claudestra 新建/resume 的默认；详见 manager.ts cmdCreate 注释。
 //   dontAsk          — 不弹框，按规则静默放行/拒绝
 //   plan             — 只读 plan 模式
 //
 // disallowedTools 黑名单与 permission-mode 正交，两者叠加：黑名单永远是硬拦截。
+//
+// 历史模式 "auto"（v2.1.0 - v2.4.10 期间是默认）已彻底 deprecated，所有路径都
+// 归一到 bypassPermissions。原因：classifier 模型过载会全 deny、误判 reply 是
+// "擅自向外发布"、每装一个 MCP server 都得 install-cli 加 allow 规则、每次 tool
+// call 加几百 ms。disallowedTools 黑名单已经把真危险命令兜住。详见 v2.4.11/13。
 
+// v2.4.13+ "auto" 从 KNOWN 列表里拿掉了（仍接受作为输入，但会被归一到
+// bypassPermissions，见 buildClaudeCommand / cmdCreate / cmdResume 里的兜底）。
+// 显式删除是为了 `--help` / 错误提示不再把 auto 当合法选项推给用户。
 export const PERMISSION_MODES = [
   "default",
   "acceptEdits",
-  "auto",
   "bypassPermissions",
   "dontAsk",
   "plan",
@@ -113,9 +118,8 @@ export function isKnownPermissionMode(m: string): boolean {
   return (PERMISSION_MODES as readonly string[]).includes(m);
 }
 
-// 启动路径未显式指定 permissionMode 时的回退。= 老行为（bypass），保证向后兼容：
-// 本 feature 之前建的 agent registry 里没有 permissionMode 字段，restart 时回退到
-// 这个，行为不变。新建交互 agent 由 manager.ts cmdCreate 显式传 "auto"。
+// 启动路径未显式指定 permissionMode 时的回退。v2.4.11+ 重新回到 bypassPermissions，
+// 也是 cmdCreate / cmdResume 的默认。所有路径里出现的 "auto" 字符串都会归一到这个值。
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "bypassPermissions";
 
 export function listPresets(): string[] {
@@ -210,8 +214,12 @@ export function buildClaudeCommand(opts: LaunchOptions): string {
           raw: opts.disallowedRaw,
         });
 
-  const mode =
+  // v2.4.13+ "auto" deprecated → 归一到 bypassPermissions。三处都会兜：cmdCreate
+  // / cmdResume 写 registry 之前已经归一了，这里再兜一层保护 cmdRestart 直读 registry
+  // 的路径，并防止有人把 `--mode auto` 当 CLI 参数手敲。
+  let mode =
     (opts.permissionMode && opts.permissionMode.trim()) || DEFAULT_PERMISSION_MODE;
+  if (mode === "auto") mode = "bypassPermissions";
 
   const parts: string[] = [
     "claude",
