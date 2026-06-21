@@ -2511,17 +2511,46 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       const client = clients.get(channelId);
       if (!client) return;
 
-      // UX：点击后清掉所有按钮 + 在原消息底下加一行「已点击」标记，
-      // 让用户能直观看到自己的 click 生效了，也防止重复点。
+      // v2.4.15+ UX：点击后清掉原按钮 + 标注"已点击"，**并在底下保留一个"打断"
+      // 按钮**，让用户在 agent 处理过程中能随时中断（之前点完按钮就没打断按钮、
+      // 一直要等 agent 自己跑完）。把这条 message 登记为本 channel 的当前 status
+      // message —— Stop hook 触发时会自动 edit 成"✅ 完成"+ 去掉按钮，跟 typed
+      // message 走 messageCreate 那条路径的语义完全一致。
+      const clickedMsgId = interaction.message?.id;
       try {
         const label = (interaction.component as any)?.label || id;
         const origContent = interaction.message?.content || "";
         await interaction.editReply({
           content: `${origContent}\n\n✅ 已点击：**${label}**`,
-          components: [],
+          components: buildComponents([
+            {
+              type: "buttons",
+              buttons: [
+                {
+                  id: `interrupt:${channelId}`,
+                  label: t("打断", "Interrupt"),
+                  emoji: "⚡",
+                  style: "danger",
+                },
+              ],
+            },
+          ]),
         }).catch(() => {});
       } catch { /* non-critical */ }
 
+      // 切换 activeStatusMessages 到这条点击的消息，旧的清成"✅ 完成"
+      stopTyping(channelId);
+      clearSafetyTimer(channelId);
+      const oldStatusId = activeStatusMessages.get(channelId);
+      if (oldStatusId && oldStatusId !== clickedMsgId) {
+        try {
+          const ch = (await discord.channels.fetch(channelId)) as TextChannel;
+          const sm = await ch.messages.fetch(oldStatusId);
+          await sm.edit({ content: t("✅ 完成", "✅ Done"), components: [] });
+        } catch { /* non-critical */ }
+      }
+      if (clickedMsgId) activeStatusMessages.set(channelId, clickedMsgId);
+      resetToolTracking(channelId);
       startTypingWithSafety(channelId);
       await deliver({
         from: { kind: "user", userId: interaction.user.id, channelId, username: interaction.user.username },
