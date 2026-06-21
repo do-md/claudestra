@@ -383,13 +383,52 @@ export async function drainChannelWatcher(
   return { drained: false, text: null };
 }
 
+// v2.4.14+ create 路径 race 兜底：channel-server register 时 Claude Code 可能还
+// 没生成 jsonl 文件（实测 ~20s 延迟）。之前 `existsSync` false 就静默 return，
+// 文件出现后没人重试 → watcher 永远不启动 → 用户看不到 tool stream，只见到 reply。
+// 现在改成 poll 等候，文件一出现就接上 watcher，上限 60s。
+const pendingStartTimers = new Map<
+  string,
+  { timer: ReturnType<typeof setInterval>; channelId: string; startedAt: number }
+>();
+const PENDING_POLL_MS = 2000;
+const PENDING_MAX_WAIT_MS = 60_000;
+
 export async function startWatching(
   agentName: string, cwd: string, sessionId: string,
   channelId: string, discord: Client
 ) {
   stopWatching(agentName);
   const jsonlPath = getJsonlPath(cwd, sessionId);
-  if (!existsSync(jsonlPath)) return;
+
+  if (!existsSync(jsonlPath)) {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (existsSync(jsonlPath)) {
+        clearInterval(timer);
+        pendingStartTimers.delete(agentName);
+        console.log(
+          `👁 JSONL 出现，启动 watcher: ${agentName} (等了 ${Date.now() - startedAt}ms)`
+        );
+        startWatching(agentName, cwd, sessionId, channelId, discord).catch((err) =>
+          console.error(`pending watcher 启动失败: ${agentName}`, err)
+        );
+        return;
+      }
+      if (Date.now() - startedAt > PENDING_MAX_WAIT_MS) {
+        clearInterval(timer);
+        pendingStartTimers.delete(agentName);
+        console.warn(
+          `⚠️  JSONL ${PENDING_MAX_WAIT_MS}ms 没出现，放弃 watcher: ${agentName} → ${jsonlPath}`
+        );
+      }
+    }, PENDING_POLL_MS);
+    pendingStartTimers.set(agentName, { timer, channelId, startedAt });
+    console.log(
+      `⏳ JSONL 暂不存在，poll 等候: ${agentName} → ${jsonlPath}`
+    );
+    return;
+  }
 
   const fileStat = await stat(jsonlPath);
   const state: WatcherState = {
@@ -423,6 +462,13 @@ export async function startWatching(
 }
 
 export function stopWatching(agentName: string) {
+  // v2.4.14+ 也清掉 pending-start 的 poll 定时器，避免 agent 被 kill / restart 后
+  // 旧的 poll 还在跑 → 文件出现时启动一个错的 watcher。
+  const pending = pendingStartTimers.get(agentName);
+  if (pending) {
+    clearInterval(pending.timer);
+    pendingStartTimers.delete(agentName);
+  }
   const state = watchers.get(agentName);
   if (state) {
     state.watcher.close();
@@ -434,6 +480,13 @@ export function stopWatching(agentName: string) {
 
 /** 根据 channelId 查找并停止 watcher（websocket 断开时兜底用） */
 export function stopWatchingByChannel(channelId: string): boolean {
+  // 先查 pending-start 队列
+  for (const [agentName, p] of pendingStartTimers.entries()) {
+    if (p.channelId === channelId) {
+      stopWatching(agentName);
+      return true;
+    }
+  }
   for (const [agentName, state] of watchers.entries()) {
     if (state.channelId === channelId) {
       stopWatching(agentName);
