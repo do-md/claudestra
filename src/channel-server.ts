@@ -545,6 +545,10 @@ Examples:
             type: "string",
             description: "Optional. What you (the caller) plan to do AFTER the target replies. Bridge injects this back into your push-back so you don't forget the plan. e.g., 'after backend confirms API is up, I'll switch useMock=false and run build:weapp'. Strongly recommended for any multi-step collaboration.",
           },
+          oneShot: {
+            type: "boolean",
+            description: "Optional (default false). 设 true = 这条消息是 fire-and-forget 通知，**不期待对方 reply / 不要 bridge 自动 push-back**。用法：你只是同步状态、ack 收到、抄送 FYI，对方应该直接 end_turn 不回应。bridge 不会给对方挂 watchdog nudge，也不会在对方 Stop 时给你自动 push 任何东西。避免 agent 之间无意义的 ack 循环。",
+          },
         },
         required: ["target", "text"],
       },
@@ -624,15 +628,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "send_to_agent": {
+      const oneShot = args?.oneShot === true;
       const result = await bridgeRequest({
         type: "route_to_agent",
         targetName: args?.target || "",
         text: args?.text || "",
         expecting: typeof args?.expecting === "string" ? args.expecting : undefined,
+        oneShot,
       });
       // v1.9.21+: bridge 现在会自动把对方的下一条 reply push 回你的 ws，
       // 你不用 fetch_messages 轮询。直接 end_turn，等对方那条 push 消息触发下一轮。
-      const advice = result.pushBack
+      // v2.4.16+: oneShot=true 时 bridge 既不挂 pending 也不会 push-back，advice 反映这点。
+      const advice = oneShot
+        ? `消息已 fire-and-forget 发给 ${result.targetName}。**不期待任何 push-back**。对方收到会自己判断要不要回，可能直接 end_turn。end_turn 等用户下一步指示即可。`
+        : result.pushBack
         ? `消息已发送给 ${result.targetName}。**不要轮询 fetch_messages** —— bridge 会在对方 reply 时自动把回复 push 到你这边作为新的入站消息，结束本轮等即可。`
         : `消息已发送给 ${result.targetName}。如需获取回复，可用 fetch_messages 轮询频道 ${result.targetChannelId}`;
       return {

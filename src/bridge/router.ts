@@ -143,6 +143,12 @@ export interface Envelope {
      *   - agent 自己已经在 text 里手动 @ 过对应 peer 了
      */
     skipAutoMention?: boolean;
+    /**
+     * v2.4.16+ deliverToLocal 不要给 target 挂 pendingInterAgentMsg watchdog。
+     * 用于 send_to_agent({oneShot:true}) 的 fire-and-forget 路径——caller 不期待
+     * pushback，target 也不该被 watchdog 在 Stop 时 nudge 要求回应。
+     */
+    skipInterAgentWatchdog?: boolean;
   };
 }
 

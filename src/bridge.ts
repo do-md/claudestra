@@ -231,6 +231,32 @@ interface PendingInterAgentMsg {
 }
 const pendingInterAgentMsg = new Map<string, PendingInterAgentMsg>();
 
+// v2.4.16+ 清掉某个 channel 上挂着的所有 inter-agent / cross-peer pending。
+// 用户在该 channel 打字（messageCreate）或者 agent 被 kill 时调，避免后续 Stop
+// hook 触发的 drain兜底 / watchdog nudge / peer pushback 把 agent 拉回到无用的
+// 互相 ack 链里。返回清掉条数（仅用于日志）。
+function clearInterAgentPendingsForChannel(channelId: string): number {
+  let n = 0;
+  // pendingAgentCalls key=target channel；同时还要扫 caller=channelId 的反向
+  if (pendingAgentCalls.delete(channelId)) n++;
+  for (const [cid, p] of pendingAgentCalls.entries()) {
+    if (p.callerChannelId === channelId) {
+      pendingAgentCalls.delete(cid);
+      n++;
+    }
+  }
+  if (pendingInterAgentMsg.delete(channelId)) n++;
+  // pendingPeerCalls key=对方 shared channel；同时 caller 端也要 match
+  for (const [cid, p] of pendingPeerCalls.entries()) {
+    if (p.callerChannelId === channelId) {
+      pendingPeerCalls.delete(cid);
+      n++;
+    }
+  }
+  if (pendingPeerInbound.delete(channelId)) n++;
+  return n;
+}
+
 const typingSafetyTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const TYPING_SAFETY_TIMEOUT_MS = 30 * 60 * 1000; // 30 分钟
 
@@ -371,7 +397,13 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
     // reply→别agent forward 都经这里），记看门狗 pending。peer 消息（from.kind=peer）
     // 不记 —— 那走 PEER DIRECT header，有 reply([DIRECT]) 的明确指引，且回路是
     // pendingPeerInbound 那条线。
-    if (env.from.kind === "local" && env.from.ws !== to.ws) {
+    // v2.4.16+: meta.skipInterAgentWatchdog=true 时不挂 watchdog（oneShot 的 fire
+    // -and-forget 场景，caller 不期待回应，watchdog 没必要打扰 target）。
+    if (
+      env.from.kind === "local" &&
+      env.from.ws !== to.ws &&
+      !env.meta.skipInterAgentWatchdog
+    ) {
       pendingInterAgentMsg.set(to.channelId, {
         fromLabel: env.from.agentName || "另一个 agent",
         retries: 0,
@@ -519,15 +551,18 @@ async function renderContentForLocal(env: RouterEnvelope): Promise<string> {
   }
 
   // 本地 agent → agent 转发（send_to_agent / pushback / reply→别agent forward）。
-  // v2.0.17+: 前缀从纯 "[🤖 来自 X]" 改成 imperative framing —— 实测 LLM 对
-  // "[来自 X]" 这种 informational 包装容易当 FYI 处理（默默 ack / 转告用户但不行动）。
-  // 明确告诉它：这是要你处理的，处理完必须 reply() 报告（或 send_to_agent 回 X）。
+  // v2.0.17 引入了 imperative framing 强迫 agent 处理；v2.4.16 又往回收了一段 ——
+  // 实测 "必须 reply() 报告、就算只是知会也 reply() 收到" 这种强约束跟 drain兜底
+  // no-text push、ia-watchdog nudge 三者叠加，是 agent 之间永无止境互相 ack 的根因
+  // （A 发 status，B 收到必须 reply 收到，A 收到 B 的 reply 又必须 reply 收到，...）。
+  // 现在改成：明确这是要看的 inbound，但**没有干货就允许直接 end_turn**，不必为
+  // 应付 framing 而编"收到"。真问到你的就答；否则该静默就静默。
   if (from.kind === "local") {
     const fromName = from.agentName ?? "agent";
     return [
-      `[🤖 来自 ${fromName} 的消息 —— 这是要你处理的，不是 FYI。`,
-      `处理完用 reply() 到你自己频道报告你做了什么（如果是问你问题，就 send_to_agent 回 ${fromName}）。`,
-      `就算判断它只是知会，也至少 reply() 一句"收到"，不要静默 end_turn。]`,
+      `[🤖 来自 ${fromName} 的 inbound 消息（非 FYI）。`,
+      `判断一下：是问你/要你动手 → 用 reply()/send_to_agent 处理；是纯状态同步/答完没下文 → end_turn 静默 OK，**别为了走形式编"收到"**。`,
+      `规则：有干货才说话；没干货别说话。]`,
       ``,
       env.content,
     ].join("\n");
@@ -1466,6 +1501,15 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
         await Bun.sleep(400);
       }
     } catch { /* non-critical */ }
+
+    // v2.4.16+ 用户发消息 = 显式接管这个 channel 的对话方向。把该 channel 上挂着
+    // 的所有 inter-agent / cross-peer pending 一并清掉，否则它们会在下一轮 Stop
+    // hook 触发 drain兜底 / nudge / 跨 peer pushback，把用户刚说的 "停下来" 拽回
+    // agent-to-agent 链里去。
+    const cleared = clearInterAgentPendingsForChannel(channelId);
+    if (cleared > 0) {
+      console.log(`🧹 user 消息到达 → 清掉 ${cleared} 条 inter-agent pending (channel=${channelId})`);
+    }
   }
 
   // 清理上一轮状态 + 重置 tool 追踪
@@ -3011,6 +3055,8 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
           ws: targetClient.ws,
           cwd: targetClient.cwd,
         };
+        // v2.4.16+ oneShot=true：fire-and-forget，跳 pushback 和 watchdog。
+        const oneShot = msg.oneShot === true;
         const env: RouterEnvelope = {
           from: fromEnv,
           to: toEnv,
@@ -3021,6 +3067,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
             triggerKind: "agent_tool",
             ts: new Date().toISOString(),
             threadId: newThreadId(),
+            skipInterAgentWatchdog: oneShot || undefined,
           },
         };
         const delivery = await deliver(env);
@@ -3039,7 +3086,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         // v2.0.1+: 同时推断 originalReplyChannel —— caller 手头正在处理的
         // inbound 请求的 intendedReplyChannel。pushback 用它做 meta.chat_id，
         // caller LLM 就不会错用 target 的私频当作回复目标（Bug 2 修复）。
-        if (fromChannelId) {
+        //
+        // v2.4.16+: 支持 oneShot=true —— fire-and-forget 模式，不挂 pending（不会
+        // pushback），同时下游 deliverToLocal 跳过给 target 挂 pendingInterAgentMsg
+        // watchdog。用于 status sync / ack / FYI 等 agent 之间不期待回应的消息。
+        if (fromChannelId && !oneShot) {
           let originalReplyChannel: string | undefined;
           for (const [, p] of pendingReplies.entries()) {
             if (p.targetWs === ws) {
@@ -3065,7 +3116,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
             ok: true,
             targetChannelId: target.channelId,
             targetName,
-            pushBack: true,
+            pushBack: !oneShot,
           },
         }));
       } catch (err) {
@@ -3954,43 +4005,59 @@ async function handleHookRequest(req: Request): Promise<Response> {
             //     turn 但没回复"，至少让 caller 不会无限静默等
             const pendingAgent = pendingAgentCalls.get(cid);
             if (pendingAgent) {
-              try {
-                const callerCtxLine = pendingAgent.expecting
-                  ? `[💡 你之前 send_to_agent 给 ${pendingAgent.targetName} 时填的期望：${pendingAgent.expecting}]\n`
-                  : "";
-                const pushBody = drainedText
-                  ? `${callerCtxLine}[ℹ️ 对方 (${pendingAgent.targetName}) 这轮没用 reply() 工具，下面是 bridge 从 assistant 文字兜底转发的：]\n\n${drainedText}`
-                  : `${callerCtxLine}[⚠️ 对方 (${pendingAgent.targetName}) 结束了 turn 但既没 reply() 也没产出 assistant 文字。可能挂了，或者拒绝执行。你需要主动追问或换路线。]`;
-                const stopWsClient = clients.get(cid);
-                const replyBackHint = pendingAgent.originalReplyChannel || cid;
-                const drainPushEnv: RouterEnvelope = {
-                  from: {
-                    kind: "local",
-                    agentName: pendingAgent.targetName,
-                    channelId: replyBackHint,
-                    ws: stopWsClient?.ws ?? pendingAgent.callerWs,
-                  },
-                  to: {
-                    kind: "local",
-                    agentName: pendingAgent.callerName,
-                    channelId: pendingAgent.callerChannelId,
-                    ws: pendingAgent.callerWs,
-                  },
-                  intent: "response",
-                  content: pushBody,
-                  meta: {
-                    messageId: `agent_drain_${Date.now()}`,
-                    triggerKind: "agent_tool",
-                    ts: new Date().toISOString(),
-                    threadId: newThreadId(),
-                  },
-                };
-                await deliver(drainPushEnv);
+              if (!drainedText) {
+                // v2.4.16+ no-text 静默清掉 pending，**不 push** 回 caller。
+                // 历史上这里 push 一条"[⚠️ 对方没产出，你需要主动追问或换路线]"，
+                // 等于积极激励 caller 再发一轮 send_to_agent → target 又没产出
+                // → 又一轮 push → 死循环（agent 之间永无止境聊天的根因）。
+                // 现在静默：caller 的 send_to_agent promise 不 resolve，caller 早
+                // 就 end_turn 了，最多等 staleCleanup 10min 扫掉。caller 没收到推
+                // 不会发起新轮 → 链条天然中断，对应"对方没回话就别盯着"的人类直觉。
                 pendingAgentCalls.delete(cid);
-                console.log(`📨 AGENT PUSH-BACK (drain兜底): ${pendingAgent.targetName} → ${pendingAgent.callerName}（${drainedText ? "drain 文字" : "no-text 通知"}）`);
-                recordMetric("agent_pushback_drain", { channelId: pendingAgent.callerChannelId, meta: { hadText: drainedText ? "yes" : "no" } });
-              } catch (e) {
-                console.error("AGENT PUSH-BACK (drain兜底) 失败:", e);
+                console.log(
+                  `🤫 drain兜底 no-text 静默清 pending: ${pendingAgent.targetName} → ${pendingAgent.callerName}`
+                );
+                recordMetric("agent_pushback_drain_silent", {
+                  channelId: pendingAgent.callerChannelId,
+                  meta: { target: pendingAgent.targetName },
+                });
+              } else {
+                try {
+                  const callerCtxLine = pendingAgent.expecting
+                    ? `[💡 你之前 send_to_agent 给 ${pendingAgent.targetName} 时填的期望：${pendingAgent.expecting}]\n`
+                    : "";
+                  const pushBody = `${callerCtxLine}[ℹ️ 对方 (${pendingAgent.targetName}) 这轮没用 reply() 工具，下面是 bridge 从 assistant 文字兜底转发的：]\n\n${drainedText}`;
+                  const stopWsClient = clients.get(cid);
+                  const replyBackHint = pendingAgent.originalReplyChannel || cid;
+                  const drainPushEnv: RouterEnvelope = {
+                    from: {
+                      kind: "local",
+                      agentName: pendingAgent.targetName,
+                      channelId: replyBackHint,
+                      ws: stopWsClient?.ws ?? pendingAgent.callerWs,
+                    },
+                    to: {
+                      kind: "local",
+                      agentName: pendingAgent.callerName,
+                      channelId: pendingAgent.callerChannelId,
+                      ws: pendingAgent.callerWs,
+                    },
+                    intent: "response",
+                    content: pushBody,
+                    meta: {
+                      messageId: `agent_drain_${Date.now()}`,
+                      triggerKind: "agent_tool",
+                      ts: new Date().toISOString(),
+                      threadId: newThreadId(),
+                    },
+                  };
+                  await deliver(drainPushEnv);
+                  pendingAgentCalls.delete(cid);
+                  console.log(`📨 AGENT PUSH-BACK (drain兜底): ${pendingAgent.targetName} → ${pendingAgent.callerName}（drain 文字）`);
+                  recordMetric("agent_pushback_drain", { channelId: pendingAgent.callerChannelId, meta: { hadText: "yes" } });
+                } catch (e) {
+                  console.error("AGENT PUSH-BACK (drain兜底) 失败:", e);
+                }
               }
             }
 
@@ -4000,41 +4067,52 @@ async function handleHookRequest(req: Request): Promise<Response> {
             // bridge 通过 messageCreate 看到 → 老的 pendingPeerCalls pushback 就接力上。
             const peerInbound = pendingPeerInbound.get(cid);
             if (peerInbound) {
-              try {
-                if (drainedText) {
+              if (!drainedText) {
+                // v2.4.16+ 镜像本地 drain兜底：no-text 静默清掉 pending，**不 forward**
+                // 到 peer 的 #agent-exchange。之前 forward "[⚠️ ...你那边请主动追问或
+                // 换路线]" 等于鼓动 peer 再发一轮 → 跨 peer 死循环（symmetrically 跟
+                // 本地一样的问题）。
+                pendingPeerInbound.delete(cid);
+                console.log(
+                  `🤫 PEER INBOUND DRAIN no-text 静默清: ${peerInbound.localAgentName} (peer=${peerInbound.peerBotName})`
+                );
+                recordMetric("peer_inbound_drain_silent", {
+                  channelId: peerInbound.sharedChannelId,
+                  meta: { agent: peerInbound.localAgentName },
+                });
+              } else {
+                try {
                   const forwardBody = `[ℹ️ ${peerInbound.localAgentName} 这轮没用 reply() 工具回到 #agent-exchange，下面是 bridge 从 assistant 文字兜底转发的：]\n\n${drainedText}`;
                   await discordReply(discord, peerInbound.sharedChannelId, forwardBody);
                   console.log(`📨 PEER INBOUND DRAIN (兜底): ${peerInbound.localAgentName} → ${peerInbound.sharedChannelId}（forwarded ${drainedText.length} chars）`);
                   recordMetric("peer_inbound_drain", { channelId: peerInbound.sharedChannelId, meta: { agent: peerInbound.localAgentName } });
-                } else {
-                  const noTextBody = `[⚠️ ${peerInbound.localAgentName} 结束了 turn 但既没 reply() 也没 assistant 文字 — 你那边请主动追问或换路线。]`;
-                  await discordReply(discord, peerInbound.sharedChannelId, noTextBody);
-                  console.log(`📨 PEER INBOUND DRAIN (no-text 兜底): ${peerInbound.localAgentName} → ${peerInbound.sharedChannelId}`);
+                  pendingPeerInbound.delete(cid);
+                } catch (e) {
+                  console.error("PEER INBOUND DRAIN (兜底) 失败:", e);
                 }
-                pendingPeerInbound.delete(cid);
-              } catch (e) {
-                console.error("PEER INBOUND DRAIN (兜底) 失败:", e);
               }
             }
 
             // v2.0.16+ inter-agent 看门狗: 这一轮结束时如果 cid 还挂着 inter-agent
             // 消息 pending（agent 既没 reply 也没 send_to_agent —— 大概率收到消息后
             // 啥也没干或没报告），注一条 nudge 到它的 ws 提醒处理 + reply() 报告。
-            // 最多 nudge 2 次（retries 到 2 放弃，不无限循环）。
+            // v2.4.16+: 最多 nudge **1** 次（之前是 2 次，跟 drain兜底 no-text push
+            // 叠加导致 agent 反复 wake-up 抓 LLM turn，是"聊不停"的另一个根因）。
+            // 1 次未响应直接放弃，少打扰对面 + 少烧 token。
             const iaPending = pendingInterAgentMsg.get(cid);
             if (iaPending) {
-              if (iaPending.retries >= 2) {
+              if (iaPending.retries >= 1) {
                 pendingInterAgentMsg.delete(cid);
-                console.log(`⚠️ inter-agent 看门狗放弃（${cid} nudge 2 次仍无响应，来自 ${iaPending.fromLabel}）`);
+                console.log(`⚠️ inter-agent 看门狗放弃（${cid} nudge 1 次仍无响应，来自 ${iaPending.fromLabel}）`);
               } else {
                 const stopClientForNudge = clients.get(cid);
                 if (stopClientForNudge) {
                   try {
                     const nudgeText = [
-                      `[⚠️ 你上一轮收到来自 ${iaPending.fromLabel} 的消息，但这一轮结束了，既没用 reply() 报告也没 send_to_agent 回应。`,
-                      `如果你已经处理了那条消息 —— 用 reply() 到自己频道告诉用户你做了什么。`,
-                      `如果还没处理 —— 现在处理；处理完用 reply() 报告；如果是问你的就 send_to_agent 回 ${iaPending.fromLabel}。`,
-                      `不要再静默 end_turn。]`,
+                      `[ℹ️ 上一轮你收到来自 ${iaPending.fromLabel} 的消息，turn 结束时既没 reply() 也没 send_to_agent。`,
+                      `如果你**判断它不需要回应**（比如纯 FYI、已经被你内部处理掉了、对方只是状态同步），end_turn 是 OK 的，这条 nudge 忽略即可。`,
+                      `如果是**漏了**：现在补上 reply() 到自己频道告诉用户做了什么；如果是问你的就 send_to_agent 回 ${iaPending.fromLabel}。`,
+                      `避免毫无产出地静默 end_turn，但也别为了应付这条 nudge 编一段"我收到了"——那只会污染对话。]`,
                     ].join("\n");
                     // 标记这个 channel 最近一条消息源是 agent/系统，避免 nudge 被处理后
                     // 的 Stop hook 误 @ 用户。
@@ -4170,6 +4248,31 @@ const server = Bun.serve({
         }
         await registerSlashCommands();
         return new Response(JSON.stringify({ ok: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // v2.4.16+ manager kill 后调用 → 清掉所有引用该 channel 的 inter-agent /
+    // cross-peer pending。避免被 kill 的 agent 复活/被 resume 后被陈年 pushback /
+    // watchdog nudge 轰炸。restart (transient flap) 不调，只在永久 kill 调。
+    if (url.pathname === "/agent/cleanup" && req.method === "POST") {
+      try {
+        const body = (await req.json().catch(() => ({}))) as { channelId?: string };
+        if (!body.channelId) {
+          return new Response(JSON.stringify({ ok: false, error: "missing channelId" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const n = clearInterAgentPendingsForChannel(body.channelId);
+        console.log(`🧹 /agent/cleanup channel=${body.channelId} 清掉 ${n} 条 pending`);
+        return new Response(JSON.stringify({ ok: true, cleared: n }), {
           headers: { "Content-Type": "application/json" },
         });
       } catch (e) {

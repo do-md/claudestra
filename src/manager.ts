@@ -818,6 +818,21 @@ async function cmdKill(name: string) {
 
   await triggerSkillsRescan("remove", tmuxName);
 
+  // v2.4.16+ 通知 bridge 清掉所有 inter-agent / cross-peer pending（避免被 kill
+  // 的 agent 在别处被 resume 后吃陈年 pushback / nudge）。restart 走另一条路，
+  // 不调这里。bridge 没启也无所谓 —— 静默失败。
+  if (info?.channelId) {
+    const port = process.env.BRIDGE_PORT || "3847";
+    try {
+      await fetch(`http://localhost:${port}/agent/cleanup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channelId: info.channelId }),
+        signal: AbortSignal.timeout(3000),
+      });
+    } catch { /* bridge 可能未运行 */ }
+  }
+
   output({
     ok: true,
     agent: tmuxName,
