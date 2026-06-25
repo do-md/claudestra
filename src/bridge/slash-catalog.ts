@@ -125,7 +125,7 @@ export const BUILTIN_COMMANDS: BuiltinCmd[] = [
     name: "mcp",
     invokeName: "mcp",
     description: "管理 MCP server 连接 / OAuth（如 restart <name>）",
-    options: [{ name: "args", description: "子命令 + 参数，例如 'restart mindbase'", type: "string" }],
+    options: [{ name: "args", description: "子命令 + 参数，例如 'restart mem0'", type: "string" }],
     argBuilder: simpleStringArg("args"),
   },
 {

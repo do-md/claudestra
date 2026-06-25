@@ -145,6 +145,57 @@ export async function getJsonlMtime(cwd: string, sessionId: string): Promise<num
   }
 }
 
+/**
+ * v2.4.17+ 检测当前 turn 末尾是不是 agent 在用 ScheduleWakeup 安排后续唤醒。
+ *
+ * Claude Code 较新版本 agents 倾向把任务包成 Bash{run_in_background:true} +
+ * ScheduleWakeup 安排几分钟后回来 poll。这时 turn 干净结束，Stop hook 会 fire，
+ * 但其实"用户任务"没真做完 —— 只是在排队等下一次回调。如果走完普通完成通知就
+ * 会 @ 用户 "✅ 完成"，用户误以为对话结束。
+ *
+ * 实现：往回扫 jsonl 最多 30 个 assistant 条目，找 tool_use.name==='ScheduleWakeup'。
+ * 遇到 type==='user' 的"真用户消息"（非 tool_result-only）就停 —— 那是新一轮的
+ * 起点，老 ScheduleWakeup 不再相关。返回 true 表示"agent 在排队，**不要**报完成"。
+ */
+export async function hasRecentScheduleWakeup(
+  cwd: string, sessionId: string,
+): Promise<boolean> {
+  try {
+    const text = await Bun.file(getJsonlPath(cwd, sessionId)).text();
+    const lines = text.split("\n");
+    // 反向扫，上限避免大文件 IO 跟分析全文件
+    const SCAN_LIMIT = 60;
+    let scanned = 0;
+    for (let i = lines.length - 1; i >= 0 && scanned < SCAN_LIMIT; i--) {
+      const line = lines[i];
+      if (!line) continue;
+      scanned++;
+      let d: any;
+      try { d = JSON.parse(line); } catch { continue; }
+      if (d.type === "user") {
+        const c = d.message?.content;
+        // tool_result-only 的"user"条目不算真用户消息（它只是 Claude 自循环）
+        const isRealUserMsg =
+          typeof c === "string" ||
+          (Array.isArray(c) && c.some((x: any) => x?.type === "text"));
+        if (isRealUserMsg) return false;
+        continue;
+      }
+      if (d.type === "assistant") {
+        const content = d.message?.content || [];
+        for (const item of content) {
+          if (item?.type === "tool_use" && item?.name === "ScheduleWakeup") {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // v2.2.0+: auto-deny 通知去重。一次 deny 可能只产生一条 tool_result，但 agent 之后
 // 又试别的被拦操作会再产生 → 15s 窗口内每个 channel 只弹一次「临时放行」按钮。
 const lastAutoDenyPost = new Map<string, number>();

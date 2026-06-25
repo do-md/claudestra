@@ -48,7 +48,7 @@ import {
   handleMgmtSelect,
 } from "./bridge/management.js";
 import { tmuxScreenshot } from "./bridge/screenshot.js";
-import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking } from "./bridge/jsonl-watcher.js";
+import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup } from "./bridge/jsonl-watcher.js";
 import { startPermissionWatcher, permissionMessages, clearPermissionMessage } from "./bridge/permission-watcher.js";
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
 import { recordMetric } from "./lib/metrics.js";
@@ -3956,6 +3956,18 @@ async function handleHookRequest(req: Request): Promise<Response> {
               const idle = await isIdle(target);
               if (!idle) {
                 console.log(`🏁 Stop 触发但 pane 不是 ❯ idle 状态，Claude 还在工作 → 跳过这次通知，等下一个 Stop: channel=${channelId} agent=${agent.name}`);
+                shouldNotify = false;
+              }
+            }
+            // v2.4.17+ 检测 ScheduleWakeup：新版 Claude Code 把任务包成
+            // run_in_background bash + ScheduleWakeup 排队回调，turn 干净结束 →
+            // Stop hook 误判为"已完成" → @ 用户。用户反馈这种情况频繁。
+            // 检测命中就跳过 @，等真正的"用户任务"完成时下一个 Stop 再走通知。
+            if (shouldNotify && agent.sessionId && agent.project) {
+              const cwd = String(agent.project).replace(/^~/, process.env.HOME || "~");
+              const wakeupPending = await hasRecentScheduleWakeup(cwd, agent.sessionId);
+              if (wakeupPending) {
+                console.log(`🌀 跳过完成通知（agent 用 ScheduleWakeup 排队下次回调，任务未结束）: channel=${channelId} agent=${agent.name}`);
                 shouldNotify = false;
               }
             }
