@@ -14,6 +14,7 @@ import { enableTimestampLogs } from "./lib/log-timestamp.js";
 import { initLang } from "./lib/i18n.js";
 import { existsSync, watchFile } from "fs";
 import { bridgeRequest } from "./lib/bridge-client.js";
+import { projectJsonlPath, findJsonlBySessionId } from "./lib/jsonl-cost.js";
 import {
   tmuxSendLine,
   tmuxCapture,
@@ -43,13 +44,22 @@ export interface CronJob {
   name: string;
   schedule: string;         // cron 表达式 (分 时 日 月 周)
   prompt: string;           // 发给 agent 的指令
-  dir: string;              // 工作目录
+  dir: string;              // 工作目录（targetAgent 模式下未使用，为向后兼容保留字段）
   enabled: boolean;
   reportChannelId?: string; // 结果通知频道（默认用 CONTROL_CHANNEL_ID）
   maxRuntime?: number;      // 最大运行时间（分钟，默认 30）
   lastRun?: string;         // ISO timestamp
   nextRun?: string;         // ISO timestamp
   createdAt: string;        // ISO timestamp
+  /**
+   * v2.4.18+ 定向到已存在的 agent。设了这个字段就不 spawn 临时 agent，直接把
+   * prompt 发到目标 agent 的 tmux window（等同用户在 Discord 里给它敲字）。
+   * agent 在自己 session 里回答，完整继承对话历史 / 上下文 / mem0 记忆访问。
+   * 不设 = 老行为（每次建临时 agent、跑完销毁）。
+   *
+   * 值是 agent 短名（不带 "agent-" 前缀，跟 CLI 一致）。
+   */
+  targetAgent?: string;
 }
 
 export interface CronHistory {
@@ -216,36 +226,60 @@ async function runManager(...args: string[]): Promise<any> {
   }
 }
 
+/**
+ * 从临时 agent 的 session jsonl 里抽取它最后输出的 assistant 文本。
+ * cron 完成通知用它把 agent 实际干了啥带回报告频道，而不是只发一句"✅ 完成"。
+ * 取最后一条非空 assistant text（通常是 agent 的总结性回复）。抓不到返回 ""。
+ */
+async function extractAgentSummary(dir: string, sessionId: string): Promise<string> {
+  try {
+    let path = projectJsonlPath(dir, sessionId);
+    if (!existsSync(path)) {
+      const fallback = findJsonlBySessionId(sessionId);
+      if (!fallback) return "";
+      path = fallback;
+    }
+    const raw = await readFile(path, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim());
+    let last = "";
+    for (const line of lines) {
+      let rec: any;
+      try { rec = JSON.parse(line); } catch { continue; }
+      if (rec.type !== "assistant") continue;
+      const content = rec.message?.content;
+      if (!Array.isArray(content)) continue;
+      const text = content
+        .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+        .map((b: any) => b.text.trim())
+        .filter(Boolean)
+        .join("\n");
+      if (text) last = text;
+    }
+    return last.trim();
+  } catch {
+    return "";
+  }
+}
+
 // ============================================================
 // 任务执行
 // ============================================================
 
 const runningJobs = new Set<string>();
 
-async function executeJob(job: CronJob): Promise<void> {
-  if (runningJobs.has(job.id)) {
-    console.log(`⏭ 跳过 "${job.name}" — 上一次执行尚未完成`);
-    return;
-  }
-
-  runningJobs.add(job.id);
-  const historyId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const reportChannel = job.reportChannelId || REPORT_CHANNEL_ID;
-  const maxRuntime = (job.maxRuntime || 30) * 60 * 1000;
+/**
+ * 老行为：spawn 临时 agent 跑一次，跑完销毁。零上下文（fresh Claude Code session）。
+ * 适合"每周清一次日志"、"每天写个孤立周报"之类跟具体 agent 记忆无关的批处理。
+ */
+async function executeOnTempAgent(
+  job: CronJob,
+  historyId: string,
+  reportChannel: string | undefined,
+  maxRuntime: number,
+): Promise<void> {
   const agentName = `cron-${job.name.toLowerCase().replace(/[^a-z0-9]/g, "-")}-${Date.now().toString(36)}`;
+  console.log(`🚀 执行 cron 任务（临时 agent）: "${job.name}" → agent ${agentName}`);
 
-  console.log(`🚀 执行 cron 任务: "${job.name}" → agent ${agentName}`);
-
-  // 记录开始
-  await appendHistory({
-    id: historyId,
-    jobId: job.id,
-    jobName: job.name,
-    startedAt: new Date().toISOString(),
-    status: "running",
-  });
-
-  // 通知开始
   if (reportChannel) {
     try {
       await bridgeRequest({
@@ -257,44 +291,27 @@ async function executeJob(job: CronJob): Promise<void> {
   }
 
   try {
-    // 1. 创建 agent —— cron 是无人值守，用 bypassPermissions（auto 模式遇到 soft_deny
-    //    会弹权限框等批准，但没人在场 → 任务卡死）。
+    // 建 agent — cron 无人值守，走 bypassPermissions（auto 会弹权限框卡死）
     const createResult = await runManager(
       "create", agentName, job.dir, `cron: ${job.name}`, "--mode", "bypassPermissions"
     );
-    if (!createResult.ok) {
-      throw new Error(`创建 agent 失败: ${createResult.error}`);
-    }
+    if (!createResult.ok) throw new Error(`创建 agent 失败: ${createResult.error}`);
 
-    const channelId = createResult.channelId;
+    const tmpSessionId = createResult.sessionId as string | undefined;
+    await Bun.sleep(3000); // 等 agent 就绪
 
-    // 2. 等待 agent 就绪
-    await Bun.sleep(3000);
-
-    // 3. 发送 prompt（通过 tmux send-keys）
     const tmuxTarget = `master:agent-${agentName}`;
     await tmuxSendLine(tmuxTarget, job.prompt);
 
-    // 4. 等待完成（轮询 idle 状态）
-    // 先等 15 秒让 agent 开始处理（避免检测到发送前的 ❯ 提示符）
+    // 等完成 —— 15s 冷启动 + 10s 轮询 idle
     await Bun.sleep(15_000);
     const startTime = Date.now();
     let completed = false;
-
     while (Date.now() - startTime < maxRuntime) {
-      await Bun.sleep(10_000); // 每 10 秒检查一次
-      try {
-        if (await tmuxIsIdle(tmuxTarget)) {
-          completed = true;
-          break;
-        }
-      } catch {
-        // window 可能已经不存在了
-        break;
-      }
+      await Bun.sleep(10_000);
+      try { if (await tmuxIsIdle(tmuxTarget)) { completed = true; break; } } catch { break; }
     }
 
-    // 5. 更新状态
     const status = completed ? "success" : "timeout";
     await updateHistory(historyId, {
       finishedAt: new Date().toISOString(),
@@ -302,23 +319,143 @@ async function executeJob(job: CronJob): Promise<void> {
       error: completed ? undefined : `超时 (${job.maxRuntime || 30} 分钟)`,
     });
 
-    // 6. 通知结果
     if (reportChannel) {
       try {
         const emoji = completed ? "✅" : "⏰";
         const statusText = completed ? "完成" : "超时";
-        await bridgeRequest({
-          type: "reply",
-          chatId: reportChannel,
-          text: `${emoji} **定时任务${statusText}**: ${job.name}`,
-        });
+        let body = `${emoji} **定时任务${statusText}**: ${job.name}`;
+        if (completed && tmpSessionId) {
+          const summary = await extractAgentSummary(job.dir, tmpSessionId);
+          if (summary) body += `\n\n${summary}`;
+        }
+        await bridgeRequest({ type: "reply", chatId: reportChannel, text: body });
       } catch { /* non-critical */ }
     }
+  } finally {
+    // 清理临时 agent（成功、超时、异常都跑一次）
+    try {
+      await Bun.sleep(2000);
+      await runManager("kill", agentName);
+    } catch { /* non-critical */ }
+  }
+}
 
-    // 7. 销毁临时 agent
-    await Bun.sleep(2000);
-    await runManager("kill", agentName);
+/**
+ * v2.4.18+ 定向到已存在的 agent。跟"用户在 Discord 里给 agent 敲字"一模一样：
+ * 通过 tmux send-keys 把 prompt 塞进目标 agent 的 TUI，agent 在自己 session 里
+ * 回答（继承对话历史 + config + mem0 访问权）。不建临时 agent、不销毁。
+ *
+ * 冲突处理：**cron 一定要触发，不跳过**（用户明确要求）。目标 agent 正忙也直接
+ * 发进去 —— Claude Code TUI 会把新输入接到当前 turn 结束后处理（跟用户在 Discord
+ * 里对着忙碌的 agent 敲字同样的行为，只不过 cron 路径不主动 C-c，让当前工作跑完
+ * 再处理 cron 的 prompt）。
+ */
+async function executeOnExistingAgent(
+  job: CronJob,
+  historyId: string,
+  reportChannel: string | undefined,
+  maxRuntime: number,
+): Promise<void> {
+  const agentShort = job.targetAgent!;
+  const tmuxName = agentShort.startsWith("agent-") ? agentShort : `agent-${agentShort}`;
+  const tmuxTarget = `master:${tmuxName}`;
 
+  console.log(`🚀 执行 cron 任务（打到现存 agent）: "${job.name}" → ${tmuxName}`);
+
+  // 存在性校验：window 不存在（agent 被 kill / registry 名不对）就报 error，
+  // 这种情况用户需要知道。但"agent 忙"不算错，照发。
+  try {
+    await tmuxIsIdle(tmuxTarget); // 只测能不能访问 window，不管返回值
+  } catch {
+    throw new Error(`目标 agent 不存在或未运行: ${tmuxName}`);
+  }
+
+  // 通知开始：**只在** reportChannel 跟 agent 自己 channel 不同的时候发，
+  // 否则就是 agent 自己频道刷屏（agent 待会儿会自己回复，重复噪音）
+  const targetChannelId = await lookupAgentChannelId(tmuxName);
+  const shouldNotifyStart = reportChannel && reportChannel !== targetChannelId;
+  if (shouldNotifyStart) {
+    try {
+      await bridgeRequest({
+        type: "reply",
+        chatId: reportChannel!,
+        text: `⏰ **定时任务开始**: ${job.name} → ${tmuxName}\n-# 💬 ${job.prompt.slice(0, 100)}`,
+      });
+    } catch { /* non-critical */ }
+  }
+
+  // 发 prompt。忙不忙都发，Claude Code TUI 自己排队。
+  await tmuxSendLine(tmuxTarget, job.prompt);
+
+  // 等 agent 处理完（idle 恢复）。冷启动 15s + 10s 轮询。
+  // 注意：agent 之前可能在忙别的事，这里等的是"忙别的 + cron prompt 都跑完"。
+  await Bun.sleep(15_000);
+  const startTime = Date.now();
+  let completed = false;
+  while (Date.now() - startTime < maxRuntime) {
+    await Bun.sleep(10_000);
+    try { if (await tmuxIsIdle(tmuxTarget)) { completed = true; break; } } catch { break; }
+  }
+
+  const status = completed ? "success" : "timeout";
+  await updateHistory(historyId, {
+    finishedAt: new Date().toISOString(),
+    status,
+    error: completed ? undefined : `超时 (${job.maxRuntime || 30} 分钟)`,
+  });
+
+  // 完成通知：agent 会自己 reply 到它自己频道，reportChannel != 目标 channel
+  // 时才补一条"XX 完成"提示。同频道不重复发（agent 的 reply 已经足够）。
+  if (reportChannel && reportChannel !== targetChannelId) {
+    try {
+      const emoji = completed ? "✅" : "⏰";
+      const statusText = completed ? "完成" : "超时";
+      await bridgeRequest({
+        type: "reply",
+        chatId: reportChannel,
+        text: `${emoji} **定时任务${statusText}**: ${job.name} → ${tmuxName}`,
+      });
+    } catch { /* non-critical */ }
+  }
+}
+
+/** 从 registry 里根据 tmux 名（含 "agent-" 前缀）查该 agent 的 Discord channelId。 */
+async function lookupAgentChannelId(tmuxName: string): Promise<string | undefined> {
+  try {
+    const r = await runManager("list");
+    const agent = (r.agents || []).find((a: any) => a.name === tmuxName);
+    return agent?.channelId;
+  } catch {
+    return undefined;
+  }
+}
+
+async function executeJob(job: CronJob): Promise<void> {
+  if (runningJobs.has(job.id)) {
+    console.log(`⏭ 跳过 "${job.name}" — 上一次执行尚未完成`);
+    return;
+  }
+
+  runningJobs.add(job.id);
+  const historyId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const reportChannel = job.reportChannelId || REPORT_CHANNEL_ID;
+  const maxRuntime = (job.maxRuntime || 30) * 60 * 1000;
+
+  // 记录开始
+  await appendHistory({
+    id: historyId,
+    jobId: job.id,
+    jobName: job.name,
+    startedAt: new Date().toISOString(),
+    status: "running",
+  });
+
+  try {
+    if (job.targetAgent) {
+      await executeOnExistingAgent(job, historyId, reportChannel, maxRuntime);
+    } else {
+      await executeOnTempAgent(job, historyId, reportChannel, maxRuntime);
+    }
   } catch (err) {
     const errorMsg = (err as Error).message;
     console.error(`❌ cron 任务执行失败: "${job.name}" — ${errorMsg}`);
@@ -338,9 +475,6 @@ async function executeJob(job: CronJob): Promise<void> {
         });
       } catch { /* non-critical */ }
     }
-
-    // 尝试清理
-    try { await runManager("kill", agentName); } catch { /* non-critical */ }
   } finally {
     runningJobs.delete(job.id);
     // 更新 lastRun 和 nextRun

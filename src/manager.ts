@@ -1271,7 +1271,7 @@ async function cmdSessions(search?: string) {
 
 import { loadJobs, saveJobs, parseCronExpression, nextCronTime, type CronJob } from "./cron.js";
 
-async function cmdCronAdd(name: string, schedule: string, dir: string, prompt: string) {
+async function cmdCronAdd(name: string, schedule: string, dir: string, prompt: string, reportChannelId?: string, targetAgent?: string) {
   // 验证 cron 表达式
   try {
     parseCronExpression(schedule);
@@ -1296,6 +1296,8 @@ async function cmdCronAdd(name: string, schedule: string, dir: string, prompt: s
     dir: dir.replace(/^~/, process.env.HOME || "~"),
     enabled: true,
     createdAt: new Date().toISOString(),
+    ...(reportChannelId ? { reportChannelId } : {}),
+    ...(targetAgent ? { targetAgent } : {}),
   };
 
   try {
@@ -1326,6 +1328,7 @@ async function cmdCronList() {
       enabled: j.enabled,
       lastRun: j.lastRun || null,
       nextRun: j.nextRun || null,
+      ...(j.targetAgent ? { targetAgent: j.targetAgent } : {}),
     })),
   });
 }
@@ -2393,12 +2396,39 @@ switch (cmd) {
   }
 
   case "cron-add": {
-    const [name, schedule, dir, ...rest] = args;
+    const [name, schedule, ...restRaw] = args;
+    const rest = [...restRaw];
+    // --channel <id>：结果通知发到指定频道（默认 CONTROL_CHANNEL_ID）
+    let reportChannelId: string | undefined;
+    const chIdx = rest.indexOf("--channel");
+    if (chIdx >= 0) {
+      reportChannelId = rest[chIdx + 1];
+      rest.splice(chIdx, 2);
+    }
+    // v2.4.18+ --target-agent <name>：把 prompt 打到已存在的 agent（继承上下文/记忆），
+    // 不再 spawn 临时 agent。设了这个的话，<dir> 参数可省（agent 有自己的 cwd）。
+    let targetAgent: string | undefined;
+    const taIdx = rest.indexOf("--target-agent");
+    if (taIdx >= 0) {
+      targetAgent = rest[taIdx + 1];
+      rest.splice(taIdx, 2);
+    }
+    let dir: string | undefined;
+    if (targetAgent) {
+      // 有 target-agent 时下一个位置参数只有看着像路径才当 dir，否则并入 prompt
+      if (rest.length >= 1 && (rest[0].startsWith("/") || rest[0].startsWith("~") || rest[0].startsWith("."))) {
+        dir = rest.shift();
+      } else {
+        dir = "-"; // 占位，不会被 executeOnExistingAgent 实际使用
+      }
+    } else {
+      dir = rest.shift();
+    }
     if (!name || !schedule || !dir || rest.length === 0) {
-      output({ ok: false, error: '用法: cron-add <name> "<cron>" <dir> <prompt...>' });
+      output({ ok: false, error: '用法: cron-add <name> "<cron>" <dir> <prompt...> [--channel <id>] [--target-agent <agent>]\n  --target-agent 设了的话 <dir> 可省' });
       break;
     }
-    await cmdCronAdd(name, schedule, dir, rest.join(" "));
+    await cmdCronAdd(name, schedule, dir, rest.join(" "), reportChannelId, targetAgent);
     break;
   }
 
@@ -2600,7 +2630,7 @@ switch (cmd) {
         "restart [name]                  — 重启 agent（不指定则重启所有）",
         "list                            — 列出所有 agent",
         "sessions [search]               — 浏览历史 Claude Code 会话",
-        'cron-add <name> "<cron>" <dir> <prompt...> — 添加定时任务',
+        'cron-add <name> "<cron>" <dir> <prompt...> [--channel <id>] [--target-agent <agent>] — 添加定时任务（--target-agent 让 prompt 打到已存在的 agent、继承其上下文/记忆；不设则每次建临时 agent）',
         "cron-list                       — 列出所有定时任务",
         "cron-remove <name|id>           — 删除定时任务",
         "cron-toggle <name|id>           — 启用/暂停定时任务",
