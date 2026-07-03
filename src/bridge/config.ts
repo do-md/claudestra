@@ -2,7 +2,10 @@
  * 共享配置常量
  */
 
-export const DISCORD_TOKEN = process.env.DISCORD_BOT_TOKEN!;
+export const DISCORD_TOKEN = process.env.DISCORD_BOT_TOKEN || "";
+// Web-only 模式：无 bot token 时 Bridge 仍启动（HTTP/WS + 本地会话 + Web 网关），
+// 仅禁用 Discord 前端。有 token 时行为与原来完全一致（不破坏 Discord 链路，prin-420d76）。
+export const DISCORD_ENABLED = !!DISCORD_TOKEN;
 export const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || "3847");
 export const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || "")
   .split(",")

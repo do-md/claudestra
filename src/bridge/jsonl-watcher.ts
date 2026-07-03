@@ -13,6 +13,7 @@ import type { Client } from "discord.js";
 import { TextChannel } from "discord.js";
 import { WATCHER_CONFIG, MCP_TOOL_PREFIX } from "./config.js";
 import { discordReply } from "./discord-api.js";
+import { pushToWeb } from "./web-hub.js";
 
 interface ToolEntry {
   id: string;
@@ -81,6 +82,25 @@ function formatTool(name: string, input: any): string {
   }
 }
 
+/** Web 端工具摘要：只出 detail（前端 ToolCard 自带 icon + 显示 name）。 */
+function webToolSummary(name: string, input: any): string {
+  switch (name) {
+    case "Read":
+    case "Edit":
+    case "Write":
+      return input?.file_path?.split("/").pop() || "";
+    case "Bash":
+      return String(input?.description || input?.command || "").replace(/\n/g, " ").slice(0, 120);
+    case "Glob":
+    case "Grep":
+      return String(input?.pattern || "");
+    case "Agent":
+      return String(input?.description || input?.prompt || "").slice(0, 80);
+    default:
+      return "";
+  }
+}
+
 /** 渲染 tool 列表为 Discord 消息 */
 function renderToolMsg(tools: ToolEntry[]): string {
   return tools.map((t) => {
@@ -116,6 +136,10 @@ async function syncToolMsg(state: WatcherState, discord: Client) {
 async function flushText(state: WatcherState, discord: Client) {
   if (state.textQueue.length === 0) return;
   const items = state.textQueue.splice(0);
+  // Web tee：逐条推助手文本（去掉 💬 前缀，⛔/⏱ 等标记保留）。附加输出，与 Discord 并行。
+  for (const item of items) {
+    pushToWeb(state.channelId, { t: "text", text: item.replace(/^💬 /, "") });
+  }
   const body = items.map((item) => `-# ${item}`).join("\n");
   try {
     await discordReply(discord, state.channelId, body);
@@ -341,6 +365,13 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
                 error: false,
               });
               toolsChanged = true;
+              // Web tee：工具加入时推一次（附加输出，与 Discord 并行）
+              pushToWeb(state.channelId, {
+                t: "tool",
+                name: block.name,
+                summary: webToolSummary(block.name, block.input),
+                state: "done",
+              });
             }
             if (block.type === "text" && block.text?.trim() && WATCHER_CONFIG.showClaudeText && !hasReply) {
               // 以前有 `t.length > 3` 的 filter 防碎片短 text 刷屏，但那会把 "OK"

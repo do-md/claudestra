@@ -23,7 +23,8 @@ import {
 } from "discord.js";
 import type { ServerWebSocket } from "bun";
 
-import { DISCORD_TOKEN, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK } from "./bridge/config.js";
+import { DISCORD_TOKEN, DISCORD_ENABLED, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK } from "./bridge/config.js";
+import { subscribeWeb, pushToWeb, isLocalChannelId, type WebStreamEvent } from "./bridge/web-hub.js";
 import {
   startTyping,
   stopTyping,
@@ -433,6 +434,10 @@ function resolveReplyBackChannel(env: RouterEnvelope): string {
  * 支持 chunking / reply_to / files / components（通过 meta 透传 discordReply）。
  */
 async function deliverToPeer(env: RouterEnvelope, to: RouterPeerEndpoint): Promise<RouterDelivery> {
+  // Web-only：peer 协作靠 Discord #agent-exchange，无 Discord 即无 peer 出口。
+  if (!DISCORD_ENABLED) {
+    return { envelope: env, outcome: { kind: "dropped", reason: "Discord disabled (Web-only)" } };
+  }
   let text = env.content;
   if (!env.meta.skipAutoMention) {
     text = await ensurePeerMentions(discord, to.sharedChannelId, text);
@@ -469,14 +474,18 @@ async function deliverToPeer(env: RouterEnvelope, to: RouterPeerEndpoint): Promi
  */
 async function deliverToUser(env: RouterEnvelope, to: RouterUserEndpoint): Promise<RouterDelivery> {
   try {
-    const ids = await discordReply(
-      discord,
-      to.channelId,
-      env.content,
-      env.meta.replyTo,
-      env.meta.components as any,
-      env.meta.files,
-    );
+    // Web-only：跳过 Discord 出口（Web tee 已负责把内容送 Web），但保留下面的
+    // cross-agent forward（纯 ws，Discord 无关，两种模式都要能用）。
+    const ids = DISCORD_ENABLED
+      ? await discordReply(
+          discord,
+          to.channelId,
+          env.content,
+          env.meta.replyTo,
+          env.meta.components as any,
+          env.meta.files,
+        )
+      : [];
     // v2.0.15+ cross-agent forward —— 见函数注释
     if (env.from.kind === "local") {
       const fromLocal = env.from;
@@ -486,6 +495,9 @@ async function deliverToUser(env: RouterEnvelope, to: RouterUserEndpoint): Promi
         forwardReplyToAgentClaude(fromLocal, env.content, to.channelId, targetClient)
           .catch((e) => console.error("reply→别agent频道 forward 异常:", e));
       }
+    }
+    if (!DISCORD_ENABLED) {
+      return { envelope: env, outcome: { kind: "dropped", reason: "Discord disabled (Web-only)" } };
     }
     return { envelope: env, outcome: { kind: "sent", discordMessageIds: ids } };
   } catch (e) {
@@ -1095,6 +1107,8 @@ function buildAllSlashCommands(): any[] {
 }
 
 async function registerSlashCommands(): Promise<void> {
+  // Web-only：无 Discord 连接，slash commands 是 Discord 专属（discord.user 为 null）。
+  if (!DISCORD_ENABLED) return;
   try {
     const commands = buildAllSlashCommands();
     // 用 hash 去重 — 命令列表没变就不 REST PUT，省 Discord 配额
@@ -2803,15 +2817,28 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         } catch { /* non-critical */ }
       }
 
-      // 启动 JSONL watcher（仅用于 tool use 流式展示，空闲检测由 hooks 处理）
-      try {
-        const regResult = await runManager("list");
-        const agent = (regResult.agents || []).find((a: any) => a.channelId === msg.channelId);
-        if (agent?.sessionId && agent?.project) {
-          const cwd = agent.project.replace(/^~/, process.env.HOME || "~");
-          startWatching(agent.name, cwd, agent.sessionId, msg.channelId, discord);
-        }
-      } catch { /* non-critical */ }
+      // 启动 JSONL watcher（tool use / 助手文本流 tee 到 Discord + Web）。
+      // fresh session 时 registry 可能还没写（manager 在 ready 之后才落盘，见
+      // cmdCreate 步骤 6），而 channel-server 在 claude 启动时就 register 了 → 首次
+      // 查不到 sessionId。故后台重试几次直到 registry 落盘，避免新会话没 watcher
+      // （无 watcher = 工具/文本流既不到 Discord 也不到 Web）。
+      {
+        const regChannelId = msg.channelId;
+        (async () => {
+          for (let i = 0; i < 10; i++) {
+            try {
+              const regResult = await runManager("list");
+              const agent = (regResult.agents || []).find((a: any) => a.channelId === regChannelId);
+              if (agent?.sessionId && agent?.project) {
+                const cwd = agent.project.replace(/^~/, process.env.HOME || "~");
+                startWatching(agent.name, cwd, agent.sessionId, regChannelId, discord);
+                return;
+              }
+            } catch { /* retry */ }
+            await Bun.sleep(1000);
+          }
+        })();
+      }
 
       break;
     }
@@ -2882,8 +2909,19 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
             skipAutoMention: isDirectReply,
           },
         };
+        // Web tee：把回复文本推给该 agent 频道的 Web 订阅者（与 Discord 并行；
+        // reply() 是 jsonl-watcher 的隐藏工具，不走 watcher，必须在此单独 tee）。
+        if (fromChannelId && text.trim()) {
+          pushToWeb(fromChannelId, { t: "text", text: text.trim() });
+        }
         const delivery = await deliver(env);
         if (delivery.outcome.kind !== "sent") {
+          // Web-only 模式：deliverToUser/Peer 恒 dropped（无 Discord 出口），但回复
+          // 已经过 Web tee 送达 —— 给 agent 回成功 ack，别让它以为 reply 失败。
+          if (!DISCORD_ENABLED && delivery.outcome.kind === "dropped") {
+            ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { messageIds: [] } }));
+            break;
+          }
           const errMsg = delivery.outcome.kind === "dropped"
             ? `reply dropped: ${delivery.outcome.reason}`
             : (delivery.outcome as any).error?.message || "unknown";
@@ -2992,7 +3030,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "create_channel": {
       try {
-        const channelId = await discordCreateChannel(discord, msg.name, msg.category);
+        // Web-only（无 Discord）：合成本地 channelId。会话照常 register / 路由 / Web 按此 id 订阅。
+        // Discord 开时不变：建真频道，Web 亦可订阅同一 channelId（两端镜像同一 session）。
+        const channelId = DISCORD_ENABLED
+          ? await discordCreateChannel(discord, msg.name, msg.category)
+          : `local-${crypto.randomUUID()}`;
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { channelId } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3002,7 +3044,10 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "delete_channel": {
       try {
-        await discordDeleteChannel(discord, msg.channelId);
+        // 合成本地 channel 或 Web-only 模式：无 Discord 频道可删，直接 ok。
+        if (DISCORD_ENABLED && !isLocalChannelId(msg.channelId)) {
+          await discordDeleteChannel(discord, msg.channelId);
+        }
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3012,9 +3057,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "rename_channel": {
       try {
-        const ch = await discord.channels.fetch(msg.channelId);
-        if (!ch || !("setName" in ch)) throw new Error("channel 不存在或不可重命名");
-        await (ch as TextChannel).setName(msg.name);
+        if (DISCORD_ENABLED && !isLocalChannelId(msg.channelId)) {
+          const ch = await discord.channels.fetch(msg.channelId);
+          if (!ch || !("setName" in ch)) throw new Error("channel 不存在或不可重命名");
+          await (ch as TextChannel).setName(msg.name);
+        }
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -4110,6 +4157,9 @@ async function handleHookRequest(req: Request): Promise<Response> {
             const drainResult = await drainChannelWatcher(cid, discord);
             const drainedText = drainResult.text;
 
+            // Web tee：drain 把残留 tool/text 刷完后，通知 Web 本轮结束。
+            pushToWeb(cid, { t: "done" });
+
             // v2.0.13+ 兜底 1: 本地 send_to_agent caller 在等 push。如果 target 这轮
             // 走了 watcher drain（assistant 文字直接 post 到自己 channel）而**不是**
             // reply()，老 pushback 路径根本不触发 → caller 永远等不到。这里在 Stop
@@ -4474,6 +4524,135 @@ const server = Bun.serve({
       }
     }
 
+    // ── Web 前端网关（与 Discord 并行的接入面）─────────────────────────
+    // Next.js BFF（已鉴权后）server-to-server 调用；浏览器永不直连 3847。
+
+    // 注入一条用户消息给指定会话（channelId 由 BFF 从 registry 解析 agent 得到）。
+    if (url.pathname === "/web/inject" && req.method === "POST") {
+      try {
+        const body = (await req.json().catch(() => ({}))) as { channelId?: string; text?: string };
+        const channelId = body.channelId;
+        const text = (body.text || "").trim();
+        if (!channelId || !text) {
+          return new Response(JSON.stringify({ ok: false, error: "missing channelId/text" }), {
+            status: 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        const client = clients.get(channelId);
+        if (!client) {
+          return new Response(JSON.stringify({ ok: false, error: "session not connected" }), {
+            status: 404, headers: { "Content-Type": "application/json" },
+          });
+        }
+        // 直接走 deliver(user→local)：不经 messageCreate，故不发 Discord 的「💭思考中」UI。
+        await deliver({
+          from: { kind: "user", userId: "web", channelId, username: "web" },
+          to: { kind: "local", channelId: client.channelId, ws: client.ws, cwd: client.cwd },
+          intent: "request",
+          content: text,
+          meta: {
+            messageId: `web_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            triggerKind: "user_discord",
+            ts: new Date().toISOString(),
+            threadId: newThreadId(),
+          },
+        });
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // 某会话的持久输出流（SSE）。订阅 web-hub 的 channelId 通道。
+    if (url.pathname === "/web/stream" && req.method === "GET") {
+      const channelId = url.searchParams.get("channelId");
+      if (!channelId) return new Response("missing channelId", { status: 400 });
+      const encoder = new TextEncoder();
+      let unsub: (() => void) | null = null;
+      let hb: ReturnType<typeof setInterval> | null = null;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const send = (payload: string) => {
+            try { controller.enqueue(encoder.encode(`data: ${payload}\n\n`)); } catch { /* closed */ }
+          };
+          send(JSON.stringify({ t: "status", status: "running" } satisfies WebStreamEvent));
+          unsub = subscribeWeb(channelId, (evt) => send(JSON.stringify(evt)));
+          hb = setInterval(() => send("[DONE]"), 30000);
+          req.signal.addEventListener("abort", () => {
+            unsub?.(); if (hb) clearInterval(hb);
+            try { controller.close(); } catch { /* already closed */ }
+          });
+        },
+        cancel() { unsub?.(); if (hb) clearInterval(hb); },
+      });
+      return new Response(body, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+        },
+      });
+    }
+
+    // ── Web 会话管理（新建 / kill / restart）───────────────────────────
+    // 复用 runManager（Bun 进程内直接跑 manager.ts，bun 必在 PATH）。返回 manager
+    // 的 JSON 原样透传给 BFF。让 Web 前门真能开门，不用回终端。
+    if (url.pathname === "/web/agents" && req.method === "POST") {
+      try {
+        const body = (await req.json().catch(() => ({}))) as {
+          name?: string; dir?: string; purpose?: string;
+        };
+        const name = (body.name || "").trim();
+        const dir = (body.dir || "").trim();
+        if (!name || !dir) {
+          return new Response(JSON.stringify({ ok: false, error: "missing name/dir" }), {
+            status: 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        const args = ["create", name, dir];
+        if (body.purpose && body.purpose.trim()) args.push(body.purpose.trim());
+        const result = await runManager(...args);
+        // 新建/kill/restart 后触发 slash 重扫（与 Discord 侧一致，非关键失败可忽略）
+        return new Response(JSON.stringify(result), {
+          status: result?.ok === false ? 400 : 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    if (
+      (url.pathname === "/web/agents/kill" || url.pathname === "/web/agents/restart") &&
+      req.method === "POST"
+    ) {
+      try {
+        const body = (await req.json().catch(() => ({}))) as { name?: string };
+        const name = (body.name || "").trim();
+        if (!name) {
+          return new Response(JSON.stringify({ ok: false, error: "missing name" }), {
+            status: 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        const cmd = url.pathname.endsWith("/kill") ? "kill" : "restart";
+        const result = await runManager(cmd, name);
+        return new Response(JSON.stringify(result), {
+          status: result?.ok === false ? 400 : 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
     return new Response("Claude Orchestrator Bridge", { status: 200 });
   },
   websocket: {
@@ -4501,9 +4680,12 @@ const server = Bun.serve({
 
 console.log(`🚀 Bridge WebSocket 启动: ws://localhost:${BRIDGE_PORT}`);
 
-if (!DISCORD_TOKEN) {
-  console.error("❌ 请设置 DISCORD_BOT_TOKEN");
-  process.exit(1);
+if (!DISCORD_ENABLED) {
+  // Web-only 模式：不连 Discord，只跑 HTTP/WS 网关 + 本地会话。
+  // discord.once("ready") 回调、shard 看门狗、messageCreate 等都不会触发（未 login）。
+  console.warn(
+    "⚠️  未设置 DISCORD_BOT_TOKEN — 以 Web-only 模式启动（Discord 前端禁用；仅 Web 网关 + 本地会话编排）",
+  );
+} else {
+  discord.login(DISCORD_TOKEN);
 }
-
-discord.login(DISCORD_TOKEN);
