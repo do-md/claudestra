@@ -1,0 +1,52 @@
+@import "tailwindcss";
+@import "daisyui/components/tooltip.css";
+
+@plugin "daisyui" {
+    themes:
+        light --default,
+        dark --prefersdark;
+}
+
+@plugin "daisyui/theme" {
+    name: "dark";
+    prefersdark: true;
+    --color-primary: "#FFFFFF";
+    --color-primary-content: "#000000";
+    --color-secondary: "#853A2D";
+    --color-accent: "#EC5A72";
+    --color-neutral: "#2E3034";
+    --color-neutral-content: "#aaaaaa";
+    --color-base-100: "rgb(23,24,25)";
+    --color-base-200: "#1E2022";
+    --color-base-300: "rgb(32,34,36)";
+    --color-base-content: "#BCBEC4";
+    --color-info: "#3abff8";
+    --color-success: "#00A96D";
+    --color-warning: "#fbbd23";
+    --radius-field: 0.5rem;
+    --depth: 0;
+}
+
+@plugin "daisyui/theme" {
+    name: "light";
+    default: true;
+    --color-primary: "#000000";
+    --color-primary-content: "#FFFFFF";
+    --color-accent: "#EC5A72";
+    --color-base-100: "#FFFFFF";
+    --color-base-200: "#F7F7F7";
+    --color-base-300: "#EDEDED";
+    --radius-field: 0.5rem;
+    --depth: 0;
+}
+
+html,
+body {
+    height: 100%;
+}
+
+body {
+    /* 移动端安全区，PWA 独立窗口下生效（需配合 viewport-fit=cover） */
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+}
