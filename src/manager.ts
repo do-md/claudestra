@@ -48,6 +48,8 @@ import {
   DEFAULT_PRESET,
   PERMISSION_MODES,
   isKnownPermissionMode,
+  resolveModelAlias,
+  listModelAliases,
 } from "./lib/claude-launch.js";
 import { printTmuxGuide } from "./lib/tmux-guide.js";
 
@@ -86,6 +88,16 @@ interface AgentInfo {
    * 之前建的）→ 启动时回退 bypass，行为不变。改完要 restart 才生效。
    */
   permissionMode?: string;
+  /**
+   * v2.4.19+ 频道置顶公告（带「🖥 跳到 iTerm tab」focus 按钮）的 Discord message id。
+   * create/resume 时发一次并记录；已有就跳过，防 restart 重复发。
+   */
+  focusMsgId?: string;
+  /**
+   * v2.4.20+ 按 agent 钉的模型（`--model`）。别名或 model id。空 = 跟随全局
+   * ~/.claude/settings.json。改完 restart 生效（是启动 flag）。
+   */
+  model?: string;
 }
 
 interface Registry {
@@ -153,6 +165,27 @@ async function triggerSkillsRescan(
       signal: AbortSignal.timeout(3000),
     });
   } catch { /* bridge 可能未运行 */ }
+}
+
+/**
+ * v2.4.19+ 在 agent 频道发置顶公告（带「🖥 跳到 iTerm tab」focus 按钮）。
+ * messageId 记进 registry.focusMsgId，已有就不重发（restart 沿用同一频道）。
+ * bridge 没跑 / 发失败都静默 —— 公告是 nice-to-have，不该挡 create/resume。
+ */
+async function announceFocusButton(tmuxName: string, channelId: string): Promise<void> {
+  try {
+    const reg = await loadRegistry();
+    if (reg.agents[tmuxName]?.focusMsgId) return;
+    const result = await bridgeRequest({
+      type: "announce_focus",
+      channelId,
+      agentName: tmuxName,
+    });
+    if (result?.messageId && reg.agents[tmuxName]) {
+      reg.agents[tmuxName].focusMsgId = result.messageId;
+      await saveRegistry(reg);
+    }
+  } catch { /* non-critical */ }
 }
 
 async function windowExists(name: string): Promise<boolean> {
@@ -386,6 +419,23 @@ function extractModeFlag(args: string[]): { rest: string[]; mode?: string } {
   return { rest, mode };
 }
 
+/** v2.4.20+ 从 argv 提取 --model <model>，支持 --model=foo */
+function extractModelFlag(args: string[]): { rest: string[]; model?: string } {
+  const rest: string[] = [];
+  let model: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--model") {
+      model = args[++i];
+    } else if (a.startsWith("--model=")) {
+      model = a.slice("--model=".length);
+    } else {
+      rest.push(a);
+    }
+  }
+  return { rest, model };
+}
+
 // ============================================================
 // 命令实现
 // ============================================================
@@ -397,6 +447,7 @@ async function cmdCreate(
   perms: { preset?: string; disallowedRaw?: string } = {},
   effort?: string,
   permissionMode?: string,
+  model?: string,
 ) {
   assertValidNewName(name);
   const tmuxName = normalizeName(name);
@@ -491,6 +542,7 @@ async function cmdCreate(
       disallowedRaw: perms.disallowedRaw,
       effort,
       permissionMode: mode,
+      model,
     });
     // 新 tmux window 起来后 .zshrc / .bashrc 可能弹 oh-my-zsh / homebrew 的 Y/n
     // update prompt，会吞掉 send-keys 第一个字符。先清掉再发命令。
@@ -546,10 +598,12 @@ async function cmdCreate(
     disallowedRaw: perms.disallowedRaw,
     effort,
     permissionMode: mode,
+    ...(model ? { model } : {}),
   };
   await saveRegistry(reg);
 
   await triggerSkillsRescan("add", tmuxName, expandedDir);
+  await announceFocusButton(tmuxName, channelId);
 
   output({
     ok: true,
@@ -576,6 +630,7 @@ async function cmdResume(
   perms: { preset?: string; disallowedRaw?: string } = {},
   effort?: string,
   permissionMode?: string,
+  model?: string,
 ) {
   if (!UUID_RE.test(sessionId)) {
     throw new Error(`非法 sessionId: "${sessionId}"（应为 UUID 格式）`);
@@ -674,6 +729,7 @@ async function cmdResume(
       disallowedRaw: perms.disallowedRaw,
       effort,
       permissionMode: mode,
+      model,
     });
     await clearShellInitPrompts(target);
     await tmuxSendLine(target, cmd);
@@ -728,6 +784,7 @@ async function cmdResume(
     disallowedRaw: perms.disallowedRaw,
     effort,
     permissionMode: mode,
+    ...(model ? { model } : {}),
   };
   await saveRegistry(reg);
 
@@ -784,6 +841,7 @@ async function cmdResume(
       : `Agent ${tmuxName} 已恢复，但 Claude Code 可能还在启动中`,
   });
   await triggerSkillsRescan("add", tmuxName, resolvedDir);
+  await announceFocusButton(tmuxName, channelId);
 }
 
 async function cmdKill(name: string) {
@@ -1163,6 +1221,9 @@ async function cmdRestart(name?: string) {
       // 老 agent（feature 前建的）info.permissionMode 为空 → buildClaudeCommand
       // 回退 bypassPermissions，行为不变。新 agent 沿用 registry 里存的模式。
       permissionMode: info.permissionMode,
+      // v2.4.20+ restart 沿用 registry 里钉的模型（这是"改全局无效"的解法：
+      // 显式 --model 覆盖 --resume 钉死的会话原模型）。
+      model: info.model,
     });
 
     const started = await startClaudeInWindow(tmuxName, cmd);
@@ -1741,6 +1802,112 @@ async function cmdMode(sub: string, ...rest: string[]) {
     ok: true,
     agent: tmuxName,
     permissionMode: modeVal,
+    hint: `已写入 registry。要让 ${tmuxName} 立即生效，跑: bun src/manager.ts restart ${tmuxName.replace(AGENT_PREFIX, "")}`,
+  });
+}
+
+/**
+ * v2.4.20+ model 子命令 —— 查看 / 改 agent 的模型（--model）。用法对齐 cmdEffort：
+ *   model list                  列出所有 agent 的模型 + 可用别名
+ *   model get <agent>           查单个
+ *   model <agent> <model>       改（= model set <agent> <model>）
+ *   model reset <agent>         清除（跟随全局 settings.json）
+ *   model all <model>           一把把所有 active agent 钉到同一模型
+ * 改完要 restart 才生效（是启动 flag）。
+ */
+async function cmdModel(sub: string, ...rest: string[]) {
+  if (!sub || sub === "list") {
+    const reg = await loadRegistry();
+    const rows = Object.entries(reg.agents)
+      .filter(([, info]) => info.status === "active")
+      .map(([name, info]) => ({
+        name,
+        model: info.model ? resolveModelAlias(info.model) : "(inherit)",
+      }));
+    output({
+      ok: true,
+      agents: rows,
+      aliases: listModelAliases(),
+      hint: "(inherit) = 跟随 ~/.claude/settings.json 全局模型。别名或完整 model id 都可用。",
+    });
+    return;
+  }
+
+  if (sub === "get") {
+    const [name] = rest;
+    if (!name) { output({ ok: false, error: "用法: model get <name>" }); return; }
+    const tmuxName = normalizeName(name);
+    const reg = await loadRegistry();
+    const info = reg.agents[tmuxName];
+    if (!info) { output({ ok: false, error: `找不到 agent: ${tmuxName}` }); return; }
+    output({ ok: true, agent: tmuxName, model: info.model ? resolveModelAlias(info.model) : "(inherit)" });
+    return;
+  }
+
+  if (sub === "reset") {
+    const [name] = rest;
+    if (!name) { output({ ok: false, error: "用法: model reset <name>" }); return; }
+    const tmuxName = normalizeName(name);
+    const reg = await loadRegistry();
+    const info = reg.agents[tmuxName];
+    if (!info) { output({ ok: false, error: `找不到 agent: ${tmuxName}` }); return; }
+    info.model = undefined;
+    await saveRegistry(reg);
+    output({
+      ok: true, agent: tmuxName, model: "(inherit)",
+      hint: `已清除。restart ${tmuxName.replace(AGENT_PREFIX, "")} 生效。`,
+    });
+    return;
+  }
+
+  // model all <model> —— 一把钉所有 active agent（满足"把所有 agent 切 fable"）
+  if (sub === "all") {
+    const [modelVal] = rest;
+    if (!modelVal) { output({ ok: false, error: "用法: model all <model>", aliases: listModelAliases() }); return; }
+    const resolved = resolveModelAlias(modelVal);
+    const reg = await loadRegistry();
+    const changed: string[] = [];
+    for (const [name, info] of Object.entries(reg.agents)) {
+      if (info.status === "active") {
+        info.model = modelVal;
+        changed.push(name);
+      }
+    }
+    await saveRegistry(reg);
+    output({
+      ok: true,
+      model: resolved,
+      changed,
+      hint: `已把 ${changed.length} 个 active agent 钉到 ${resolved}。跑 restart（不带名字）全部重启生效。`,
+    });
+    return;
+  }
+
+  // 默认：model <agent> <model> 或 model set <agent> <model>
+  let agentName: string;
+  let modelVal: string;
+  if (sub === "set") {
+    [agentName, modelVal] = rest;
+  } else {
+    agentName = sub;
+    modelVal = rest[0];
+  }
+
+  if (!agentName || !modelVal) {
+    output({ ok: false, error: "用法: model <agent> <model>｜model reset <agent>｜model all <model>｜model list", aliases: listModelAliases() });
+    return;
+  }
+
+  const tmuxName = normalizeName(agentName);
+  const reg = await loadRegistry();
+  const info = reg.agents[tmuxName];
+  if (!info) { output({ ok: false, error: `找不到 agent: ${tmuxName}` }); return; }
+  info.model = modelVal;
+  await saveRegistry(reg);
+  output({
+    ok: true,
+    agent: tmuxName,
+    model: resolveModelAlias(modelVal),
     hint: `已写入 registry。要让 ${tmuxName} 立即生效，跑: bun src/manager.ts restart ${tmuxName.replace(AGENT_PREFIX, "")}`,
   });
 }
@@ -2330,34 +2497,36 @@ const [cmd, ...args] = process.argv.slice(2);
 try {
 switch (cmd) {
   case "create": {
-    const { rest: afterMode, mode } = extractModeFlag(args);
+    const { rest: afterModel, model } = extractModelFlag(args);
+    const { rest: afterMode, mode } = extractModeFlag(afterModel);
     const { rest: afterEffort, effort } = extractEffortFlag(afterMode);
     const { rest: posArgs, preset, disallowedRaw } = extractPermFlags(afterEffort);
     const [name, dir, ...purposeParts] = posArgs;
     if (!name || !dir) {
       output({
         ok: false,
-        error: 'create <name> <dir> [purpose] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>]',
+        error: 'create <name> <dir> [purpose] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>] [--model <model>]',
       });
       break;
     }
-    await cmdCreate(name, dir, purposeParts.join(" "), { preset, disallowedRaw }, effort, mode);
+    await cmdCreate(name, dir, purposeParts.join(" "), { preset, disallowedRaw }, effort, mode, model);
     break;
   }
 
   case "resume": {
-    const { rest: afterMode, mode } = extractModeFlag(args);
+    const { rest: afterModel, model } = extractModelFlag(args);
+    const { rest: afterMode, mode } = extractModeFlag(afterModel);
     const { rest: afterEffort, effort } = extractEffortFlag(afterMode);
     const { rest: posArgs, preset, disallowedRaw } = extractPermFlags(afterEffort);
     const [name, sessionId, dir] = posArgs;
     if (!name || !sessionId) {
       output({
         ok: false,
-        error: 'resume <name> <sessionId> [dir] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>]',
+        error: 'resume <name> <sessionId> [dir] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>] [--model <model>]',
       });
       break;
     }
-    await cmdResume(name, sessionId, dir, { preset, disallowedRaw }, effort, mode);
+    await cmdResume(name, sessionId, dir, { preset, disallowedRaw }, effort, mode, model);
     break;
   }
 
@@ -2384,6 +2553,26 @@ switch (cmd) {
   case "list":
     await cmdList();
     break;
+
+  // v2.4.19+ 给现存 active agent 补发置顶 focus 公告（新建/恢复的自动发，这个
+  // 是给"feature 上线前就在跑"的老 agent 用的一次性 backfill）
+  case "announce-focus": {
+    const [nameArg] = args;
+    const reg = await loadRegistry();
+    const targets = Object.entries(reg.agents).filter(([n, info]) =>
+      info.status === "active" && info.channelId &&
+      (!nameArg || n === normalizeName(nameArg))
+    );
+    const results: Record<string, string> = {};
+    for (const [n, info] of targets) {
+      if (info.focusMsgId) { results[n] = "已有，跳过"; continue; }
+      await announceFocusButton(n, info.channelId);
+      const after = await loadRegistry();
+      results[n] = after.agents[n]?.focusMsgId ? "✅ 已发" : "❌ 失败";
+    }
+    output({ ok: true, results });
+    break;
+  }
 
   case "sessions":
     await cmdSessions(args.join(" ") || undefined);
@@ -2583,6 +2772,12 @@ switch (cmd) {
   case "mode": {
     const [sub, ...rest] = args;
     await cmdMode(sub || "list", ...rest);
+    break;
+  }
+
+  case "model": {
+    const [sub, ...rest] = args;
+    await cmdModel(sub || "list", ...rest);
     break;
   }
 

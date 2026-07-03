@@ -2291,6 +2291,71 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         return;
       }
 
+      // v2.4.19+ 跳到 iTerm tab 按钮（LLM-free）。
+      // tmux select-window 只改 tmux 内部的 active window —— iTerm CC 模式下
+      // 每个 tmux window 是一个原生 tab，tab 焦点归 iTerm 管，得用 AppleScript
+      // 按 session 名（CC 模式显示为 "✳ <短名> (node)"）找到 tab 并 select。
+      // 只对 bridge 所在的这台 Mac 有效 —— 手机上点也行，Mac 那头会切好等你回来。
+      if (id.startsWith("focus:")) {
+        const targetChannelId = id.slice("focus:".length);
+        try {
+          const controlId = process.env.CONTROL_CHANNEL_ID || "";
+          let targetWindow: string;
+          let label: string;
+          let tabNeedle: string; // iTerm session 名匹配串
+          if (targetChannelId === controlId) {
+            targetWindow = `${MASTER_SESSION}:0`;
+            label = "master";
+            tabNeedle = " Claude Code ("; // master 的 CC tab 名
+          } else {
+            const listResult = await runManager("list");
+            const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
+            if (!agent) {
+              await interaction.followUp({ content: "❌ 找不到对应 agent（可能已被 kill）", ephemeral: true }).catch(() => {});
+              return;
+            }
+            targetWindow = `${MASTER_SESSION}:${agent.name}`;
+            label = agent.name;
+            // tab 名用 agent 短名（去 "agent-" 前缀），两侧界定符防前缀嵌套误匹配
+            const short = String(agent.name).replace(/^agent-/, "");
+            tabNeedle = ` ${short} (`;
+          }
+          // tmux 内部状态也同步一下（非 CC attach 的裸 tmux 场景仍有用）
+          await tmuxRaw(["select-window", "-t", targetWindow]).catch(() => {});
+          // AppleScript：遍历 iTerm windows/tabs/sessions 按名选 tab + 前置
+          const esc = tabNeedle.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+          const script = [
+            'tell application "iTerm2"',
+            '  repeat with w in windows',
+            '    repeat with t in tabs of w',
+            '      repeat with s in sessions of t',
+            `        if name of s contains "${esc}" then`,
+            '          select w',
+            '          select t',
+            '          activate',
+            '          return "found"',
+            '        end if',
+            '      end repeat',
+            '    end repeat',
+            '  end repeat',
+            '  activate',
+            '  return "notfound"',
+            'end tell',
+          ].join("\n");
+          const osa = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+          const found = (await new Response(osa.stdout).text()).trim();
+          await osa.exited;
+          console.log(`🖥 focus 按钮: ${targetWindow} → iTerm tab ${found === "found" ? "已选中" : "没找到（仅前置 iTerm）"}`);
+          const note = found === "found"
+            ? `🖥 已跳到 **${label}** 的 iTerm tab`
+            : `🖥 iTerm 已前置，但没找到 **${label}** 的 tab（iTerm 没 -CC attach？tmux 内部已切过去）`;
+          await interaction.followUp({ content: note, ephemeral: true }).catch(() => {});
+        } catch (e) {
+          await interaction.followUp({ content: `❌ 切换失败: ${(e as Error).message}`, ephemeral: true }).catch(() => {});
+        }
+        return;
+      }
+
       // 打断按钮
       if (id.startsWith("interrupt:")) {
         const targetChannelId = id.slice("interrupt:".length);
@@ -2951,6 +3016,43 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         if (!ch || !("setName" in ch)) throw new Error("channel 不存在或不可重命名");
         await (ch as TextChannel).setName(msg.name);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
+      } catch (err) {
+        ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
+      }
+      break;
+    }
+
+    case "announce_focus": {
+      // v2.4.19+ manager create/resume 后调：在 agent 频道发一条置顶公告，带
+      // 「🖥 跳到 iTerm tab」按钮（focus:<channelId>，LLM-free 直接执行）。
+      // 返回 messageId 给 manager 存 registry，避免 restart 重复发。
+      try {
+        const annChannelId = msg.channelId as string;
+        const annAgentName = msg.agentName as string;
+        const ids = await discordReply(
+          discord,
+          annChannelId,
+          `📌 **${annAgentName}** 控制台\n-# 点按钮把 Mac 上的 iTerm 切到这个 agent 的 tab`,
+          undefined,
+          [{
+            type: "buttons",
+            buttons: [
+              { id: `focus:${annChannelId}`, label: "🖥 跳到 iTerm tab", style: "primary" },
+            ],
+          }],
+        );
+        const annMsgId = ids[ids.length - 1];
+        // pin 失败不算错（权限不够时公告仍在，只是没置顶）
+        try {
+          const ch = await discord.channels.fetch(annChannelId);
+          if (ch && "messages" in ch) {
+            const m = await (ch as TextChannel).messages.fetch(annMsgId);
+            await m.pin();
+          }
+        } catch (e) {
+          console.warn(`📌 announce_focus pin 失败（公告已发未置顶）: ${(e as Error).message}`);
+        }
+        ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { messageId: annMsgId } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
       }

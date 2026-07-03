@@ -122,6 +122,33 @@ export function isKnownPermissionMode(m: string): boolean {
 // 也是 cmdCreate / cmdResume 的默认。所有路径里出现的 "auto" 字符串都会归一到这个值。
 export const DEFAULT_PERMISSION_MODE: PermissionMode = "bypassPermissions";
 
+// ────────────────────────────────────────────────
+// 模型（Claude Code --model）
+// ────────────────────────────────────────────────
+//
+// v2.4.20+ 支持按 agent 钉模型。别名 → 完整 model id 的映射，方便用户敲短名。
+// 不在别名表里的值原样透传（允许用户指定任意 model id / 未来新模型）。
+export const MODEL_ALIASES: Record<string, string> = {
+  fable: "claude-fable-5",
+  "fable-5": "claude-fable-5",
+  opus: "claude-opus-4-8",
+  "opus-4-8": "claude-opus-4-8",
+  "opus-4-7": "claude-opus-4-7",
+  sonnet: "claude-sonnet-4-6",
+  haiku: "claude-haiku-4-5-20251001",
+};
+
+/** 别名 → model id；未知值原样返回（透传任意 model id）。 */
+export function resolveModelAlias(m: string): string {
+  const key = m.trim().toLowerCase();
+  return MODEL_ALIASES[key] || m.trim();
+}
+
+/** 展示用：列出所有已知别名 + 对应 id。 */
+export function listModelAliases(): Array<{ alias: string; model: string }> {
+  return Object.entries(MODEL_ALIASES).map(([alias, model]) => ({ alias, model }));
+}
+
 export function listPresets(): string[] {
   return Object.keys(DISALLOWED_PRESETS);
 }
@@ -183,6 +210,15 @@ export interface LaunchOptions {
    * 没传就不加 flag → Claude Code 用 `~/.claude/settings.json` 的全局 effortLevel。
    */
   effort?: string;
+  /**
+   * v2.4.20+ Session-scoped 模型（`--model <model>`）。给 create / resume / restart
+   * 都生效。传模型 id（如 `claude-fable-5`）或别名（`fable` / `opus` / `sonnet` /
+   * `haiku`）。没传就不加 flag → Claude Code 用全局 settings.json 的模型。
+   *
+   * 关键：resume/restart 用 `--resume` 会钉死会话原模型，只有显式 `--model` 才能
+   * 覆盖 —— 这正是"改全局 settings 对已存在 agent 无效"的根因。
+   */
+  model?: string;
 }
 
 /** POSIX 单引号 shell 转义 */
@@ -252,6 +288,12 @@ export function buildClaudeCommand(opts: LaunchOptions): string {
 
   if (opts.effort && opts.effort.trim() && opts.effort !== "default") {
     parts.push("--effort", shellEscape(opts.effort.trim()));
+  }
+
+  // v2.4.20+ 显式 --model 覆盖会话原模型。放在 --resume 之后，Claude Code 以
+  // 显式 flag 为准（这是"restart 改不掉已存在 agent 模型"的解法）。
+  if (opts.model && opts.model.trim()) {
+    parts.push("--model", shellEscape(resolveModelAlias(opts.model.trim())));
   }
 
   if (disallowed.length > 0) {
