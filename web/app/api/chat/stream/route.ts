@@ -2,7 +2,7 @@ export const runtime = "nodejs";
 
 import { mockBridge } from "@/lib/chat/mock-bridge";
 import { SSE_DONE, type WebStreamEvent } from "@/lib/chat/events";
-import { resolveChannelId } from "@/lib/chat/agents";
+import { resolveChannelId, getMasterInfo, MASTER_AGENT_NAME } from "@/lib/chat/agents";
 import { isAuthed } from "@/lib/api-auth";
 
 const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
@@ -26,7 +26,10 @@ export async function GET(request: Request) {
   const agent = url.searchParams.get("agent");
   if (!agent) return new Response("missing agent", { status: 400 });
 
-  const channelId = resolveChannelId(agent);
+  const channelId =
+    agent === MASTER_AGENT_NAME
+      ? (await getMasterInfo())?.channelId ?? null
+      : resolveChannelId(agent);
   if (channelId) {
     // 真实 Bridge：透传其 SSE 流（事件格式一致）
     try {

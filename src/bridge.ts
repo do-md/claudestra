@@ -23,7 +23,9 @@ import {
 } from "discord.js";
 import type { ServerWebSocket } from "bun";
 
-import { DISCORD_TOKEN, DISCORD_ENABLED, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK } from "./bridge/config.js";
+import { DISCORD_TOKEN, DISCORD_ENABLED, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK, MASTER_DIR } from "./bridge/config.js";
+import { existsSync as fsExistsSync, readdirSync as fsReaddirSync, statSync as fsStatSync } from "fs";
+import { resolve as pathResolve } from "path";
 import { subscribeWeb, pushToWeb, isLocalChannelId, type WebStreamEvent } from "./bridge/web-hub.js";
 import {
   startTyping,
@@ -4373,6 +4375,10 @@ async function handleHookRequest(req: Request): Promise<Response> {
 
 const server = Bun.serve({
   port: BRIDGE_PORT,
+  // Bun.serve 的 HTTP idleTimeout 默认 10s：SSE 响应超过 10s 没数据就被 Bun 关连接，
+  // 导致 /web/stream 上「思考 >10s 才回复」的消息丢失（reply/tool/done 都收不到）。
+  // 抬到 255（Bun 上限）+ /web/stream 每 15s 心跳，长思考也不断流。
+  idleTimeout: 255,
   async fetch(req, server) {
     if (server.upgrade(req)) return undefined;
 
@@ -4581,7 +4587,9 @@ const server = Bun.serve({
           };
           send(JSON.stringify({ t: "status", status: "running" } satisfies WebStreamEvent));
           unsub = subscribeWeb(channelId, (evt) => send(JSON.stringify(evt)));
-          hb = setInterval(() => send("[DONE]"), 30000);
+          // 15s 心跳（< Bun idleTimeout 255s，也留足余量应对中间代理的更短空闲超时），
+          // 保证长思考期间连接不被判空闲而关闭。
+          hb = setInterval(() => send("[DONE]"), 15000);
           req.signal.addEventListener("abort", () => {
             unsub?.(); if (hb) clearInterval(hb);
             try { controller.close(); } catch { /* already closed */ }
@@ -4651,6 +4659,44 @@ const server = Bun.serve({
           status: 500, headers: { "Content-Type": "application/json" },
         });
       }
+    }
+
+    // 大总管（master orchestrator）信息。Web 端据此置顶一个「大总管」入口，路由到
+    // CONTROL_CHANNEL_ID（与 Discord #control 同一角色）。master 不在 registry.json，
+    // 靠 CONTROL_CHANNEL_ID 识别；cwd 优先取已连接 master 的实际 cwd，否则 MASTER_DIR；
+    // sessionId 取该 cwd slug 目录下最新的 jsonl（launcher 重启会换 session，故每次现算）。
+    if (url.pathname === "/web/master" && req.method === "GET") {
+      const channelId = CONTROL_CHANNEL_ID;
+      if (!channelId) {
+        return new Response(JSON.stringify({ available: false }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      // 归一化路径（MASTER_DIR 含 import.meta.dir/../.. 的 ..，直接算 slug 会错）
+      const cwd = pathResolve(clients.get(channelId)?.cwd || MASTER_DIR);
+      // 找 cwd slug 目录下最新的 .jsonl → 当前 master session
+      let sessionId: string | null = null;
+      try {
+        const slug = "-" + cwd.replace(/^\//, "").replace(/\//g, "-");
+        const dir = `${process.env.HOME}/.claude/projects/${slug}`;
+        if (fsExistsSync(dir)) {
+          let newest = 0;
+          for (const f of fsReaddirSync(dir)) {
+            if (!f.endsWith(".jsonl")) continue;
+            const mt = fsStatSync(`${dir}/${f}`).mtimeMs;
+            if (mt > newest) { newest = mt; sessionId = f.replace(/\.jsonl$/, ""); }
+          }
+        }
+      } catch { /* sessionId 保持 null */ }
+      const connected = clients.has(channelId);
+      return new Response(JSON.stringify({
+        available: true,
+        channelId,
+        cwd,
+        sessionId,
+        connected,
+        displayName: "大总管",
+      }), { headers: { "Content-Type": "application/json" } });
     }
 
     return new Response("Claude Orchestrator Bridge", { status: 200 });

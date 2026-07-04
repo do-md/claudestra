@@ -14,6 +14,58 @@ export interface AgentSession {
   channelId?: string;
   /** 是否为 mock 数据（真实 registry 缺失时） */
   mock?: boolean;
+  /** 大总管（master orchestrator）置顶入口——不在 registry，靠 CONTROL_CHANNEL_ID；不可 kill/restart。 */
+  pinnedMaster?: boolean;
+}
+
+/** 大总管的保留会话名（前端 openAgent / 路由用它识别 master）。 */
+export const MASTER_AGENT_NAME = "__master__";
+
+const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
+
+export interface MasterInfo {
+  channelId: string;
+  cwd: string;
+  sessionId: string | null;
+  connected: boolean;
+  displayName: string;
+}
+
+/**
+ * 取大总管信息（channelId + cwd + 当前 sessionId），server 端调 Bridge /web/master。
+ * Bridge 无 CONTROL_CHANNEL_ID / 不可达 → 返回 null（前端就不显示大总管入口）。
+ */
+export async function getMasterInfo(): Promise<MasterInfo | null> {
+  try {
+    const res = await fetch(`${BRIDGE}/web/master`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { available?: boolean } & MasterInfo;
+    if (!j.available || !j.channelId) return null;
+    return {
+      channelId: j.channelId,
+      cwd: j.cwd,
+      sessionId: j.sessionId ?? null,
+      connected: !!j.connected,
+      displayName: j.displayName || "大总管",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 把 MasterInfo 转成置顶的 AgentSession（供 /api/agents 前插）。 */
+export function masterAgentSession(m: MasterInfo): AgentSession {
+  return {
+    name: MASTER_AGENT_NAME,
+    displayName: m.displayName,
+    purpose: "调度员：管理/派发多个 agent",
+    cwd: m.cwd,
+    status: m.connected ? "active" : "stopped",
+    channelId: m.channelId,
+    pinnedMaster: true,
+  };
 }
 
 const REGISTRY_PATH = path.join(

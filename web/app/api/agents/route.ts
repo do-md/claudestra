@@ -1,7 +1,7 @@
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
-import { loadAgents } from "@/lib/chat/agents";
+import { loadAgents, getMasterInfo, masterAgentSession } from "@/lib/chat/agents";
 import { isAuthed } from "@/lib/api-auth";
 
 const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
@@ -10,7 +10,13 @@ export async function GET(request: Request) {
   if (!(await isAuthed(request))) {
     return NextResponse.json({ error: "未登录" }, { status: 401 });
   }
-  return NextResponse.json({ data: loadAgents() });
+  // 置顶大总管（若 Bridge 配了 CONTROL_CHANNEL_ID），其余是 registry 里的 worker agent
+  const master = await getMasterInfo();
+  const list = [
+    ...(master ? [masterAgentSession(master)] : []),
+    ...loadAgents(),
+  ];
+  return NextResponse.json({ data: list });
 }
 
 /** 新建 agent：代理 Bridge POST /web/agents（内部 runManager create）。 */

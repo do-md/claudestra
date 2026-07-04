@@ -2,7 +2,7 @@ export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 import { mockBridge } from "@/lib/chat/mock-bridge";
-import { resolveChannelId } from "@/lib/chat/agents";
+import { resolveChannelId, getMasterInfo, MASTER_AGENT_NAME } from "@/lib/chat/agents";
 import { isAuthed } from "@/lib/api-auth";
 
 const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
@@ -21,7 +21,11 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "agent 和 text 不能为空" }, { status: 400 });
   }
 
-  const channelId = resolveChannelId(agent);
+  // 大总管：channelId 从 Bridge /web/master 取（不在 registry）
+  const channelId =
+    agent === MASTER_AGENT_NAME
+      ? (await getMasterInfo())?.channelId ?? null
+      : resolveChannelId(agent);
   if (channelId) {
     // 真实 Bridge 路径
     try {

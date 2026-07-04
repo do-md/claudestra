@@ -26,7 +26,7 @@ function AgentRow({ a, active }: { a: AgentSession; active: boolean }) {
     action: "kill" | "restart"
   ) => {
     e.stopPropagation();
-    if (busy || a.mock) return;
+    if (busy || a.mock || a.pinnedMaster) return;
     setBusy(action);
     setError("");
     const res =
@@ -48,9 +48,18 @@ function AgentRow({ a, active }: { a: AgentSession; active: boolean }) {
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
           onClick={() => store.openAgent(a.name)}
         >
-          <StatusDot status={a.status} />
+          {a.pinnedMaster ? (
+            <span className="text-sm" title="大总管（总控）">👑</span>
+          ) : (
+            <StatusDot status={a.status} />
+          )}
           <span className="min-w-0 flex-1 truncate">
             {a.displayName}
+            {a.pinnedMaster && (
+              <span className="badge badge-primary badge-xs ml-1 align-middle">
+                总控
+              </span>
+            )}
             {a.mock && (
               <span className="badge badge-ghost badge-xs ml-1 align-middle">
                 mock
@@ -59,7 +68,7 @@ function AgentRow({ a, active }: { a: AgentSession; active: boolean }) {
           </span>
         </button>
 
-        {!a.mock && (
+        {!a.mock && !a.pinnedMaster && (
           <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
             <button
               className="btn btn-ghost btn-xs px-1"

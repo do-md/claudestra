@@ -20,4 +20,6 @@ export interface AgentSession {
   cwd: string;
   status: "active" | "stopped";
   mock?: boolean;
+  /** 大总管置顶入口——不显示 kill/restart，列表第一位。 */
+  pinnedMaster?: boolean;
 }

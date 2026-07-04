@@ -21,13 +21,20 @@ TMUX_BIN="$(command -v tmux || echo /opt/homebrew/bin/tmux)"
 
 mkdir -p /tmp/claude-orchestrator
 
-# ① 幂等确保 master session（base-index 0，与 launcher.ts 一致）
+# ① 幂等确保 master session（base-index 0，与 launcher.ts 一致）。
+#    window:0 的 cwd 必须是 master/（MASTER_DIR），大总管才会加载 master/CLAUDE.md 的
+#    调度员 persona（否则在 repo 根会误加载架构文档 apps/claudestra/CLAUDE.md）。
 if ! "$TMUX_BIN" -S "$SOCK" has-session -t master 2>/dev/null; then
-  "$TMUX_BIN" -S "$SOCK" new-session -d -s master -c "$REPO"
+  "$TMUX_BIN" -S "$SOCK" new-session -d -s master -c "$REPO/master"
   "$TMUX_BIN" -S "$SOCK" set-option -t master base-index 0 2>/dev/null || true
 fi
 
-# ② Web-only：即便环境里有 token 也强制不带，绝不误连 Discord
+# ② 大总管（master orchestrator）的合成控制频道 id。Web-only 无 Discord #control，
+#    用固定 local- 合成 id；bridge 据此把该频道识别为 master，/web/master 也返回它。
+#    ⚠ 必须与 scripts/web-only-launcher.sh 里的值完全一致。
+export CONTROL_CHANNEL_ID="${CONTROL_CHANNEL_ID:-local-master-control}"
+
+# ③ Web-only：即便环境里有 token 也强制不带，绝不误连 Discord
 unset DISCORD_BOT_TOKEN
 cd "$REPO"
 exec "$BUN" run src/bridge.ts

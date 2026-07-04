@@ -1,7 +1,7 @@
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
-import { resolveSession } from "@/lib/chat/agents";
+import { resolveSession, getMasterInfo, MASTER_AGENT_NAME } from "@/lib/chat/agents";
 import { loadHistoryFromJsonl } from "@/lib/chat/history";
 import { isAuthed } from "@/lib/api-auth";
 
@@ -20,9 +20,13 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "missing agent" }, { status: 400 });
   }
 
-  const ref = resolveSession(agent);
+  // 大总管：sessionId+cwd 从 Bridge /web/master 取（不在 registry）
+  const ref =
+    agent === MASTER_AGENT_NAME
+      ? await getMasterInfo()
+      : resolveSession(agent);
   if (!ref?.sessionId || !ref?.cwd) {
-    // mock 或尚无 session（新建后还没跑过）→ 无历史
+    // mock / 尚无 session（新建后还没跑过）/ master 未连 → 无历史
     return NextResponse.json({ data: [] });
   }
 
