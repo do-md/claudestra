@@ -1539,10 +1539,7 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
       triggerKind: "bridge_synth",
       ts: new Date().toISOString(),
       threadId: newThreadId(),
-      components: [{
-        type: "buttons",
-        buttons: [{ id: `interrupt:${channelId}`, label: t("打断", "Interrupt"), emoji: "⚡", style: "danger" }],
-      }],
+      components: agentActionButtons(channelId, true),
     },
   });
   if (statusDelivery.outcome.kind === "sent" && statusDelivery.outcome.discordMessageIds?.[0]) {
@@ -1999,6 +1996,31 @@ async function scopePeerToAgentExchange(
 // ============================================================
 
 /**
+ * v2.4.22+ agent 频道消息底部的通用操作按钮行。挂在「💭 思考中」/「✅ 完成」/
+ * button-click 回执这些**永远在频道底部、正文里**的消息上，用户一眼就能点 ——
+ * 不用翻 pin（pin 弹窗里按钮 Discord 点不动）、不用打 /focus。
+ * withInterrupt=true 时带打断（工作中），完成态不带。
+ */
+function agentActionButtons(channelId: string, withInterrupt: boolean): any[] {
+  const buttons: any[] = [];
+  if (withInterrupt) {
+    buttons.push({ id: `interrupt:${channelId}`, label: t("打断", "Interrupt"), emoji: "⚡", style: "danger" });
+  }
+  buttons.push({ id: `focus:${channelId}`, label: t("跳转", "Focus"), emoji: "🖥", style: "secondary" });
+  buttons.push({ id: `screenshot:${channelId}`, label: t("截图", "Shot"), emoji: "📸", style: "secondary" });
+  return [{ type: "buttons", buttons }];
+}
+
+/** v2.4.22+ button 触发截图（复用 /screenshot slash 的逻辑）。返回 png 路径或 null。 */
+async function captureChannelScreenshot(channelId: string): Promise<string | null> {
+  const listResult = await runManager("list");
+  const agent = (listResult.agents || []).find((a: any) => a.channelId === channelId);
+  const windowName = agent ? agent.name : "master";
+  console.log(`📸 截图（button）: window=${windowName} channel=${channelId}`);
+  return tmuxScreenshot(windowName);
+}
+
+/**
  * v2.4.19+ 把 bridge 所在 Mac 的 iTerm2 切到某 channel 对应的 tab。
  * button（focus:）和 /focus slash 命令共用。
  *
@@ -2010,11 +2032,9 @@ async function focusITermTab(targetChannelId: string): Promise<{ ok: boolean; fo
   const controlId = process.env.CONTROL_CHANNEL_ID || "";
   let targetWindow: string;
   let label: string;
-  let tabNeedle: string;
   if (targetChannelId === controlId) {
     targetWindow = `${MASTER_SESSION}:0`;
     label = "master";
-    tabNeedle = " Claude Code (";
   } else {
     const listResult = await runManager("list");
     const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
@@ -2023,36 +2043,80 @@ async function focusITermTab(targetChannelId: string): Promise<{ ok: boolean; fo
     }
     targetWindow = `${MASTER_SESSION}:${agent.name}`;
     label = agent.name;
-    const short = String(agent.name).replace(/^agent-/, "");
-    tabNeedle = ` ${short} (`;
   }
+
+  // 先把 tmux 内部 active window 也切过去（保底 + 让 tmux 状态跟 iTerm 一致）
   await tmuxRaw(["select-window", "-t", targetWindow]).catch(() => {});
-  const esc = tabNeedle.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const script = [
-    'tell application "iTerm2"',
-    '  repeat with w in windows',
-    '    repeat with t in tabs of w',
-    '      repeat with s in sessions of t',
-    `        if name of s contains "${esc}" then`,
-    '          select w',
-    '          select t',
-    '          activate',
-    '          return "found"',
-    '        end if',
-    '      end repeat',
-    '    end repeat',
-    '  end repeat',
-    '  activate',
-    '  return "notfound"',
-    'end tell',
-  ].join("\n");
-  const osa = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
-  const found = (await new Response(osa.stdout).text()).trim() === "found";
-  await osa.exited;
-  console.log(`🖥 focus: ${targetWindow} → iTerm tab ${found ? "已选中" : "没找到（仅前置 iTerm）"}`);
-  const note = found
-    ? `🖥 已跳到 **${label}** 的 iTerm tab`
-    : `🖥 iTerm 已前置，但没找到 **${label}** 的 tab（iTerm 没 -CC attach？tmux 内部已切过去）`;
+
+  // 有没有 control-mode 客户端（= iTerm 正 -CC attach）。没有就没 tab 可切。
+  const clientsOut = await tmuxRaw(["list-clients", "-t", MASTER_SESSION]).catch(() => "");
+  const hasCC = /control/.test(clientsOut);
+
+  // v2.4.24: 用「位置序号」定位 tab，不再靠 iTerm 跟随 select-window（后台时 iTerm 会
+  // 忽略），也不靠 session 名字符串匹配（新建 agent 标题是默认 "Claude Code" 会撞名）。
+  // iTerm CC 模式下每个 tmux window 是一个原生 tab，且 tab 顺序跟 `list-windows` 严格
+  // 一致 —— 求出目标在 window 列表里的 1-based 序号，AppleScript 直接 `select tab N`。
+  const idxList = (await tmuxRaw(["list-windows", "-t", MASTER_SESSION, "-F", "#{window_index}"]).catch(() => "")).split("\n").filter(Boolean);
+  const targetIdx = (await tmuxRaw(["display-message", "-p", "-t", targetWindow, "#{window_index}"]).catch(() => "")).trim();
+  const ordinal = idxList.indexOf(targetIdx) + 1; // 1-based 位置
+  const tmuxCount = idxList.length;
+
+  let outcome = "noattach";
+  if (hasCC && ordinal >= 1) {
+    // 找到「承载 tmux tab 的那个 iTerm 窗口」（tab 数正好等于 tmux window 数；退而求其次取 tab 最多的窗口），
+    // 选中第 ordinal 个 tab，再选中该窗口并前置。
+    const script = [
+      'tell application "iTerm2"',
+      '  set targetW to missing value',
+      `  repeat with w in windows`,
+      `    if (count of tabs of w) is ${tmuxCount} then`,
+      '      set targetW to w',
+      '      exit repeat',
+      '    end if',
+      '  end repeat',
+      '  if targetW is missing value then',
+      '    set maxT to 0',
+      '    repeat with w in windows',
+      '      if (count of tabs of w) > maxT then',
+      '        set maxT to (count of tabs of w)',
+      '        set targetW to w',
+      '      end if',
+      '    end repeat',
+      '  end if',
+      '  if targetW is missing value then',
+      '    activate',
+      '    return "nowin"',
+      '  end if',
+      `  if (count of tabs of targetW) < ${ordinal} then`,
+      '    select targetW',
+      '    activate',
+      '    return "outofrange"',
+      '  end if',
+      `  select tab ${ordinal} of targetW`,
+      '  select targetW',
+      '  activate',
+      '  return "ok"',
+      'end tell',
+    ].join("\n");
+    const osa = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+    outcome = (await new Response(osa.stdout).text()).trim();
+    await osa.exited;
+  } else {
+    // 没 -CC attach 时也把 iTerm 提到前台（用户至少看到 iTerm）
+    const osa = Bun.spawn(["osascript", "-e", 'tell application "iTerm2" to activate'], { stdout: "pipe", stderr: "pipe" });
+    await osa.exited;
+  }
+
+  const found = outcome === "ok";
+  console.log(`🖥 focus: ${targetWindow} → tab #${ordinal}/${tmuxCount} outcome=${outcome} (hasCC=${hasCC})`);
+  let note: string;
+  if (found) {
+    note = `🖥 已跳到 **${label}** 的 iTerm tab`;
+  } else if (!hasCC) {
+    note = `🖥 iTerm 已前置，但当前没有 -CC attach，无法切 tab（tmux 内部已切到 **${label}**，重连 iTerm 即可）`;
+  } else {
+    note = `🖥 iTerm 已前置，但没定位到 **${label}** 的 tab（outcome=${outcome}；tmux 内部已切过去）`;
+  }
   return { ok: true, found, label, note };
 }
 
@@ -2377,6 +2441,22 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         return;
       }
 
+      // v2.4.22+ 截图按钮（复用 /screenshot 逻辑）。ephemeral 回执带图，不刷屏。
+      if (id.startsWith("screenshot:")) {
+        const targetChannelId = id.slice("screenshot:".length);
+        try {
+          const pngPath = await captureChannelScreenshot(targetChannelId);
+          if (pngPath) {
+            await interaction.followUp({ content: "📸 终端截图", files: [{ attachment: pngPath }], ephemeral: true }).catch(() => {});
+          } else {
+            await interaction.followUp({ content: "❌ 截图失败：PNG 生成失败", ephemeral: true }).catch(() => {});
+          }
+        } catch (e) {
+          await interaction.followUp({ content: `❌ 截图失败: ${(e as Error).message}`, ephemeral: true }).catch(() => {});
+        }
+        return;
+      }
+
       // 打断按钮
       if (id.startsWith("interrupt:")) {
         const targetChannelId = id.slice("interrupt:".length);
@@ -2652,19 +2732,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         const origContent = interaction.message?.content || "";
         await interaction.editReply({
           content: `${origContent}\n\n✅ 已点击：**${label}**`,
-          components: buildComponents([
-            {
-              type: "buttons",
-              buttons: [
-                {
-                  id: `interrupt:${channelId}`,
-                  label: t("打断", "Interrupt"),
-                  emoji: "⚡",
-                  style: "danger",
-                },
-              ],
-            },
-          ]),
+          components: buildComponents(agentActionButtons(channelId, true)),
         }).catch(() => {});
       } catch { /* non-critical */ }
 
@@ -4302,7 +4370,9 @@ async function handleHookRequest(req: Request): Promise<Response> {
         }
       }
 
-      // 把所有相关 channel 的"💭 思考中..."状态消息改成"✅ 完成"并去掉 interrupt 按钮
+      // 把所有相关 channel 的"💭 思考中..."状态消息改成"✅ 完成"。
+      // v2.4.22+ 去掉 interrupt（活干完了），但**保留 focus + screenshot 按钮** ——
+      // 这条消息永远在频道底部附近，用户随手能点跳 tab / 截图，不用翻 pin 或打命令。
       for (const cid of channelsToClear) {
         const statusMsgId = activeStatusMessages.get(cid);
         if (!statusMsgId) continue;
@@ -4310,7 +4380,7 @@ async function handleHookRequest(req: Request): Promise<Response> {
           const ch = await discord.channels.fetch(cid);
           if (ch && "messages" in ch) {
             const sm = await (ch as TextChannel).messages.fetch(statusMsgId);
-            await sm.edit({ content: t("✅ 完成", "✅ Done"), components: [] });
+            await sm.edit({ content: t("✅ 完成", "✅ Done"), components: buildComponents(agentActionButtons(cid, false)) });
           }
         } catch { /* non-critical */ }
         activeStatusMessages.delete(cid);
