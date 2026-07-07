@@ -51,6 +51,7 @@ import { tmuxScreenshot } from "./bridge/screenshot.js";
 import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup } from "./bridge/jsonl-watcher.js";
 import { startPermissionWatcher, permissionMessages, clearPermissionMessage } from "./bridge/permission-watcher.js";
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
+import { updateStatsDashboard, initStatsDashboard, handleStatsRequest } from "./bridge/stats-dashboard.js";
 import { recordMetric } from "./lib/metrics.js";
 import {
   tmuxCapture,
@@ -936,6 +937,10 @@ discord.once("ready", async () => {
   // 没法编辑。启动后扫所有 registered channel 的近期消息，把遗留的思考中消息
   // 编辑成"bridge 已重启"。
   cleanupStaleThinkingMessages().catch((e) => console.error("清理遗留思考中消息失败:", e));
+
+  // v2.4.25+ 用量看板：启动后确保只读频道 + 常驻消息存在，并刷一次。延迟几秒等
+  // channel-server 重连、master TUI 稳定，再抓 /status。
+  setTimeout(() => void initStatsDashboard(discord), 6000);
 
   // 扫 skill + 为已有 active agent 扫项目级
   await scanGlobalSkills();
@@ -4102,6 +4107,10 @@ async function handleHookRequest(req: Request): Promise<Response> {
     // 兼容旧版 hook 发的 "stop"
     if (event === "Stop" || event === "StopFailure" || event === "Notification" || event === "stop") {
       console.log(`🏁 Hook 收到 ${event}: channel=${channelId}`);
+      // v2.4.25+ 对话完成 → 刷用量看板（防抖合并，内部惰性缓存 /status）
+      if (event === "Stop" || event === "StopFailure" || event === "stop") {
+        updateStatsDashboard(discord);
+      }
       // typing + safety timer：本 channel + 共享 ws 的所有 channel 都停（参见
       // sameWsChannels 的注释）。
       stopTyping(channelId);
@@ -4423,6 +4432,11 @@ const server = Bun.serve({
     const url = new URL(req.url);
     if (url.pathname === "/hook" && req.method === "POST") {
       return handleHookRequest(req);
+    }
+
+    // v2.4.25+ 用量看板开放 JSON 接口（给 Web 端）
+    if (url.pathname === "/stats" && req.method === "GET") {
+      return handleStatsRequest();
     }
 
     // Skills 重新扫描（manager 在 create/resume/kill 后调）
