@@ -194,34 +194,54 @@ function bar(pct: number | null, w = 10): string {
   return "▰".repeat(f) + "▱".repeat(w - f) + ` ${String(pct).padStart(3)}%`;
 }
 
+// 预警阈值（%）。上下文占用：≥75 该 compact 了；账号 limit：≥80 快撞墙。
+const CTX_YELLOW = 50, CTX_RED = 75;
+const LIMIT_YELLOW = 50, LIMIT_RED = 80;
+
+function ctxDot(pct: number): string {
+  return pct >= CTX_RED ? "🔴" : pct >= CTX_YELLOW ? "🟡" : "🟢";
+}
+function limitDot(pct: number | null): string {
+  if (pct == null) return "⚪";
+  return pct >= LIMIT_RED ? "🔴" : pct >= LIMIT_YELLOW ? "🟡" : "🟢";
+}
+/** embed 左侧边框色跟最严重的账号 limit 走：绿/黄/红 */
+function limitColor(pct: number | null): number {
+  if (pct == null) return 0x5865f2;
+  return pct >= LIMIT_RED ? 0xed4245 : pct >= LIMIT_YELLOW ? 0xfee75c : 0x57f287;
+}
+
 /**
  * 用 Discord 原生 embed 字段渲染，而不是等宽代码块表格 ——
  * 代码块在窄手机屏（~33 字符）会硬折行、把列冲乱。原生字段全宽堆叠、按文字自然换行，
- * 还能用 emoji。每个 agent 一个非 inline 字段：粗体名字行带最关键的上下文占用，
- * value 行放模型 + 今日/本周。账号级 limit 两条进度条放在 description。
+ * 还能用 emoji。每个 agent 一个非 inline 字段：名字前用颜色点表示上下文占用预警
+ * （🟢正常 / 🟡偏高 / 🔴该 compact），value 行放模型 + 今日/本周。账号级 limit 两条
+ * 进度条放在 description，也各带颜色点，边框色跟最严重的 limit 走。
  */
 function renderEmbed(snap: StatsSnapshot): EmbedBuilder {
   const g = snap.global;
   const desc: string[] = ["**🌐 账号 limit（所有 agent 共享）**"];
+  let worstLimit: number | null = null;
   if (g && (g.sessionPct != null || g.weekPct != null)) {
-    desc.push(`⏱ 5h　${bar(g.sessionPct, 8)}${g.sessionResets ? "　⟳ " + fmtResets(g.sessionResets) : ""}`);
-    desc.push(`📆 周　${bar(g.weekPct, 8)}${g.weekResets ? "　⟳ " + fmtResets(g.weekResets) : ""}`);
+    worstLimit = Math.max(g.sessionPct ?? 0, g.weekPct ?? 0);
+    desc.push(`⏱ 5h　${limitDot(g.sessionPct)} ${bar(g.sessionPct, 8)}${g.sessionResets ? "　⟳ " + fmtResets(g.sessionResets) : ""}`);
+    desc.push(`📆 周　${limitDot(g.weekPct)} ${bar(g.weekPct, 8)}${g.weekResets ? "　⟳ " + fmtResets(g.weekResets) : ""}`);
   } else {
     desc.push("_（/status 抓取中 / master 忙，下次对话完成时刷新）_");
   }
+  desc.push("_🟢 正常 · 🟡 偏高 · 🔴 需注意（点=上下文占用 / 前缀=limit）_");
 
   const emb = new EmbedBuilder()
     .setTitle("📊 Claudestra 用量看板")
-    .setColor(0x5865f2)
+    .setColor(limitColor(worstLimit))
     .setDescription(desc.join("\n"))
     .setFooter({ text: "本地 JSONL + /status · 每次对话完成自动更新" })
     .setTimestamp(new Date(snap.updatedAt));
 
   for (const a of snap.agents.slice(0, 24)) {
     const name = a.name.replace(/^agent-/, "");
-    const dot = a.status === "active" ? "🟢" : "⚪";
     emb.addFields({
-      name: `${dot} ${name} · 📖 ${formatTokens(a.contextTokens)} ${a.contextPct}%`,
+      name: `${ctxDot(a.contextPct)} ${name} · 📖 ${formatTokens(a.contextTokens)} ${a.contextPct}%`,
       value: `${a.model.replace(/^claude-/, "")} · 今 ${formatTokens(a.today.tokens)} · 周 ${formatTokens(a.week.tokens)}`,
       inline: false,
     });
