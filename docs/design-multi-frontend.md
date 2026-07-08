@@ -1,0 +1,307 @@
+# 设计文档：多前端架构（Discord 解耦 → Web / Telegram / API）
+
+> 状态：**细化稿，待 owner 批准**（2026-07-09，取代同日早前的 discord-decoupling 草案）
+> 目标：Discord 从「系统的脸」降级为「第一个 adapter」。核心与任何聊天平台解耦，
+> 使 Web 前端、Telegram bot、纯 HTTP 集成都是**同一套接口的消费者**，接入新前端
+> 不需要动核心。
+
+## 0. TL;DR
+
+- 核心洞察：v2.0.0 的 `Envelope{from,to,intent}` + `deliver()` 已经是平台无关的路由内核，缺的只是三样东西：
+  1. **中性消息格式**（NeutralMessage）与 **ChatAdapter 接口** —— 出入口的平台抽象；
+  2. **带前缀的统一 chat_id keyspace**（`discord:<id>` / `telegram:<id>` / `api:<token>`）—— 让所有 pending/thread/registry 逻辑对新前端零改动；
+  3. **结构化事件流**（event-bus + SSE）—— 只读前端（网页看板、监控）的数据源。
+- agent 侧 **完全无感**：MCP 工具（reply / send_to_agent）的 chat_id 本来就是不透明字符串，前缀化后原样回传即可。
+- 分四个阶段，每阶段独立可发布：A 事件流 → B 入站 API + token → C1 出站按 transport 分发 → C2 Discord 全面收编成 adapter（纯重构，可缓）。Telegram 在 C1 之后即可接入；Web 只需要 A+B。
+
+## 1. 背景与动机
+
+owner 的三个诉求（2026-07-08/09）：
+
+1. **把某个 agent 开放给外部的人** —— Discord 权限模型做这件事很别扭；
+2. **网页版 prototype** —— 本设计的接口就是网页版的全部后端；
+3. **多前端演进** —— 未来能「轻松接入类似 Telegram 这样的软件」。
+
+原则不变：**Keep it simple**。所有抽象都切在「加第二个实现时才付费」的位置，不做用不上的泛化。
+
+## 2. 分层架构总览
+
+```
+                        ┌──────────────────────────────────────┐
+   前端（每个一个 adapter）│              核心（平台无关）           │
+                        │                                      │
+ Discord ──────────────►│  Envelope / deliver() 路由内核        │
+ Telegram（future）─────►│  registry / pending / thread 追踪     │◄──── channel-server (ws)
+ Web / HTTP API ───────►│  agent 生命周期 (manager)             │◄──── jsonl-watcher
+                        │  event-bus（结构化事件）              │◄──── hooks (Stop/Notification)
+                        │  身份与授权（transport-scoped）       │
+                        └──────────────────────────────────────┘
+        入站：adapter 收平台消息 → InboundMessage → Envelope → deliver()
+        出站：deliver() → NeutralMessage → adapterFor(dest).send()
+        只读：event-bus → SSE（/events）→ 任何订阅者
+```
+
+三条数据通道，前端各取所需：
+
+| 通道 | 协议 | 谁用 |
+|------|------|------|
+| 会话（收发消息） | adapter（Discord ws / Telegram long-poll / HTTP POST） | 有人机对话的前端 |
+| 事件流（只读实时） | SSE `GET /events` | 网页看板、监控、任何想看 tool 流的 |
+| 快照（只读拉取） | `GET /stats`（已存在）、`GET /api/v1/agents` | 看板初始化、健康检查 |
+
+## 3. 核心抽象（本设计的合同，冻结部分）
+
+### 3.1 统一 chat_id keyspace（决策 D7，D2 的推广）
+
+所有「会话地址」是一个带 transport 前缀的字符串：
+
+```
+discord:<channelId>       Discord 频道
+telegram:<chatId>         Telegram 会话（future）
+api:<tokenId>             HTTP API 用户（Phase B）
+web:<sessionId>           网页端会话（future，若 web 走 ws 而非纯 API）
+<裸 snowflake>            兼容形态 = discord:<id>，永久支持
+```
+
+- registry / clients / pendingReplies / thread 的 key 全部沿用这个 keyspace——它们只把 key 当不透明字符串，**零改动**。
+- agent 的 MCP `reply(chat_id)` 原样回传，**agent 与 channel-server 零改动**。
+- 解析集中在一处：`parseChatId(s) → { transport, id }`（router.ts），核心里禁止再出现对裸 id 的 Discord 假设。
+
+### 3.2 NeutralMessage（中性消息格式，additive-only）
+
+现有 reply 工具的入参已经基本是中性的，正式定义并冻结：
+
+```ts
+interface NeutralMessage {
+  text: string;
+  /** 中性 UI 组件。现有 {type:"buttons"|"select"} JSON 原样采用 */
+  components?: NeutralComponent[];
+  /** 本地文件绝对路径（出站附件） */
+  files?: string[];
+  /** 同 keyspace 的消息引用（回复哪条） */
+  replyTo?: string;
+}
+// NeutralComponent = 现有 buttons/select 的 raw JSON schema，唯一标准形态。
+// 交互回传语义（冻结）：用户点按钮 → 入站一条 text 为 "[button:<id>]" 的消息；
+// 选菜单 → "[select:<id>:<value>]"。所有 transport 一致，agent 无感。
+```
+
+兼容承诺：NeutralMessage / NeutralComponent / BridgeEvent 三个 schema **只加字段不删不改语义**（additive-only）。
+
+### 3.3 ChatAdapter 接口（Phase C1 引入，Discord 先做隐式实现）
+
+```ts
+interface ChatAdapter {
+  transport: string;                 // "discord" | "telegram" | ...
+  caps: {
+    maxTextLen: number;              // Discord 2000 / Telegram 4096
+    buttons: boolean;                // 不支持 → 降级为文本编号列表
+    edit: boolean;                   // 支持编辑已发消息（tool 流的合并编辑用）
+    files: boolean;
+    typing: boolean;
+  };
+  /** 出站。分块、组件渲染、平台限速都是 adapter 内部职责 */
+  send(destId: string, msg: NeutralMessage): Promise<{ messageIds: string[] }>;
+  edit?(destId: string, messageId: string, msg: NeutralMessage): Promise<void>;
+  typing?(destId: string, on: boolean): void;
+  /** 入站。adapter 收到平台消息后回调核心；核心负责建 Envelope + deliver */
+  onInbound(cb: (m: InboundMessage) => void): void;
+}
+
+interface InboundMessage {
+  chatId: string;                    // 带前缀，如 "telegram:12345"
+  userId: string;                    // transport 内的用户 id
+  username?: string;
+  text: string;
+  attachments?: string[];            // 已下载到本地 inbox 的绝对路径
+  messageId: string;
+  replyToMessageId?: string;
+}
+```
+
+降级规则（写死在各 adapter，不做运行时协商）：
+- 无 buttons 能力 → 组件渲染为 `1) label  2) label` 文本，用户回数字，adapter 回传 `[button:<对应id>]`；
+- 超长 → 按 caps.maxTextLen 分块（沿用 discordReply 的按行切分算法，抽到 lib）；
+- 无 edit → tool 流每次发新消息（或该 transport 干脆不订阅 tool 流，见 §6）。
+
+### 3.4 身份与授权（transport-scoped identity）
+
+```
+principal =  discord:<userId>   ← 现 ALLOWED_USER_IDS，迁移为此形态
+          |  telegram:<userId>  ← future
+          |  token:<tokenId>    ← Phase B
+```
+
+授权表统一为 per-principal 的 agent 白名单（`"*"` = 全部，master 需显式列名）：
+
+```json
+// ~/.claude-orchestrator/principals.json  (Phase B 落地，0600)
+{
+  "principals": [
+    { "id": "discord:535144625355096076", "role": "owner", "agents": ["*", "master"] },
+    { "id": "token:tok_a1b2c3", "name": "外包-张三", "agents": ["worker-alpha"],
+      "secret": "<hex>", "disabled": false, "createdAt": "..." }
+  ]
+}
+```
+
+- owner 的 Discord id 从 .env 迁入（.env 保留读取作为 fallback，不 break 现有安装）。
+- **管理能力按 role 走**：`role: "owner"` 才能 create/kill/cron；token 默认只有会话权。管理面 API 化是 future（D6 不变），但授权模型现在就分出 role 字段，避免以后重构。
+- 每 principal 限流 30 req/min（HTTP 入口）。
+
+## 4. Phase A — 事件流（多前端的只读地基）
+
+### 4.1 event-bus（`src/bridge/event-bus.ts`）
+
+进程内总线 + 每 agent 500 条环形缓冲，seq 单调递增，无持久化（权威历史 = jsonl，已有纯库可查）。
+
+```ts
+interface BridgeEvent {
+  seq: number; ts: string;
+  agent: string;                     // registry 名，master = "master"
+  chatId: string;                    // 该 agent 的主会话地址（带前缀）
+  type: "tool_start" | "tool_done" | "assistant_text" | "turn_duration"
+      | "agent_status" | "auto_deny" | "question" | "chat_message";
+  data: Record<string, unknown>;
+}
+```
+
+负载明细（additive-only）：
+- `tool_start` `{toolId, name, summary}` / `tool_done` `{toolId, error}`
+- `assistant_text` `{text, rateLimited?}`
+- `turn_duration` `{durationMs}`
+- `agent_status` `{status: "thinking"|"done"}`
+- `auto_deny` `{reason}` / `question` `{questions}`（AskUserQuestion 原始结构）
+- `chat_message` `{direction:"in"|"out", from, text, threadId}` —— 正式会话消息的镜像
+
+### 4.2 埋点：旁路镜像，不拆 watcher（决策 D1，理由见 git 史）
+
+在 `processNewData` / `drainChannelWatcher` / Stop-hook / deliver 成功处**各加一行 emit**，
+Discord 渲染管线一字不动。事件流是镜像不是管线上游——零回归，且新前端（Telegram/Web）
+的「tool 流」直接订阅 bus 自行渲染，不复用 Discord 的 debounce/edit 逻辑（那是 Discord
+限速的产物，Telegram 有自己的限速节奏）。
+
+### 4.3 SSE 端点
+
+```
+GET /events?agent=<name>&since=<seq>     # Last-Event-ID 亦可
+```
+
+标准 SSE：`id:` = seq，`data:` = BridgeEvent JSON，30s 心跳注释。本机免鉴权；
+Phase B 后同逻辑挂 `/api/v1/events`，token 鉴权 + 按 principal 的 agent 白名单过滤。
+
+### 4.4 绑定收紧
+
+`Bun.serve` 现在默认绑 0.0.0.0（/hook /stats 已暴露内网）。改 `hostname: "127.0.0.1"`，
+新增 env `BRIDGE_BIND` 放开。对公网暴露 = 用户自己上反代（Caddy / Tailscale Funnel），
+TLS 与网络边界不是 bridge 职责。release notes 提醒自定义 BRIDGE_URL 跨机器的用户。
+
+## 5. Phase B — 入站 HTTP API（Web prototype 的后端）
+
+### 5.1 端点（挂 `/api/v1/`，路径版本化一次到位）
+
+```
+POST /api/v1/agents/:name/messages    { text, wait?: seconds≤300 }
+GET  /api/v1/agents                   agent 列表 + 状态（scope 过滤）
+GET  /api/v1/events?agent=&since=     token 版 SSE
+GET  /api/v1/threads/:threadId        wait 超时后的轮询兜底（读 ring buffer）
+GET  /api/v1/files/:opaqueId          出站附件下载（bridge 登记过的路径才发）
+```
+
+鉴权 `Authorization: Bearer <secret>`；CLI `manager.ts token-add <name> --agents a,b` /
+`token-list` / `token-revoke`，secret 只在 add 时显示一次。
+
+### 5.2 入站流程
+
+鉴权 → scope 检查（403）→ 查 clients（agent 离线 409）→
+`Envelope{ from: {kind:"api", tokenId, name}, to: local, intent:"request" }` → `deliver()`。
+`resolveReplyBackChannel` 返回 `api:<tokenId>` → agent 的 chat_id 就是它，reply 原样回传。
+`renderContentForLocal` 加 from.kind==="api" 分支，header 形如 `[🌐 来自 API 用户 张三]`，
+让 agent 知道对话方不是 Discord 用户（没有 @mention / push 语义）。
+
+### 5.3 回复路径
+
+`deliver()` 加 `case "api"` → `deliverToApi`：
+1. resolve 同步 waiter（`threadId → resolver` map）→ `POST` 的 `wait` 模式直接拿到 `{reply, components, files}`；
+2. emit `chat_message(out)` 事件（SSE 订阅者收到）；
+3. 写 ring buffer（threads 轮询兜底）。**不碰 Discord。**
+
+按钮：components 原样进响应 JSON；网页渲染成真按钮，点击 = `POST` 一条 `[button:<id>]`。
+与 Discord 的回传格式一致（§3.2 冻结语义），agent 无感。
+
+### 5.4 网页版 prototype 用法（验证接口够用）
+
+```
+初始化   GET /api/v1/agents            → 侧边栏 agent 列表
+选中     GET /api/v1/events?agent=x    → SSE 挂上，实时渲染 tool 流 + 💬
+发消息   POST /api/v1/agents/x/messages {text, wait:120} → 渲染 reply + 按钮
+点按钮   POST {text: "[button:approve_xxx]"}
+历史     不做 —— prototype 只做实时；历史回放是 future（D5，权威数据在 jsonl）
+```
+
+网页本身 = 一个静态页（可以就放 bridge 的 `GET /` 返回，也可以独立部署），**没有独立后端**。
+
+## 6. Phase C — 出站抽象与 Discord 收编
+
+### C1（小步，先行）：deliverToUser 按 transport 分发
+
+```ts
+async function deliverToUser(env, to) {
+  const { transport } = parseChatId(to.channelId);
+  const adapter = adapters.get(transport);      // 现阶段只有 discord
+  return adapter.send(...)
+}
+```
+
+一个 `adapters` 注册表 + Discord 的 send/edit/typing 包成第一个 `ChatAdapter`
+（内部还是现在的 discordReply，只是挪个壳）。**C1 之后接入 Telegram 就是纯增量**：
+实现 ChatAdapter + 在 principals.json 加身份 + 配置 agent 绑定，核心零改动。
+
+### C2（可缓，渐进）：全面收编
+
+把 messageCreate 入站、typing、status 消息、slash、管理按钮等 Discord 专属逻辑逐步
+挪进 discord-adapter 模块。**纯重构、无用户价值，按「顺手改到就挪」的节奏做，
+不专门立项**——避免大爆炸重构（v2.0.0 迁移的教训：一个场景一个场景挪）。
+
+### Telegram adapter 蓝图（future，不在本次范围，写此证明接口够用）
+
+- 库：grammY（Bun 兼容），long-polling（无需公网回调）；
+- `caps: { maxTextLen: 4096, buttons: true(inline keyboard), edit: true, files: true, typing: true }`；
+- inline keyboard 的 callback_data = 我们的 button id，点击回传 `[button:<id>]`；
+- agent 绑定：registry 的 agent 条目加可选 `bindings: ["telegram:<chatId>"]`，
+  inbound 命中绑定 → 正常 deliver；agent 的 tool 流由 tg-adapter 订阅 event-bus 自行渲染
+  （节流粒度自定，不复用 Discord watcher）；
+- 身份：`telegram:<userId>` 进 principals.json，role/agents 白名单同一套。
+
+## 7. 决策记录
+
+- **D1 旁路镜像不拆 watcher**：零回归；且多前端各自订阅 bus 渲染，Discord 渲染管线本就不该被复用。
+- **D2→D7 带前缀 chat_id 统一 keyspace**：pending/thread/registry/agent 全部零改动；裸 id = discord 永久兼容。
+- **D3 不改 registry 主键**：agent 仍以 Discord 频道为主会话（Discord 是 primary transport）。「无 Discord 频道的 agent」等真需求出现再引入内部 id。
+- **D4 peer 协作不动**：`#agent-exchange` 的信任模型就是 Discord 频道成员资格，是特性不是耦合。
+- **D5 无持久化事件存储**：实时走 bus，历史读 jsonl（纯库已有）。网页版历史回放是 future。
+- **D6 管理面不进 API（v1）**：但 principals 授权模型现在就带 role 字段，为 future 管理 API 留位。
+- **D7 路径版本化 `/api/v1/`** + **三个 schema additive-only**（NeutralMessage / NeutralComponent / BridgeEvent）：这是对前端作者的兼容承诺。
+- **D8 C2 收编不立项**：跟随日常改动渐进迁移，避免大爆炸。
+
+## 8. 测试与验收
+
+- 单测：event-bus（emit/subscribe/replay/环形淘汰）、parseChatId、principals（scope/role/限流纯逻辑）、NeutralMessage 降级渲染（buttons→文本编号）。
+- router.test.ts 扩展：ApiUserEndpoint、`resolveReplyTarget("api:...")`、前缀兼容（裸 id = discord）。
+- live（sandbox 惯例）：
+  - `curl -N /events` + agent 跑一轮工具：事件齐全、seq 连续、断线补发正确；
+  - token 全链路：POST→reply（wait 与 SSE 两路）；越权 403；revoke 后 401；
+  - Discord 回归：tool 流、💬、drain、按钮、peer 路由、管理面全部行为不变。
+
+## 9. 工作量与发布
+
+| 阶段 | 内容 | 预估 | 风险 |
+|------|------|------|------|
+| A | event-bus + 埋点 + SSE + 绑定收紧 | ~400 行 | 低（纯旁路） |
+| B | principals/token + /api/v1 五个端点 + deliverToApi + CLI | ~700 行 | 中（reply 回路加分支） |
+| C1 | parseChatId + adapters 注册表 + Discord send 包壳 | ~150 行 | 低 |
+| C2 | Discord 全面收编 | 渐进，不计 | — |
+
+- 发布：A 可单独发；A+B+C1 合并为一个 **minor**（headline：「Claudestra 现在有开放的
+  HTTP API 与实时事件流——网页端、Telegram、任何前端都能接入」）。遵守攒批规则。
+- Telegram adapter 与网页端本体：**不在本次范围**，等接口落地后按需求另开。
