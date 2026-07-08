@@ -273,12 +273,19 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
         // v2.2.0+: auto-mode classifier 拦截检测。被拦的操作在 jsonl 里是一条
         // type:"user" 的 tool_result（is_error），内容稳定含 "denied by the Claude
         // Code auto mode classifier. Reason: …"。检测到 → 频道弹「临时放行」按钮。
+        //
+        // v2.5.5+: 必须查 is_error === true。之前只做字符串正则 → agent 一 Read/
+        // grep 到**含这行字面量的源码**（比如本文件自己），tool_result 里带着这
+        // 句话就误报"被 auto 拦了"，明明 agent 全程 bypass 也弹放行按钮（owner
+        // 2026-07-09 实测：claudestra agent 读 jsonl-watcher.ts 触发）。真 deny
+        // 的 tool_result 一定 is_error，成功的 Read/Bash 结果不会。
         if (entry.type === "user") {
           const uc = entry.message?.content;
           if (Array.isArray(uc)) {
             for (const b of uc) {
               if (
                 b?.type === "tool_result" &&
+                b.is_error === true &&
                 typeof b.content === "string" &&
                 /denied by the Claude Code auto mode classifier/i.test(b.content)
               ) {
