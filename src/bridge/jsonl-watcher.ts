@@ -13,6 +13,8 @@ import type { Client } from "discord.js";
 import { TextChannel } from "discord.js";
 import { WATCHER_CONFIG, MCP_TOOL_PREFIX } from "./config.js";
 import { discordReply } from "./discord-api.js";
+// v2.6.0+ 旁路事件埋点（设计 D1：只 emit 不改渲染管线）
+import { emitEvent } from "./event-bus.js";
 
 interface ToolEntry {
   id: string;
@@ -292,6 +294,7 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
                 const rm = b.content.match(/Reason:\s*([\s\S]+?)(?:\.\s+If you|\.\.|$)/i);
                 const reason = rm ? rm[1].trim().replace(/\s+/g, " ").slice(0, 220) : "";
                 maybePostAutoDeny(discord, state, reason).catch(() => {});
+                emitEvent({ agent: state.agentName, chatId: state.channelId, type: "auto_deny", data: { reason } });
               }
             }
           }
@@ -306,6 +309,7 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
           } else {
             const secs = (entry.durationMs / 1000).toFixed(0);
             state.textQueue.push(`⏱ 尼了 ${secs} 秒`);
+            emitEvent({ agent: state.agentName, chatId: state.channelId, type: "turn_duration", data: { durationMs: entry.durationMs } });
           }
         }
 
@@ -326,6 +330,7 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
               postAskUserQuestionMessage(discord, state.channelId, tmuxTarget, questions)
                 .catch((e) => console.error("AUQ post 失败:", e));
               console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) → posted Discord components for ${state.agentName}`);
+              emitEvent({ agent: state.agentName, chatId: state.channelId, type: "question", data: { questions } });
               continue; // 跳过本 entry 的 tool/text 处理
             }
           } catch (e) { /* non-critical */ }
@@ -341,13 +346,15 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
 
           for (const block of content) {
             if (block.type === "tool_use" && block.name && !isHiddenTool(block.name) && WATCHER_CONFIG.showToolUse) {
+              const summary = formatTool(block.name, block.input);
               state.tools.push({
                 id: block.id,
-                summary: formatTool(block.name, block.input),
+                summary,
                 done: false,
                 error: false,
               });
               toolsChanged = true;
+              emitEvent({ agent: state.agentName, chatId: state.channelId, type: "tool_start", data: { toolId: block.id, name: block.name, summary } });
             }
             if (block.type === "text" && block.text?.trim() && WATCHER_CONFIG.showClaudeText && !hasReply) {
               // 以前有 `t.length > 3` 的 filter 防碎片短 text 刷屏，但那会把 "OK"
@@ -361,8 +368,10 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
               if (/You['']?ve hit your limit|Hit your (rate )?limit/i.test(t)) {
                 state.textQueue.push(`⛔ ${t}`);
                 state.rateLimited = true;
+                emitEvent({ agent: state.agentName, chatId: state.channelId, type: "assistant_text", data: { text: t, rateLimited: true } });
               } else {
                 state.textQueue.push(`💬 ${t}`);
+                emitEvent({ agent: state.agentName, chatId: state.channelId, type: "assistant_text", data: { text: t } });
               }
             }
           }
@@ -378,6 +387,7 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
                 tool.done = true;
                 tool.error = !!block.is_error;
                 toolsChanged = true;
+                emitEvent({ agent: state.agentName, chatId: state.channelId, type: "tool_done", data: { toolId: block.tool_use_id, error: tool.error } });
               }
             }
           }
@@ -534,6 +544,17 @@ export function stopWatching(agentName: string) {
     if (state.pollInterval) clearInterval(state.pollInterval);
     watchers.delete(agentName);
   }
+}
+
+/** v2.6.0+ channelId → agent 名反查（event-bus 埋点用，避免热路径查 registry） */
+export function agentNameForChannel(channelId: string): string | null {
+  for (const [agentName, p] of pendingStartTimers.entries()) {
+    if (p.channelId === channelId) return agentName;
+  }
+  for (const [agentName, state] of watchers.entries()) {
+    if (state.channelId === channelId) return agentName;
+  }
+  return null;
 }
 
 /** 根据 channelId 查找并停止 watcher（websocket 断开时兜底用） */

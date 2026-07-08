@@ -264,6 +264,45 @@ export function formatAddress(a: ParsedAddress): AddressString {
 }
 
 // ============================================================
+// v2.6.0+ 统一 chat_id keyspace（设计 D7，多前端架构的地址合同）
+// ============================================================
+
+/**
+ * 所有「会话地址」是一个带 transport 前缀的字符串：
+ *   discord:<channelId>   Discord 频道
+ *   api:<tokenId>         HTTP API 用户
+ *   telegram:<chatId>     Telegram（future）
+ *   <裸 id>               兼容形态 = discord:<id>，永久支持
+ *
+ * registry / clients / pendingReplies / thread 把 key 当不透明字符串使用，
+ * agent 的 reply(chat_id) 原样回传 —— 解析只发生在 bridge 的出入口，且
+ * 必须经过这里，核心里禁止再出现对裸 id 的 Discord 假设。
+ */
+export interface ParsedChatId {
+  transport: string;
+  id: string;
+}
+
+const KNOWN_TRANSPORTS = new Set(["discord", "api", "telegram", "web"]);
+
+export function parseChatId(s: string): ParsedChatId {
+  const idx = s.indexOf(":");
+  if (idx > 0) {
+    const prefix = s.slice(0, idx);
+    if (KNOWN_TRANSPORTS.has(prefix)) {
+      return { transport: prefix, id: s.slice(idx + 1) };
+    }
+  }
+  // 裸 id（Discord snowflake 或历史数据）= discord，永久兼容
+  return { transport: "discord", id: s };
+}
+
+/** 格式化回统一 keyspace 字符串。discord 保持裸 id（历史兼容 + registry 主键不变） */
+export function formatChatId(p: ParsedChatId): string {
+  return p.transport === "discord" ? p.id : `${p.transport}:${p.id}`;
+}
+
+// ============================================================
 // Thread id 生成 + 线程追踪 helper
 // ============================================================
 

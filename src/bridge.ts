@@ -48,7 +48,9 @@ import {
   handleMgmtSelect,
 } from "./bridge/management.js";
 import { tmuxScreenshot } from "./bridge/screenshot.js";
-import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup } from "./bridge/jsonl-watcher.js";
+import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel } from "./bridge/jsonl-watcher.js";
+// v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
+import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from "./bridge/event-bus.js";
 import { startPermissionWatcher, permissionMessages, clearPermissionMessage } from "./bridge/permission-watcher.js";
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
 import { updateStatsDashboard, initStatsDashboard, handleStatsRequest, forceRefreshStatsDashboard } from "./bridge/stats-dashboard.js";
@@ -379,6 +381,12 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
   }
   try {
     to.ws.send(JSON.stringify({ type: "message", content, meta }));
+    // v2.6.0+ 事件埋点：入站消息镜像 + agent 进入思考态（旁路，不影响主流程）
+    {
+      const evAgent = to.agentName || agentNameForChannel(to.channelId) || (to.channelId === CONTROL_CHANNEL_ID ? "master" : "?");
+      emitEvent({ agent: evAgent, chatId: to.channelId, type: "chat_message", data: { direction: "in", from: meta.user || "?", text: env.content, threadId: env.meta.threadId } });
+      emitEvent({ agent: evAgent, chatId: to.channelId, type: "agent_status", data: { status: "thinking" } });
+    }
     // intent=request 挂 pending + thread 追踪。response 端到端，不挂新 pending。
     if (env.intent === "request") {
       pendingReplies.set(replyBackChannel, {
@@ -3058,6 +3066,12 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         const ids = delivery.outcome.discordMessageIds || [];
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { messageIds: ids } }));
 
+        // v2.6.0+ 事件埋点：agent 的正式回复镜像（out）
+        {
+          const evAgent = agentNameForChannel(fromChannelId) || (fromChannelId === CONTROL_CHANNEL_ID ? "master" : "?");
+          emitEvent({ agent: evAgent, chatId: msg.chatId, type: "chat_message", data: { direction: "out", from: evAgent, text, threadId: env.meta.threadId } });
+        }
+
         // v1.9.21+ send_to_agent 推回机制：
         // 如果 reply 的 chat_id 正好是某个 pending send_to_agent 的 target agent 的
         // channel，说明 agent 在它自己的 channel 里发了答案（discord 看得到，供审计）；
@@ -4181,6 +4195,9 @@ async function handleHookRequest(req: Request): Promise<Response> {
       // v2.4.25+ 对话完成 → 刷用量看板（防抖合并，内部惰性缓存 /status）
       if (event === "Stop" || event === "StopFailure" || event === "stop") {
         updateStatsDashboard(discord);
+        // v2.6.0+ 事件埋点：turn 结束（在去抖/通知判断之前 —— 事件流忠实反映 hook）
+        const evAgent = agentNameForChannel(channelId) || (channelId === CONTROL_CHANNEL_ID ? "master" : "?");
+        emitEvent({ agent: evAgent, chatId: channelId, type: "agent_status", data: { status: "done" } });
       }
       // typing + safety timer：本 channel + 共享 ws 的所有 channel 都停（参见
       // sameWsChannels 的注释）。
@@ -4494,8 +4511,59 @@ async function handleHookRequest(req: Request): Promise<Response> {
   }
 }
 
+/**
+ * v2.6.0+ GET /events —— 结构化事件流（SSE）。设计 §4.3。
+ * ?agent=<name> 过滤单 agent；?since=<seq> 或 Last-Event-ID 断线补发。
+ * 30s 心跳注释防代理超时。本机部署默认免鉴权（服务只绑 127.0.0.1，见下）。
+ */
+function handleEventsRequest(req: Request, extraFilter?: EventFilter): Response {
+  const url = new URL(req.url);
+  const agent = url.searchParams.get("agent") || undefined;
+  const sinceParam = url.searchParams.get("since") ?? req.headers.get("Last-Event-ID");
+  const since = sinceParam !== null ? Number(sinceParam) : NaN;
+  const filter: EventFilter = { ...(extraFilter || {}), ...(agent ? { agent } : {}) };
+  let unsub: (() => void) | null = null;
+  let ping: ReturnType<typeof setInterval> | null = null;
+  const cleanup = () => {
+    unsub?.();
+    unsub = null;
+    if (ping) { clearInterval(ping); ping = null; }
+  };
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      const send = (evt: { seq: number }) => {
+        try {
+          controller.enqueue(enc.encode(`id: ${evt.seq}\ndata: ${JSON.stringify(evt)}\n\n`));
+        } catch {
+          cleanup(); // controller 已关（客户端断开），停止推送
+        }
+      };
+      if (Number.isFinite(since)) {
+        for (const evt of replayEventsSince(since, filter)) send(evt);
+      }
+      unsub = subscribeEvents(filter, send);
+      ping = setInterval(() => {
+        try { controller.enqueue(enc.encode(`: ping\n\n`)); } catch { cleanup(); }
+      }, 30_000);
+    },
+    cancel() { cleanup(); },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
+
 const server = Bun.serve({
   port: BRIDGE_PORT,
+  // v2.6.0+ 默认只绑回环 —— /hook /stats /skills/rescan 一直无鉴权，之前默认
+  // 0.0.0.0 等于把它们暴露在内网。跨机器场景（自定义 BRIDGE_URL 指向远程）用
+  // BRIDGE_BIND=0.0.0.0 显式放开，网络边界（反代/TLS/防火墙）由用户自己负责。
+  hostname: process.env.BRIDGE_BIND || "127.0.0.1",
   async fetch(req, server) {
     if (server.upgrade(req)) return undefined;
 
@@ -4508,6 +4576,11 @@ const server = Bun.serve({
     // v2.4.25+ 用量看板开放 JSON 接口（给 Web 端）
     if (url.pathname === "/stats" && req.method === "GET") {
       return handleStatsRequest();
+    }
+
+    // v2.6.0+ 结构化事件流（SSE，本机免鉴权版；token 版挂 /api/v1/events）
+    if (url.pathname === "/events" && req.method === "GET") {
+      return handleEventsRequest(req);
     }
 
     // Skills 重新扫描（manager 在 create/resume/kill 后调）

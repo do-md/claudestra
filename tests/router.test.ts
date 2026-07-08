@@ -11,6 +11,8 @@ import { describe, test, expect } from "bun:test";
 import {
   parseAddress,
   formatAddress,
+  parseChatId,
+  formatChatId,
   newThreadId,
   endpointLabel,
   envelopeLabel,
@@ -293,5 +295,39 @@ describe("makeResponseEnvelope", () => {
       { messageId: "my_msg_id" },
     );
     expect(resp.meta.messageId).toBe("my_msg_id");
+  });
+});
+
+// ============================================================
+// v2.6.0+ parseChatId / formatChatId（统一 chat_id keyspace，设计 D7）
+// ============================================================
+
+describe("parseChatId", () => {
+  test("裸 snowflake = discord（永久兼容）", () => {
+    expect(parseChatId("1495997330061791353")).toEqual({ transport: "discord", id: "1495997330061791353" });
+  });
+
+  test("显式 discord: 前缀", () => {
+    expect(parseChatId("discord:123")).toEqual({ transport: "discord", id: "123" });
+  });
+
+  test("api:<tokenId>", () => {
+    expect(parseChatId("api:tok_a1b2c3")).toEqual({ transport: "api", id: "tok_a1b2c3" });
+  });
+
+  test("telegram / web 前缀", () => {
+    expect(parseChatId("telegram:987")).toEqual({ transport: "telegram", id: "987" });
+    expect(parseChatId("web:sess_1")).toEqual({ transport: "web", id: "sess_1" });
+  });
+
+  test("未知前缀视为裸 discord id（防误伤含冒号的历史数据）", () => {
+    expect(parseChatId("thr_123:x")).toEqual({ transport: "discord", id: "thr_123:x" });
+  });
+
+  test("formatChatId 往返：discord 保持裸 id，其余带前缀", () => {
+    expect(formatChatId({ transport: "discord", id: "123" })).toBe("123");
+    expect(formatChatId({ transport: "api", id: "tok_1" })).toBe("api:tok_1");
+    expect(formatChatId(parseChatId("api:tok_1"))).toBe("api:tok_1");
+    expect(formatChatId(parseChatId("456"))).toBe("456");
   });
 });
