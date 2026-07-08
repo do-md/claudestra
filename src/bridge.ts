@@ -51,7 +51,7 @@ import { tmuxScreenshot } from "./bridge/screenshot.js";
 import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup } from "./bridge/jsonl-watcher.js";
 import { startPermissionWatcher, permissionMessages, clearPermissionMessage } from "./bridge/permission-watcher.js";
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
-import { updateStatsDashboard, initStatsDashboard, handleStatsRequest } from "./bridge/stats-dashboard.js";
+import { updateStatsDashboard, initStatsDashboard, handleStatsRequest, forceRefreshStatsDashboard } from "./bridge/stats-dashboard.js";
 import { recordMetric } from "./lib/metrics.js";
 import {
   tmuxCapture,
@@ -2285,6 +2285,12 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       await interaction.deferUpdate().catch(async () => {
         await interaction.deferReply({ ephemeral: true }).catch(() => {});
       });
+
+      // 用量看板「🔄 刷新」按钮 — 强制立即刷新（deferUpdate 已 ack，doUpdate 会编辑消息）
+      if (id === "stats_refresh") {
+        forceRefreshStatsDashboard(discord).catch((e) => console.error("📊 手动刷新失败:", e));
+        return;
+      }
 
       // TUI modal 选项按钮 — 把键转发给 tmux，再截图 + 可能再出菜单
       if (id.startsWith("modal:")) {

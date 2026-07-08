@@ -10,7 +10,15 @@
  * 同一份快照另开 `GET /stats` JSON 接口，给以后的 Web 端。
  */
 
-import { EmbedBuilder, PermissionFlagsBits, type Client, type TextChannel } from "discord.js";
+import {
+  EmbedBuilder,
+  PermissionFlagsBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  type Client,
+  type TextChannel,
+} from "discord.js";
 import { existsSync } from "fs";
 import { tmuxRaw, MASTER_SESSION } from "../lib/tmux-helper.js";
 import { readConfig, setStatsDashboard } from "../lib/config-store.js";
@@ -305,19 +313,27 @@ async function ensureChannel(discord: Client): Promise<string | null> {
   }
 }
 
+/** 看板消息底部的「🔄 刷新」按钮（点了强制立即刷新，绕过账号 gauge 的 3min 缓存）。 */
+function refreshRow() {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("stats_refresh").setLabel("🔄 刷新").setStyle(ButtonStyle.Secondary),
+  );
+}
+
 async function ensureMessage(discord: Client, channelId: string, embed: EmbedBuilder): Promise<string | null> {
   const ch = (await discord.channels.fetch(channelId).catch(() => null)) as TextChannel | null;
   if (!ch || !("send" in ch)) return null;
+  const payload = { embeds: [embed], components: [refreshRow()] };
   const cfg = await readConfig();
   const existingId = cfg.statsDashboard?.messageId;
   if (existingId) {
     const msg = await ch.messages.fetch(existingId).catch(() => null);
     if (msg) {
-      await msg.edit({ embeds: [embed] });
+      await msg.edit(payload);
       return existingId;
     }
   }
-  const msg = await ch.send({ embeds: [embed] });
+  const msg = await ch.send(payload);
   await setStatsDashboard(channelId, msg.id);
   return msg.id;
 }
@@ -348,6 +364,12 @@ async function doUpdate(discord: Client): Promise<void> {
       void doUpdate(discord);
     }
   }
+}
+
+/** 看板「🔄 刷新」按钮：强制刷新账号 gauge（清缓存年龄）+ 立即重渲染。 */
+export async function forceRefreshStatsDashboard(discord: Client): Promise<void> {
+  if (accountCache) accountCache.scrapedAt = 0; // 让下次 getAccountUsage 强制重抓
+  await doUpdate(discord);
 }
 
 /** 每次「对话完成」hook 调这个（防抖合并瞬时连发）。 */

@@ -66,6 +66,8 @@ interface FileStats {
   contextTokens: number;
   today: UsageWindow;
   week: UsageWindow;
+  /** 最后一条 assistant 实际用的 model（真相），可能跟 registry 钉的不一样 */
+  model: string;
 }
 
 const fileCache = new Map<string, { key: string; stats: FileStats }>();
@@ -76,6 +78,7 @@ async function readFileStats(path: string): Promise<FileStats> {
     contextTokens: 0,
     today: { tokens: 0, requests: 0 },
     week: { tokens: 0, requests: 0 },
+    model: "",
   };
   if (!existsSync(path)) return empty;
   const dayTs = dayStartTs();
@@ -91,6 +94,7 @@ async function readFileStats(path: string): Promise<FileStats> {
   const today: UsageWindow = { tokens: 0, requests: 0 };
   const week: UsageWindow = { tokens: 0, requests: 0 };
   let contextTokens = 0;
+  let model = "";
   let ctxFound = false;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
@@ -101,11 +105,12 @@ async function readFileStats(path: string): Promise<FileStats> {
     const u = rec?.message?.usage;
     if (!u) continue;
     if (!ctxFound) {
-      // 从尾往前第一条带 usage 的 assistant = 当前上下文快照
+      // 从尾往前第一条带 usage 的 assistant = 当前上下文快照 + 实际在跑的模型
       contextTokens =
         Number(u.input_tokens || 0) +
         Number(u.cache_read_input_tokens || 0) +
         Number(u.cache_creation_input_tokens || 0);
+      model = String(rec?.message?.model || "");
       ctxFound = true;
     }
     const ts = new Date(rec.timestamp).getTime();
@@ -122,7 +127,7 @@ async function readFileStats(path: string): Promise<FileStats> {
       today.requests += 1;
     }
   }
-  const stats: FileStats = { contextTokens, today, week };
+  const stats: FileStats = { contextTokens, today, week, model };
   fileCache.set(path, { key, stats });
   return stats;
 }
@@ -145,11 +150,12 @@ export async function computeAgentStats(agents: AgentLike[]): Promise<AgentStat[
     const jsonl = resolveJsonl(a);
     const fs = jsonl
       ? await readFileStats(jsonl)
-      : { contextTokens: 0, today: { tokens: 0, requests: 0 }, week: { tokens: 0, requests: 0 } };
+      : { contextTokens: 0, today: { tokens: 0, requests: 0 }, week: { tokens: 0, requests: 0 }, model: "" };
     out.push({
       name: a.name,
       channelId: a.channelId || "",
-      model: a.model || "?",
+      // 实际在跑的模型（jsonl 真相）优先；不是正常 claude- 模型（如 <synthetic>）时退回 registry
+      model: fs.model.startsWith("claude-") ? fs.model : (a.model || fs.model || "?"),
       status: a.status || "active",
       contextTokens: fs.contextTokens,
       contextPct: Math.min(100, Math.round((fs.contextTokens / CONTEXT_CEILING) * 100)),
