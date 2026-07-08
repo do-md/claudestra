@@ -75,7 +75,20 @@ export interface BridgeEndpoint {
   label?: string;
 }
 
-export type Endpoint = LocalEndpoint | PeerEndpoint | UserEndpoint | BridgeEndpoint;
+/**
+ * v2.6.0+ HTTP API 用户（多前端架构 Phase B，设计 §5）。
+ * 会话地址是虚拟 chat_id `api:<tokenId>`（统一 keyspace，D7）：agent 收到的
+ * meta.chat_id 就是它，reply 原样回传 → resolveReplyTarget 识别前缀 → 这里。
+ */
+export interface ApiUserEndpoint {
+  kind: "api";
+  /** token 短 id（"tok_xxx"），虚拟 chat_id 的 id 部分 */
+  tokenId: string;
+  /** token 的人类名，渲染进 agent 看到的 header */
+  name: string;
+}
+
+export type Endpoint = LocalEndpoint | PeerEndpoint | UserEndpoint | BridgeEndpoint | ApiUserEndpoint;
 
 // ============================================================
 // Envelope：一条待投递的消息
@@ -186,6 +199,8 @@ export function endpointLabel(e: Endpoint): string {
       return `user:${e.userId}@${e.channelId}`;
     case "bridge":
       return `bridge:${e.label ?? "?"}`;
+    case "api":
+      return `api:${e.tokenId}(${e.name})`;
   }
 }
 

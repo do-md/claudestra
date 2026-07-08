@@ -98,6 +98,12 @@ interface AgentInfo {
    * ~/.claude/settings.json。改完 restart 生效（是启动 flag）。
    */
   model?: string;
+  /**
+   * v2.6.0+ R1：标记为「可对外暴露的专用 agent」（create --external）。
+   * token-add 把未标 external 的 agent 加进 scope 时要求 --force —— 防止把
+   * owner 日常在用、上下文里有机密的 agent 开放给外部人。
+   */
+  external?: boolean;
 }
 
 interface Registry {
@@ -436,6 +442,17 @@ function extractModelFlag(args: string[]): { rest: string[]; model?: string } {
   return { rest, model };
 }
 
+/** v2.6.0+ 从 argv 提取布尔 flag（--external / --force 这类无值开关） */
+function extractBoolFlag(args: string[], flag: string): { rest: string[]; value: boolean } {
+  const rest: string[] = [];
+  let value = false;
+  for (const a of args) {
+    if (a === flag) value = true;
+    else rest.push(a);
+  }
+  return { rest, value };
+}
+
 // ============================================================
 // 命令实现
 // ============================================================
@@ -448,6 +465,7 @@ async function cmdCreate(
   effort?: string,
   permissionMode?: string,
   model?: string,
+  external?: boolean,
 ) {
   assertValidNewName(name);
   const tmuxName = normalizeName(name);
@@ -602,6 +620,7 @@ async function cmdCreate(
     effort,
     permissionMode: mode,
     ...(model ? { model } : {}),
+    ...(external ? { external: true } : {}),
   };
   await saveRegistry(reg);
 
@@ -2189,6 +2208,108 @@ async function cmdInviteLink(args: string[]) {
   });
 }
 
+// ============================================================
+// v2.6.0+ HTTP API token（多前端架构 Phase B，设计 §3.4 / §5.1 / R1）
+// ============================================================
+
+/**
+ * token-add <name> --agents a,b [--force] [--no-mirror]
+ * 生成一个 API token，scope 限定在指定 agent。secret 只显示这一次。
+ * R1 防呆：目标 agent 未标 external:true（create --external）时要求 --force。
+ */
+async function cmdTokenAdd(name: string, agentsCsv: string, force: boolean, noMirror: boolean) {
+  const { readPrincipals, writePrincipals, newTokenPrincipal, tokenIdOf } =
+    await import("./lib/principals.js");
+  const agents = agentsCsv.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!name || agents.length === 0) {
+    output({ ok: false, error: 'token-add <name> --agents <a,b|*> [--force] [--no-mirror]' });
+    return;
+  }
+
+  // scope 里的 agent 校验：存在性 + R1 external 检查（"*" 跳过存在性，仍警告）
+  const reg = await loadRegistry();
+  const warnings: string[] = [];
+  for (const a of agents) {
+    if (a === "*") {
+      if (!force) {
+        output({
+          ok: false,
+          error: `--agents "*" 会把全部 agent 开放给这个 token（master 除外）。上下文共享有泄密风险（R1），确认请加 --force。`,
+        });
+        return;
+      }
+      warnings.push(`"*" scope：所有普通 agent 都对此 token 可见`);
+      continue;
+    }
+    const info = reg.agents[a] || reg.agents[`agent-${a}`];
+    if (!info) {
+      output({ ok: false, error: `agent "${a}" 不存在（registry 里没有 ${a} / agent-${a}）` });
+      return;
+    }
+    if (!info.external && !force) {
+      output({
+        ok: false,
+        error:
+          `agent "${a}" 未标记为对外专用（external）。把日常在用的 agent 开放给外部 token，` +
+          `对方可以套出该 agent 上下文里的既有内容（R1 共享上下文风险）。` +
+          `建议：为外部用途新建专用 agent（create <name> <dir> --external）；` +
+          `确实要开放这个就加 --force。`,
+      });
+      return;
+    }
+    if (!info.external) warnings.push(`"${a}" 未标 external，已用 --force 强制开放`);
+  }
+
+  const file = await readPrincipals();
+  const p = newTokenPrincipal(name, agents);
+  if (noMirror) p.mirror = false;
+  file.principals.push(p);
+  await writePrincipals(file);
+
+  output({
+    ok: true,
+    tokenId: tokenIdOf(p),
+    name,
+    agents,
+    mirror: p.mirror,
+    secret: p.secret,
+    secretNote: "⚠️ secret 只显示这一次，请立即保存。调用方式: Authorization: Bearer <secret>",
+    warnings,
+    usage: `curl -H "Authorization: Bearer ${p.secret}" -X POST http://<bridge>/api/v1/agents/${agents[0] === "*" ? "<agent>" : agents[0]}/messages -H "Content-Type: application/json" -d '{"text":"你好","wait":60}'`,
+  });
+}
+
+async function cmdTokenList() {
+  const { readPrincipals, tokenIdOf } = await import("./lib/principals.js");
+  const file = await readPrincipals();
+  const tokens = file.principals
+    .filter((p) => p.id.startsWith("token:"))
+    .map((p) => ({
+      tokenId: tokenIdOf(p),
+      name: p.name,
+      agents: p.agents,
+      disabled: !!p.disabled,
+      mirror: p.mirror !== false,
+      createdAt: p.createdAt,
+      secretPreview: p.secret ? `${p.secret.slice(0, 8)}…` : "",
+    }));
+  output({ ok: true, count: tokens.length, tokens });
+}
+
+async function cmdTokenRevoke(idOrName: string) {
+  const { readPrincipals, writePrincipals, findToken, tokenIdOf } =
+    await import("./lib/principals.js");
+  const file = await readPrincipals();
+  const p = findToken(file, idOrName);
+  if (!p) {
+    output({ ok: false, error: `找不到 token: ${idOrName}（token-list 查看现有的）` });
+    return;
+  }
+  file.principals = file.principals.filter((x) => x !== p);
+  await writePrincipals(file);
+  output({ ok: true, revoked: tokenIdOf(p), name: p.name, message: "token 已删除，立即失效" });
+}
+
 async function cmdPeerExpose(localAgent: string, peer: string, purpose: string, mode: "direct" | "via_master" = "direct") {
   const peers = await import("./lib/peers.js");
   const data = await peers.readPeers();
@@ -2553,7 +2674,8 @@ const [cmd, ...args] = process.argv.slice(2);
 try {
 switch (cmd) {
   case "create": {
-    const { rest: afterModel, model } = extractModelFlag(args);
+    const { rest: afterExternal, value: external } = extractBoolFlag(args, "--external");
+    const { rest: afterModel, model } = extractModelFlag(afterExternal);
     const { rest: afterMode, mode } = extractModeFlag(afterModel);
     const { rest: afterEffort, effort } = extractEffortFlag(afterMode);
     const { rest: posArgs, preset, disallowedRaw } = extractPermFlags(afterEffort);
@@ -2561,11 +2683,40 @@ switch (cmd) {
     if (!name || !dir) {
       output({
         ok: false,
-        error: 'create <name> <dir> [purpose] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>] [--model <model>]',
+        error: 'create <name> <dir> [purpose] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>] [--model <model>] [--external]',
       });
       break;
     }
-    await cmdCreate(name, dir, purposeParts.join(" "), { preset, disallowedRaw }, effort, mode, model);
+    await cmdCreate(name, dir, purposeParts.join(" "), { preset, disallowedRaw }, effort, mode, model, external);
+    break;
+  }
+
+  // v2.6.0+ HTTP API token 管理（多前端架构 Phase B）
+  case "token-add": {
+    const { rest: afterForce, value: force } = extractBoolFlag(args, "--force");
+    const { rest: afterMirror, value: noMirror } = extractBoolFlag(afterForce, "--no-mirror");
+    // --agents a,b（也接受 --agents=a,b）
+    let agentsCsv = "";
+    const posArgs: string[] = [];
+    for (let i = 0; i < afterMirror.length; i++) {
+      const a = afterMirror[i];
+      if (a === "--agents") agentsCsv = afterMirror[++i] || "";
+      else if (a.startsWith("--agents=")) agentsCsv = a.slice("--agents=".length);
+      else posArgs.push(a);
+    }
+    await cmdTokenAdd(posArgs.join(" "), agentsCsv, force, noMirror);
+    break;
+  }
+  case "token-list":
+    await cmdTokenList();
+    break;
+  case "token-revoke": {
+    const [idOrName] = args;
+    if (!idOrName) {
+      output({ ok: false, error: "token-revoke <tokenId|name>" });
+      break;
+    }
+    await cmdTokenRevoke(idOrName);
     break;
   }
 

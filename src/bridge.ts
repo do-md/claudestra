@@ -51,6 +51,15 @@ import { tmuxScreenshot } from "./bridge/screenshot.js";
 import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel } from "./bridge/jsonl-watcher.js";
 // v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
 import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from "./bridge/event-bus.js";
+// v2.6.0+ HTTP API 身份与授权（设计 §3.4 / §5）
+import {
+  readPrincipals,
+  findByBearer,
+  agentInScope,
+  tokenIdOf,
+  SlidingWindowLimiter,
+  type Principal,
+} from "./lib/principals.js";
 import { startPermissionWatcher, permissionMessages, clearPermissionMessage } from "./bridge/permission-watcher.js";
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
 import { updateStatsDashboard, initStatsDashboard, handleStatsRequest, forceRefreshStatsDashboard } from "./bridge/stats-dashboard.js";
@@ -118,6 +127,48 @@ interface PendingReply {
   threadId?: string;
 }
 const pendingReplies = new Map<string, PendingReply>();
+
+// ============================================================
+// v2.6.0+ HTTP API 会话状态（多前端架构 Phase B，设计 §5）
+// ============================================================
+
+/**
+ * 一次 POST /api/v1/agents/:name/messages 的追踪。key = `${tokenId}|${agentChannelId}`
+ * （同 token 对同 agent 的并发请求按 FIFO 队列 resolve）。
+ * agent 的 reply(chat_id="api:<tokenId>") 进 deliverToApi 时按 key 出队：
+ * resolve 同步 waiter + emit chat_message(out)（带原请求 threadId）+ 存结果供轮询。
+ */
+interface PendingApiRequest {
+  tokenId: string;
+  tokenName: string;
+  agentChannelId: string;
+  agentName: string;
+  threadId: string;
+  ts: number;
+  /** wait 模式挂的 resolver（无 wait 则为空） */
+  resolve?: (result: ApiReplyResult) => void;
+}
+interface ApiReplyResult {
+  reply: string | null;
+  components?: unknown[];
+  files?: { name: string; url: string }[];
+  threadId: string;
+  agent: string;
+  /** true = agent 没调 reply()，文本来自 Stop-hook drain 兜底（R3） */
+  viaFallback?: boolean;
+}
+const pendingApiRequests = new Map<string, PendingApiRequest[]>();
+/** threadId → 已完成结果（轮询兜底用，TTL 清理见 staleCleanup） */
+const apiThreadResults = new Map<string, { result: ApiReplyResult; ts: number }>();
+/** 出站附件登记：opaqueId → 本地路径 + 属主 token（防任意文件读取） */
+const apiFiles = new Map<string, { path: string; tokenId: string; name: string }>();
+/** per-token 限流器（30 req/min，内存态） */
+const apiLimiters = new Map<string, SlidingWindowLimiter>();
+const API_REQUEST_TTL_MS = 10 * 60_000;
+
+function apiReqKey(tokenId: string, agentChannelId: string): string {
+  return `${tokenId}|${agentChannelId}`;
+}
 
 /**
  * thread → 原始请求 envelope 的追踪。deliverToLocal 在 intent=request 时挂一条，
@@ -271,10 +322,11 @@ import type {
   LocalEndpoint as RouterLocalEndpoint,
   PeerEndpoint as RouterPeerEndpoint,
   UserEndpoint as RouterUserEndpoint,
+  ApiUserEndpoint as RouterApiUserEndpoint,
   Envelope as RouterEnvelope,
   Delivery as RouterDelivery,
 } from "./bridge/router.js";
-import { endpointLabel, envelopeLabel, newThreadId } from "./bridge/router.js";
+import { endpointLabel, envelopeLabel, newThreadId, parseChatId } from "./bridge/router.js";
 
 /**
  * v2.0.0+ 统一消息投递入口。所有 bridge 的出入站消息（messageCreate 路由 /
@@ -334,10 +386,85 @@ async function deliver(env: RouterEnvelope): Promise<RouterDelivery> {
         return await deliverToPeer(env, env.to);
       case "user":
         return await deliverToUser(env, env.to);
+      case "api":
+        return await deliverToApi(env, env.to);
     }
   } catch (e) {
     console.error(`deliver 失败 ${envelopeLabel(env)}:`, e);
     return { envelope: env, outcome: { kind: "error", error: e as Error } };
+  }
+}
+
+/**
+ * v2.6.0+ 投递到 HTTP API 用户（设计 §5.3）。不碰 Discord（镜像除外）：
+ * 1. 按 `${tokenId}|${agent频道}` 出队 pendingApiRequest → resolve 同步 waiter；
+ * 2. emit chat_message(out) 事件（带原请求 threadId，SSE 订阅者收到）；
+ * 3. 结果写 apiThreadResults（GET /api/v1/threads/:id 轮询兜底）；
+ * 4. R2 审计镜像：把回复镜像到该 agent 的 Discord 频道（token mirror!==false 时）。
+ */
+async function deliverToApi(env: RouterEnvelope, to: RouterApiUserEndpoint): Promise<RouterDelivery> {
+  const fromChannelId = env.from.kind === "local" ? env.from.channelId : "";
+  const key = apiReqKey(to.tokenId, fromChannelId);
+  const queue = pendingApiRequests.get(key);
+  const pending = queue?.shift();
+  if (queue && queue.length === 0) pendingApiRequests.delete(key);
+
+  // 附件登记 → 下载 URL（属主 = 该 token，GET /api/v1/files/:id 校验）
+  const files = (env.meta.files || []).map((p) => {
+    const id = `f_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const name = p.split("/").pop() || "file";
+    apiFiles.set(id, { path: p, tokenId: to.tokenId, name });
+    return { name, url: `/api/v1/files/${id}` };
+  });
+
+  const threadId = pending?.threadId || env.meta.threadId;
+  const agentName = pending?.agentName ||
+    (env.from.kind === "local" ? env.from.agentName : undefined) ||
+    agentNameForChannel(fromChannelId) || "?";
+  const result: ApiReplyResult = {
+    reply: env.content,
+    components: env.meta.components,
+    files: files.length ? files : undefined,
+    threadId,
+    agent: agentName,
+  };
+  apiThreadResults.set(threadId, { result, ts: Date.now() });
+  pending?.resolve?.(result);
+
+  emitEvent({
+    agent: agentName,
+    chatId: `api:${to.tokenId}`,
+    type: "chat_message",
+    data: { direction: "out", from: agentName, text: env.content, threadId, api: true },
+  });
+
+  // R2 审计镜像（fire-and-forget，走 bridge→user 的 UI 类通道）
+  mirrorApiExchange(to, fromChannelId, `[🌐 API→${to.name}] ${env.content}`).catch(() => {});
+
+  return { envelope: env, outcome: { kind: "sent" } };
+}
+
+/** R2：API 对话镜像到 agent 的 Discord 频道（principal.mirror === false 时不发） */
+async function mirrorApiExchange(to: RouterApiUserEndpoint, agentChannelId: string, text: string): Promise<void> {
+  if (!agentChannelId) return;
+  try {
+    const file = await readPrincipals();
+    const p = file.principals.find((x) => x.id === `token:${to.tokenId}`);
+    if (p?.mirror === false) return;
+    await deliver({
+      from: { kind: "bridge", label: "api-mirror" },
+      to: { kind: "user", userId: "", channelId: agentChannelId },
+      intent: "notification",
+      content: text,
+      meta: {
+        messageId: `api_mirror_${Date.now()}`,
+        triggerKind: "system",
+        ts: new Date().toISOString(),
+        threadId: newThreadId(),
+      },
+    });
+  } catch (e) {
+    console.error("API 镜像失败:", (e as Error).message);
   }
 }
 
@@ -374,6 +501,10 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
     meta.user = `bridge${env.from.label ? `:${env.from.label}` : ""}`;
     meta.user_id = "bridge";
     meta.is_bridge = "true";
+  } else if (env.from.kind === "api") {
+    meta.user = env.from.name;
+    meta.user_id = `api:${env.from.tokenId}`;
+    meta.api = "true";
   }
   if (env.meta.attachments && env.meta.attachments.length > 0) {
     meta.attachment_count = String(env.meta.attachments.length);
@@ -432,6 +563,8 @@ function resolveReplyBackChannel(env: RouterEnvelope): string {
   if (env.from.kind === "user") return env.from.channelId;
   if (env.from.kind === "peer") return env.from.sharedChannelId;
   if (env.from.kind === "local") return env.from.channelId;
+  // v2.6.0+ API 用户：虚拟 chat_id（统一 keyspace D7），agent reply 原样回传
+  if (env.from.kind === "api") return `api:${env.from.tokenId}`;
   return "";
 }
 
@@ -564,6 +697,18 @@ async function renderContentForLocal(env: RouterEnvelope): Promise<string> {
   // header；agent 看到的是 bridge 写的通知正文本身。
   if (from.kind === "bridge") {
     return env.content;
+  }
+
+  // v2.6.0+ HTTP API 用户（设计 §5.2）：header 明示对话方不是 Discord 用户 ——
+  // 没有 @mention/push 语义，且这是外部 principal（R1 纵深防御：agent 可据此
+  // 对上下文里的敏感内容保持沉默）。reply 直接回 meta.chat_id（api:<tokenId>）。
+  if (from.kind === "api") {
+    return [
+      `[🌐 来自 API 用户「${from.name}」（外部 token 接入，非 Discord）。`,
+      `直接用 reply() 回答到本 chat_id 即可；对方看不到本频道历史，不要在回复里引用与本请求无关的既有上下文内容。]`,
+      ``,
+      env.content,
+    ].join("\n");
   }
 
   // 本地 agent → agent 转发（send_to_agent / pushback / reply→别agent forward）。
@@ -3638,7 +3783,18 @@ async function resolvePeerDirectCandidate(
  *      作为 userId。deliverToUser 不自动 @ user（push 通知在 Stop hook 完成通知
  *      里另管）。
  */
-async function resolveReplyTarget(chatId: string): Promise<RouterUserEndpoint | RouterPeerEndpoint> {
+async function resolveReplyTarget(chatId: string): Promise<RouterUserEndpoint | RouterPeerEndpoint | RouterApiUserEndpoint> {
+  // v2.6.0+ 虚拟 chat_id `api:<tokenId>`（统一 keyspace D7）→ API 用户
+  const parsed = parseChatId(chatId);
+  if (parsed.transport === "api") {
+    let name = parsed.id;
+    try {
+      const file = await readPrincipals();
+      const p = file.principals.find((x) => x.id === `token:${parsed.id}`);
+      if (p?.name) name = p.name;
+    } catch { /* 名字仅展示用，查不到就用 tokenId */ }
+    return { kind: "api", tokenId: parsed.id, name };
+  }
   try {
     const { readPeers } = await import("./lib/peers.js");
     const peers = await readPeers();
@@ -4150,6 +4306,24 @@ setInterval(() => {
       console.log(`🧹 pendingPeerInbound stale: 清掉 agent=${pending.localAgentName} (peer=${pending.peerBotName})`);
     }
   }
+  // v2.6.0+ API 会话状态 TTL（10min）：pending 请求、轮询结果、附件登记
+  for (const [key, queue] of pendingApiRequests.entries()) {
+    const fresh = queue.filter((p) => now - p.ts <= API_REQUEST_TTL_MS);
+    if (fresh.length === 0) pendingApiRequests.delete(key);
+    else if (fresh.length !== queue.length) pendingApiRequests.set(key, fresh);
+  }
+  for (const [tid, hit] of apiThreadResults.entries()) {
+    if (now - hit.ts > API_REQUEST_TTL_MS) apiThreadResults.delete(tid);
+  }
+  if (apiFiles.size > 200) {
+    // 附件登记只按容量截断（文件本身在 TMP_DIR，系统自己清）
+    const excess = apiFiles.size - 200;
+    let i = 0;
+    for (const k of apiFiles.keys()) {
+      if (i++ >= excess) break;
+      apiFiles.delete(k);
+    }
+  }
   for (const [channelId, pending] of pendingInterAgentMsg.entries()) {
     if (now - pending.ts > STALE_MS) {
       pendingInterAgentMsg.delete(channelId);
@@ -4395,6 +4569,31 @@ async function handleHookRequest(req: Request): Promise<Response> {
               }
             }
 
+            // v2.6.0+ R3: API waiter 兜底 —— agent end_turn 没 reply() 时，用
+            // drain 出的 assistant 文本 resolve 挂着的 API 请求，wait 调用方不必
+            // 干等到超时。连文本都没有 → resolve reply:null（"结束但没回复"）。
+            for (const [pKey, pQueue] of pendingApiRequests.entries()) {
+              if (!pQueue.length || pQueue[0].agentChannelId !== cid) continue;
+              pendingApiRequests.delete(pKey);
+              for (const p of pQueue) {
+                const result: ApiReplyResult = {
+                  reply: drainedText || null,
+                  threadId: p.threadId,
+                  agent: p.agentName,
+                  viaFallback: true,
+                };
+                apiThreadResults.set(p.threadId, { result, ts: Date.now() });
+                p.resolve?.(result);
+                emitEvent({
+                  agent: p.agentName,
+                  chatId: `api:${p.tokenId}`,
+                  type: "chat_message",
+                  data: { direction: "out", from: p.agentName, text: drainedText || "", threadId: p.threadId, api: true, viaFallback: true },
+                });
+                console.log(`🌐 API waiter drain 兜底: ${p.agentName} → token ${p.tokenId}（${drainedText ? drainedText.length + " chars" : "no-text"}）`);
+              }
+            }
+
             // v2.0.16+ inter-agent 看门狗: 这一轮结束时如果 cid 还挂着 inter-agent
             // 消息 pending（agent 既没 reply 也没 send_to_agent —— 大概率收到消息后
             // 啥也没干或没报告），注一条 nudge 到它的 ws 提醒处理 + reply() 报告。
@@ -4558,6 +4757,202 @@ function handleEventsRequest(req: Request, extraFilter?: EventFilter): Response 
   });
 }
 
+// ============================================================
+// v2.6.0+ /api/v1/* —— token 鉴权的入站 HTTP API（设计 §5）
+// ============================================================
+
+function apiJson(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** Bearer 鉴权 + 限流。失败直接返回 Response，成功返回 principal。 */
+async function authApi(req: Request): Promise<Principal | Response> {
+  const auth = req.headers.get("Authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return apiJson(401, { ok: false, error: "missing Authorization: Bearer <secret>" });
+  const file = await readPrincipals();
+  const p = findByBearer(file, m[1].trim());
+  if (!p) return apiJson(401, { ok: false, error: "invalid or revoked token" });
+  const tid = tokenIdOf(p);
+  let limiter = apiLimiters.get(tid);
+  if (!limiter) {
+    limiter = new SlidingWindowLimiter();
+    apiLimiters.set(tid, limiter);
+  }
+  if (!limiter.tryAcquire()) return apiJson(429, { ok: false, error: "rate limit exceeded (30 req/min)" });
+  return p;
+}
+
+/** registry 名双向兼容（"worker" ↔ "agent-worker"），返回 manager list 里的条目 */
+async function findApiAgent(name: string): Promise<{ name: string; channelId: string; idle?: boolean; status?: string; purpose?: string } | null> {
+  try {
+    const listResult = await runManager("list");
+    const agents = (listResult.agents || []) as any[];
+    return agents.find((a) => a.name === name || a.name === `agent-${name}` || `agent-${a.name}` === name) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function handleApiRequest(req: Request, url: URL): Promise<Response> {
+  const auth = await authApi(req);
+  if (auth instanceof Response) return auth;
+  const principal = auth;
+  const tokenId = tokenIdOf(principal);
+  const path = url.pathname.slice("/api/v1".length);
+
+  // GET /api/v1/agents —— scope 内的 agent 快照
+  if (path === "/agents" && req.method === "GET") {
+    try {
+      const listResult = await runManager("list");
+      const agents = ((listResult.agents || []) as any[])
+        .filter((a) => agentInScope(principal, a.name))
+        .map((a) => ({ name: a.name, status: a.status, idle: a.idle, purpose: a.purpose }));
+      return apiJson(200, { ok: true, agents });
+    } catch (e) {
+      return apiJson(500, { ok: false, error: (e as Error).message });
+    }
+  }
+
+  // GET /api/v1/events —— token 版 SSE（按 scope 过滤事件）
+  if (path === "/events" && req.method === "GET") {
+    let scopeAgents: string[] | undefined;
+    if (!principal.agents.includes("*")) {
+      // 双向兼容前缀：scope 里存裸名时补 agent- 前缀的变体
+      scopeAgents = principal.agents.flatMap((a) => [a, `agent-${a}`]);
+    }
+    return handleEventsRequest(req, scopeAgents ? { agents: scopeAgents } : undefined);
+  }
+
+  // GET /api/v1/threads/:threadId —— wait 超时后的轮询兜底
+  const threadMatch = path.match(/^\/threads\/([^/]+)$/);
+  if (threadMatch && req.method === "GET") {
+    const hit = apiThreadResults.get(threadMatch[1]);
+    if (!hit) return apiJson(404, { ok: false, error: "thread not found (not answered yet, or expired)" });
+    return apiJson(200, { ok: true, ...hit.result });
+  }
+
+  // GET /api/v1/files/:id —— 出站附件下载（校验属主 token）
+  const fileMatch = path.match(/^\/files\/([^/]+)$/);
+  if (fileMatch && req.method === "GET") {
+    const entry = apiFiles.get(fileMatch[1]);
+    if (!entry || entry.tokenId !== tokenId) return apiJson(404, { ok: false, error: "file not found" });
+    const f = Bun.file(entry.path);
+    if (!(await f.exists())) return apiJson(410, { ok: false, error: "file no longer on disk" });
+    return new Response(f, {
+      headers: { "Content-Disposition": `attachment; filename="${encodeURIComponent(entry.name)}"` },
+    });
+  }
+
+  // POST /api/v1/agents/:name/messages —— 给 agent 发消息（同步 wait / 202+轮询）
+  const msgMatch = path.match(/^\/agents\/([^/]+)\/messages$/);
+  if (msgMatch && req.method === "POST") {
+    const agentParam = decodeURIComponent(msgMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const client = clients.get(agent.channelId);
+    if (!client) return apiJson(409, { ok: false, error: `agent "${agent.name}" is offline (no active session)` });
+
+    // body：JSON {text, wait} 或 multipart（text 字段 + files，R5 入站附件）
+    let text = "";
+    let waitSec = 0;
+    const attachments: string[] = [];
+    const contentType = req.headers.get("Content-Type") || "";
+    try {
+      if (contentType.includes("multipart/form-data")) {
+        const form = await req.formData();
+        text = String(form.get("text") || "");
+        waitSec = Number(form.get("wait") || 0);
+        const inboxDir = `${TMP_DIR}/inbox`;
+        await Bun.spawn(["mkdir", "-p", inboxDir]).exited;
+        const files = form.getAll("files").filter((f): f is File => f instanceof File).slice(0, 5);
+        for (const f of files) {
+          if (f.size > 10 * 1024 * 1024) return apiJson(413, { ok: false, error: `file "${f.name}" exceeds 10MB` });
+          const dest = `${inboxDir}/api_${Date.now()}_${f.name.replace(/[^\w.\-]/g, "_")}`;
+          await Bun.write(dest, f);
+          attachments.push(dest);
+        }
+      } else {
+        const body = (await req.json()) as { text?: string; wait?: number };
+        text = String(body.text || "");
+        waitSec = Number(body.wait || 0);
+      }
+    } catch {
+      return apiJson(400, { ok: false, error: "invalid body (JSON {text, wait?} or multipart with text/files)" });
+    }
+    if (!text.trim() && attachments.length === 0) {
+      return apiJson(400, { ok: false, error: "text is required" });
+    }
+    waitSec = Math.min(Math.max(waitSec, 0), 300);
+
+    const tokenName = principal.name || tokenId;
+    const threadId = newThreadId();
+    const env: RouterEnvelope = {
+      from: { kind: "api", tokenId, name: tokenName },
+      to: { kind: "local", agentName: agent.name, channelId: agent.channelId, ws: client.ws, cwd: client.cwd },
+      intent: "request",
+      content: text,
+      meta: {
+        messageId: `api_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        triggerKind: "system",
+        ts: new Date().toISOString(),
+        threadId,
+        attachments: attachments.length ? attachments : undefined,
+        // API 请求不需要 inter-agent watchdog（有自己的 wait/轮询语义）
+        skipInterAgentWatchdog: true,
+      },
+    };
+
+    // 挂 pending（无论是否 wait —— deliverToApi 靠它关联 threadId / R3 兜底靠它找 waiter）
+    const key = apiReqKey(tokenId, agent.channelId);
+    const entry: PendingApiRequest = {
+      tokenId,
+      tokenName,
+      agentChannelId: agent.channelId,
+      agentName: agent.name,
+      threadId,
+      ts: Date.now(),
+    };
+    const queue = pendingApiRequests.get(key) || [];
+    queue.push(entry);
+    pendingApiRequests.set(key, queue);
+
+    const delivery = await deliver(env);
+    if (delivery.outcome.kind !== "sent") {
+      const idx = queue.indexOf(entry);
+      if (idx >= 0) queue.splice(idx, 1);
+      const reason = delivery.outcome.kind === "dropped" ? delivery.outcome.reason : (delivery.outcome as any).error?.message;
+      return apiJson(502, { ok: false, error: `delivery failed: ${reason || "unknown"}` });
+    }
+
+    // R2 入站镜像
+    mirrorApiExchange({ kind: "api", tokenId, name: tokenName }, agent.channelId, `[🌐 API←${tokenName}] ${text}`).catch(() => {});
+    startTypingWithSafety(agent.channelId);
+
+    if (waitSec === 0) {
+      return apiJson(202, { ok: true, accepted: true, threadId, agent: agent.name, hint: `poll GET /api/v1/threads/${threadId} or subscribe /api/v1/events` });
+    }
+
+    const result = await new Promise<ApiReplyResult | null>((resolve) => {
+      entry.resolve = resolve;
+      setTimeout(() => resolve(null), waitSec * 1000);
+    });
+    if (!result) {
+      entry.resolve = undefined; // 超时后 deliverToApi/R3 仍会把结果写进 apiThreadResults
+      return apiJson(202, { ok: true, accepted: true, timedOut: true, threadId, agent: agent.name, hint: `poll GET /api/v1/threads/${threadId}` });
+    }
+    return apiJson(200, { ok: true, ...result });
+  }
+
+  return apiJson(404, { ok: false, error: "unknown endpoint" });
+}
+
 const server = Bun.serve({
   port: BRIDGE_PORT,
   // v2.6.0+ 默认只绑回环 —— /hook /stats /skills/rescan 一直无鉴权，之前默认
@@ -4581,6 +4976,11 @@ const server = Bun.serve({
     // v2.6.0+ 结构化事件流（SSE，本机免鉴权版；token 版挂 /api/v1/events）
     if (url.pathname === "/events" && req.method === "GET") {
       return handleEventsRequest(req);
+    }
+
+    // v2.6.0+ token 鉴权的入站 API（多前端架构 Phase B）
+    if (url.pathname.startsWith("/api/v1/")) {
+      return handleApiRequest(req, url);
     }
 
     // Skills 重新扫描（manager 在 create/resume/kill 后调）
