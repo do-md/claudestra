@@ -51,7 +51,9 @@ Each Claude Code session has its own `channel-server` subprocess running as a st
 src/
   bridge.ts              Main entry: Discord client, WebSocket server, deliver() dispatch, slash commands, Stop hooks
   bridge/
-    router.ts            v2.0.0+ Envelope/Endpoint types + parseAddress + threadId helpers
+    router.ts            v2.0.0+ Envelope/Endpoint types + parseAddress + threadId helpers; v2.6.0+ parseChatId (unified transport-prefixed chat_id keyspace) + ApiUserEndpoint
+    adapters.ts          v2.6.0+ ChatAdapter interface + registry (NeutralMessage contract); Discord is the first adapter, deliverToUser dispatches by transport
+    event-bus.ts         v2.6.0+ in-process event bus (seq + per-agent ring buffer) mirroring tool calls / assistant text / status → SSE
     config.ts            Shared runtime constants
     components.ts        Discord UI components + typing indicators
     discord-api.ts       Discord API wrappers: discordReply (chunking / reply_to / files / components), channel CRUD, react, edit
@@ -76,6 +78,7 @@ src/
     skills.ts            SKILL.md discovery — user / plugin / project sources + hardcoded natives
     jsonl-cost.ts        Parse ~/.claude/projects JSONL files → per-model token rollup
     peers.ts             peers.json data model + PeerEvent encode/parse + effective mode
+    principals.ts        v2.6.0+ transport-scoped identity + API token CRUD/scope/rate-limit (~/.claude-orchestrator/principals.json)
   ansi2html.ts           ANSI escape codes → coloured HTML
   html2png.ts            HTML → PNG via Playwright headless Chromium
   discord-reply.ts       Bash fallback: send a message through the Bridge directly
@@ -107,6 +110,7 @@ SETUP.md                 User-facing installation guide
 - **Idle detection** — Claude Code `Stop` / `Notification` hooks drive Discord typing indicators precisely; a 30-minute safety timeout catches edge cases.
 - **Master guardian** — pm2-managed launcher keeps the master tmux session alive and auto-dismisses Claude Code confirmation prompts.
 - **Safety rails** — `--disallowedTools` blocks `rm -rf`, `git push --force`, `git reset --hard`, `chmod 777`, and other destructive commands for every spawned agent.
+- **Multi-frontend API (v2.6.0+)** — the core is decoupled from Discord (design doc: `docs/design-multi-frontend.md`). Three transport-neutral channels: `GET /events` (SSE stream of tool calls / assistant text / agent status, `Last-Event-ID` replay), `POST /api/v1/agents/:name/messages` (Bearer-token inbound messaging with sync `wait`, multipart file upload, thread polling fallback), and `GET /stats`. Tokens are scoped per-agent (`manager.ts token-add <name> --agents a,b`; non-`--external` agents require `--force` — shared-context leak guard). API conversations are mirrored to the agent's Discord channel for auditability (`--no-mirror` to opt out). Outbound delivery goes through the `ChatAdapter` registry (`bridge/adapters.ts`) — adding Telegram or another platform means implementing one adapter, zero core changes. Bridge HTTP binds `127.0.0.1` by default (`BRIDGE_BIND` to open up).
 - **Discord slash autocomplete for skills + built-ins** — on startup, the Bridge discovers every available slash command from four sources (user-level `~/.claude/skills/`, installed plugins in `~/.claude/plugins/cache/…`, per-agent `<cwd>/.claude/skills/`, and a curated set of Claude Code built-ins like `/cost`, `/mcp`, `/context`, `/compact`) and registers them as Discord slash commands. Invocations are re-scanned on every `manager.ts create|resume|kill|restart` via the `/skills/rescan` HTTP endpoint. When a user types a registered `/cmd args` in Discord, the bridge forwards the literal text to the channel's agent via `tmux send-keys`, so Claude Code interprets it natively. Project-level skills are filtered: typing a skill that only exists in another agent's cwd yields an ephemeral explanation instead of going through.
 
 ### Cross-Claudestra peer collaboration
@@ -164,6 +168,12 @@ bun src/manager.ts auto-update status
 bun src/manager.ts auto-update claudestra on|off   # Claudestra self-update (30 min poll)
 bun src/manager.ts auto-update claude on|off       # Claude Code CLI (weekly poll)
 
+# Multi-frontend API tokens (v2.6.0+; scope = per-agent whitelist, "*" = all non-master)
+bun src/manager.ts token-add <name> --agents <a,b|*> [--force] [--no-mirror]
+bun src/manager.ts token-list
+bun src/manager.ts token-revoke <tokenId|name>
+bun src/manager.ts create <name> <dir> --external   # mark agent as safe-to-expose (R1 guard)
+
 # Token usage aggregation (parses ~/.claude/projects/<slug>/<sessionId>.jsonl)
 bun src/manager.ts cost [--agent <name>] [--today|--week]
 
@@ -184,6 +194,7 @@ bun test
 | `USER_NAME` | How the master agent addresses the operator in replies |
 | `BRIDGE_URL` | Optional override for the channel-server's WebSocket target |
 | `MASTER_DIR` | Optional override for the master tmux session's working directory |
+| `BRIDGE_BIND` | HTTP/ws bind address (default `127.0.0.1`; set `0.0.0.0` to expose — bring your own reverse proxy/TLS) |
 
 ## tmux topology
 

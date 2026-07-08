@@ -36,6 +36,8 @@ Claudestra 是一个多 session 编排器，基于 Claude Code 原生的 **Chann
 src/
   bridge.ts              主入口：Discord client、WebSocket server、事件分发、slash 命令
   bridge/
+    adapters.ts          v2.6.0+ ChatAdapter 接口 + 注册表（出站按 transport 分发，Discord 是第一个 adapter）
+    event-bus.ts         v2.6.0+ 进程内事件总线（tool 调用/文本/状态 → SSE 事件流）
     config.ts            共享运行时常量
     components.ts        Discord UI 组件 + typing indicator
     discord-api.ts       Discord API 封装（建/删频道、编辑消息等）
@@ -53,6 +55,7 @@ src/
     bridge-client.ts     共享 Bridge WebSocket 请求封装
     tmux-helper.ts       共享 tmux 命令封装（tmuxRaw, isIdle, sendLine, …）
     claude-launch.ts     统一 Claude Code 启动命令构造（flags, MCP_NAME, shell 转义）
+    principals.ts        v2.6.0+ API token 身份/scope/限流（~/.claude-orchestrator/principals.json）
   ansi2html.ts           ANSI 转义码 → 彩色 HTML
   html2png.ts            HTML → PNG（Playwright headless Chromium）
   discord-reply.ts       Bash fallback：通过 Bridge 直接发消息
@@ -68,6 +71,7 @@ SETUP.md / SETUP.zh-CN.md    面向用户的安装指南
 ## 功能
 
 - **多 agent 编排** — 创建、恢复、销毁、重启、列表、浏览历史。
+- **多前端 API（v2.6.0+）** — 核心与 Discord 解耦（设计文档 `docs/design-multi-frontend.md`）：`GET /events` SSE 实时事件流（断线补发）、`POST /api/v1/agents/:name/messages` token 鉴权入站消息（同步 wait / multipart 传文件 / 轮询兜底）。token 按 agent 圈定 scope（`token-add <名> --agents a,b`，未标 `--external` 的 agent 需 `--force`），API 对话默认镜像回 Discord 频道供审计。接 Telegram 等新前端 = 实现一个 ChatAdapter，核心零改动。Bridge 默认只绑 `127.0.0.1`（`BRIDGE_BIND` 放开）。
 - **Agent 间通信** — `send_to_agent(target, text)` MCP 工具通过 Bridge 直接向另一个 agent 的上下文注入消息。
 - **定时任务** — cron 表达式拉起临时 agent、执行 prompt、汇报、清理。
 - **Discord UI** — 按钮、下拉菜单、slash 命令（`/status`、`/screenshot`、`/interrupt`、`/cron`）。
@@ -146,6 +150,7 @@ bun test
 | `USER_NAME` | 大总管在回复里对操作者的称呼 |
 | `BRIDGE_URL` | channel-server 的 WebSocket 目标地址（可选覆盖） |
 | `MASTER_DIR` | 大总管 tmux session 的工作目录（可选覆盖） |
+| `BRIDGE_BIND` | HTTP/ws 绑定地址（默认 `127.0.0.1`；`0.0.0.0` 对外开放，反代/TLS 自理） |
 
 ## tmux 拓扑
 
