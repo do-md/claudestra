@@ -25,6 +25,7 @@ import {
 const DASHBOARD_CHANNEL_NAME = "📊-claudestra-stats";
 const ACCOUNT_TTL_MS = 3 * 60 * 1000; // 账号级 %，慢变化，3min 才重抓
 const DEBOUNCE_MS = 3000; // 合并瞬时连发的多个 hook
+const TICK_MS = 10 * 60 * 1000; // 低频兜底：挂机没 hook 时也刷一次，反映 5h/周 limit 重置
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -103,13 +104,33 @@ function parseUsagePanel(raw: string): AccountUsage {
  * 驱动 master:0 的 /status，确定性导航到 Usage tab，抓 session/week 占比。
  * master 忙就返回 null（用旧缓存）。全程本地、不调用 LLM。
  */
-async function scrapeAccountUsage(): Promise<AccountUsage | null> {
-  const target = `${MASTER_SESSION}:0`;
-  try {
-    const pane0 = await tmuxRaw(["capture-pane", "-t", target, "-p"]).catch(() => "");
-    if (/esc to interrupt/.test(pane0)) return null; // master 正忙，别打扰
-    if (!/❯/.test(pane0)) return null; // 不在 idle prompt
+function paneIdle(pane: string): boolean {
+  return /❯/.test(pane) && !/esc to interrupt/.test(pane);
+}
 
+/**
+ * 挑一个 idle 的 Claude 会话来抓 /status。账号 5h/周 gauge 是**全局**的（"all models"、
+ * 固定 reset 时间），任何会话读都一样，所以不必非得读 master。之前固定读 master:0，
+ * 但 master 作为大总管常年在忙 → idle 守卫每次 bail → gauge 永远冻结。优先 master，
+ * 它忙就退回任意 idle agent 窗口（通常刚跑完 hook 的那个就是 idle 的）。
+ */
+async function findIdleScrapeTarget(): Promise<string | null> {
+  const candidates: string[] = [`${MASTER_SESSION}:0`];
+  const wins = (await tmuxRaw(["list-windows", "-t", MASTER_SESSION, "-F", "#{window_name}"]).catch(() => ""))
+    .split("\n")
+    .filter((w) => w.startsWith("agent-"));
+  candidates.push(...wins.map((w) => `${MASTER_SESSION}:${w}`));
+  for (const t of candidates) {
+    const pane = await tmuxRaw(["capture-pane", "-t", t, "-p"]).catch(() => "");
+    if (paneIdle(pane)) return t;
+  }
+  return null;
+}
+
+async function scrapeAccountUsage(): Promise<AccountUsage | null> {
+  const target = await findIdleScrapeTarget();
+  if (!target) return null; // 没有任何 idle 会话可借，下次再说（沿用旧缓存）
+  try {
     await tmuxRaw(["send-keys", "-t", target, "-l", "/status"]);
     await sleep(150);
     await tmuxRaw(["send-keys", "-t", target, "Enter"]);
@@ -127,15 +148,16 @@ async function scrapeAccountUsage(): Promise<AccountUsage | null> {
       await tmuxRaw(["send-keys", "-t", target, "Right"]);
       await sleep(300);
     }
-    // 关闭面板恢复 master
+    // 关闭面板恢复会话
     await tmuxRaw(["send-keys", "-t", target, "Escape"]);
     await sleep(80);
     await tmuxRaw(["send-keys", "-t", target, "Escape"]);
     if (!found) return null;
-    return parseUsagePanel(panel);
+    const usage = parseUsagePanel(panel);
+    console.log(`📊 账号用量已刷新: session=${usage.sessionPct}% week=${usage.weekPct}% (via ${target})`);
+    return usage;
   } catch (e) {
     console.error("📊 /status 抓取失败:", (e as Error).message);
-    // 尽量把面板关掉，别把 master 卡在 /status
     try {
       await tmuxRaw(["send-keys", "-t", target, "Escape"]);
       await tmuxRaw(["send-keys", "-t", target, "Escape"]);
@@ -144,11 +166,18 @@ async function scrapeAccountUsage(): Promise<AccountUsage | null> {
   }
 }
 
-/** 带 TTL 缓存 + in-flight 去重的账号用量获取。抓不到就沿用旧缓存。 */
+/**
+ * 带 TTL 缓存 + in-flight 去重的账号用量获取。抓不到就沿用旧缓存。
+ * 关键：整个抓取套一层超时 —— 万一某次 tmux/osascript 卡住，`scraping` 也会在超时后
+ * 复位，绝不会永久卡住让 gauge 冻结（这是之前 6h 不更新的根源之一）。
+ */
 async function getAccountUsage(): Promise<AccountUsage | null> {
   if (accountCache && Date.now() - accountCache.scrapedAt < ACCOUNT_TTL_MS) return accountCache;
   if (scraping) return scraping;
-  scraping = scrapeAccountUsage()
+  scraping = Promise.race([
+    scrapeAccountUsage(),
+    new Promise<null>((r) => setTimeout(() => r(null), 15000)),
+  ])
     .then((u) => {
       if (u) accountCache = u;
       return accountCache;
@@ -330,13 +359,19 @@ export function updateStatsDashboard(discord: Client): void {
   }, DEBOUNCE_MS);
 }
 
-/** 启动时确保频道 + 消息存在，并刷一次。 */
+let tickTimer: ReturnType<typeof setInterval> | null = null;
+
+/** 启动时确保频道 + 消息存在，刷一次，并起一个低频兜底 tick。 */
 export async function initStatsDashboard(discord: Client): Promise<void> {
   try {
     await doUpdate(discord);
   } catch (e) {
     console.error("📊 看板初始化失败:", (e as Error).message);
   }
+  // 低频兜底：主更新仍是「对话完成」hook，但挂机、没任何 hook 时账号 5h/周 limit 的
+  // 重置就反映不出来。这个 tick 每 10min 刷一次补上（doUpdate 内部有 running 锁 + 账号
+  // 抓取自带 TTL/超时，不会跟 hook 更新打架）。
+  if (!tickTimer) tickTimer = setInterval(() => void doUpdate(discord), TICK_MS);
 }
 
 /** GET /stats —— 开放 JSON 接口，给 Web 端。 */
