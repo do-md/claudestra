@@ -327,6 +327,8 @@ import type {
   Delivery as RouterDelivery,
 } from "./bridge/router.js";
 import { endpointLabel, envelopeLabel, newThreadId, parseChatId } from "./bridge/router.js";
+// v2.6.0+ C1：出站按 transport 分发（设计 §6）
+import { registerAdapter, adapterFor, type ChatAdapter } from "./bridge/adapters.js";
 
 /**
  * v2.0.0+ 统一消息投递入口。所有 bridge 的出入站消息（messageCreate 路由 /
@@ -611,16 +613,23 @@ async function deliverToPeer(env: RouterEnvelope, to: RouterPeerEndpoint): Promi
  */
 async function deliverToUser(env: RouterEnvelope, to: RouterUserEndpoint): Promise<RouterDelivery> {
   try {
-    const ids = await discordReply(
-      discord,
-      to.channelId,
-      env.content,
-      env.meta.replyTo,
-      env.meta.components as any,
-      env.meta.files,
-    );
-    // v2.0.15+ cross-agent forward —— 见函数注释
-    if (env.from.kind === "local") {
+    // v2.6.0+ C1：按 transport 分发（设计 §6）。to.channelId 是统一 keyspace
+    // 地址（裸 id = discord）。当前只注册了 discord adapter；Telegram 等未来
+    // transport 只需 registerAdapter，一行不改这里。
+    const dest = parseChatId(to.channelId);
+    const adapter = adapterFor(dest.transport);
+    if (!adapter) {
+      return { envelope: env, outcome: { kind: "dropped", reason: `no adapter for transport "${dest.transport}"` } };
+    }
+    const { messageIds: ids } = await adapter.send(dest.id, {
+      text: env.content,
+      replyTo: env.meta.replyTo,
+      components: env.meta.components,
+      files: env.meta.files,
+    });
+    // v2.0.15+ cross-agent forward —— 见函数注释（Discord 专属：clients 的 key
+    // 是 Discord channel id，别的 transport 没有"用户频道=agent 频道"的重合）
+    if (env.from.kind === "local" && dest.transport === "discord") {
       const fromLocal = env.from;
       const isFromMaster = !!CONTROL_CHANNEL_ID && clients.get(CONTROL_CHANNEL_ID)?.ws === fromLocal.ws;
       const targetClient = clients.get(to.channelId);
@@ -1085,6 +1094,26 @@ const discord = new Client({
     GatewayIntentBits.DirectMessages,
   ],
 });
+
+// v2.6.0+ C1：Discord 作为第一个 ChatAdapter（设计 §6）。内部就是 discordReply
+// —— 挪壳不挪逻辑：分块 / reply_to / components 渲染 / files 都在 discordReply
+// 里，本来就是 Discord 专属职责。send 时 discord client 已 ready（消息只会在
+// ready 后流动）。
+registerAdapter({
+  transport: "discord",
+  caps: { maxTextLen: 2000, buttons: true, edit: true, files: true, typing: true },
+  async send(destId, msg) {
+    const ids = await discordReply(
+      discord,
+      destId,
+      msg.text,
+      msg.replyTo,
+      msg.components as any,
+      msg.files,
+    );
+    return { messageIds: ids || [] };
+  },
+} satisfies ChatAdapter);
 
 discord.once("ready", async () => {
   setBotUserId(discord.user?.id || "");
@@ -4934,6 +4963,8 @@ async function handleApiRequest(req: Request, url: URL): Promise<Response> {
     // R2 入站镜像
     mirrorApiExchange({ kind: "api", tokenId, name: tokenName }, agent.channelId, `[🌐 API←${tokenName}] ${text}`).catch(() => {});
     startTypingWithSafety(agent.channelId);
+    // API 触发的 turn 不发 Stop 完成通知 @ owner（回复走 API 回路 + R2 镜像已可见）
+    lastMessageSource.set(agent.channelId, "agent");
 
     if (waitSec === 0) {
       return apiJson(202, { ok: true, accepted: true, threadId, agent: agent.name, hint: `poll GET /api/v1/threads/${threadId} or subscribe /api/v1/events` });
