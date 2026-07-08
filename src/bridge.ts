@@ -483,7 +483,14 @@ async function deliverToUser(env: RouterEnvelope, to: RouterUserEndpoint): Promi
       const fromLocal = env.from;
       const isFromMaster = !!CONTROL_CHANNEL_ID && clients.get(CONTROL_CHANNEL_ID)?.ws === fromLocal.ws;
       const targetClient = clients.get(to.channelId);
-      if (!isFromMaster && targetClient && targetClient.ws !== fromLocal.ws) {
+      // v2.5.5: fromLocal.channelId 为空 = 发送方不是任何已注册的 agent，而是
+      // manager/cron 的临时 bridge-client 连接（restart 完成通知、cron 播报这类
+      // **给用户看的管理消息**）。这类只发 Discord，不 forward 进目标 agent 的
+      // 上下文 —— 否则 agent 收到"你自己已重启"的通知，判断一轮不用回应（内心戏
+      // 被 jsonl-watcher 以 💬 播到频道），ia-watchdog 又 nudge 一轮，一条通知
+      // 变三条噪音 + 两轮 LLM 消耗（owner 2026-07-08 报的"重启后一堆乱七八糟
+      // bridge 消息"）。真 agent reply 到别的 agent 频道时 channelId 非空，不受影响。
+      if (!isFromMaster && fromLocal.channelId && targetClient && targetClient.ws !== fromLocal.ws) {
         forwardReplyToAgentClaude(fromLocal, env.content, to.channelId, targetClient)
           .catch((e) => console.error("reply→别agent频道 forward 异常:", e));
       }
