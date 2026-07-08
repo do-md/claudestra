@@ -39,7 +39,6 @@ if (!CHANNEL_ID) {
 
 let bridgeWs: WebSocket | null = null;
 let registered = false;
-let wasRegistered = false; // v2.4.13+ grace-queue 用：只对"曾经活过"才入队，否则直接 reject
 let replaced = false; // bridge 通知此 channel-server 被新连接取代，跳过重连直接退出
 const pendingRequests = new Map<
   string,
@@ -142,8 +141,7 @@ function connectBridge(): Promise<void> {
 
       if (msg.type === "registered") {
         registered = true;
-        wasRegistered = true;
-        // v2.4.13+ WS 重连成功 → 把 grace 期间排队的请求全部重发
+        // v2.4.13+ WS (重)连成功 → 把 grace 期间排队的请求全部重发
         flushQueuedSenders();
         resolve();
         return;
@@ -228,11 +226,9 @@ function bridgeRequest(msg: any): Promise<any> {
     // 手敲 /mcp + 菜单选择才能恢复，这是我们要根除的痛点。
     const wsReady = bridgeWs && bridgeWs.readyState === WebSocket.OPEN && registered;
     if (!wsReady) {
-      if (!wasRegistered) {
-        // 初次连接都还没成功 → 入队也救不回来，直接 reject
-        reject(new Error("Bridge 未连接（channel-server 尚未初次注册）"));
-        return;
-      }
+      // v2.5.4+ 初次注册前的请求也入队（之前直接 reject）：main 已改成初连失败
+      // 不退出、后台退避重连，bridge 起来后 registered 分支会 flush 队列 ——
+      // "尚未初次注册"不再是死路，15s 超时兜底依然在。
       // 入队，给 15s 宽限等 WS 恢复
       const entry: QueuedSender = {
         send: () => doSend(msg, resolve, reject),
@@ -664,10 +660,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ============================================================
 
 async function main() {
-  // 先连接 Bridge
-  await connectBridge();
+  // 先连接 Bridge。v2.5.4+ 初次连接失败**不再退出**：电脑重启后 launchd 同时拉
+  // bridge 和 launcher，agent 恢复时 bridge 常常还没就绪（Discord login 要几秒），
+  // channel-server 初连被拒 → 之前这里直接 process.exit(1)，而 Claude Code 不会
+  // respawn stdio MCP → agent 永久失联（消息不达 / reply 不可用 / watcher 不启动），
+  // 只能手动 restart。现在初连失败交给 onclose 的指数退避重连（3s..60s cap），
+  // 跟断线重连同一条路：bridge 起来后自动注册，全程无感。
+  await connectBridge().catch((err) => {
+    console.error("初次连接 Bridge 失败（后台退避重连中）:", (err as Error)?.message || err);
+  });
 
-  // 启动 MCP stdio transport
+  // 启动 MCP stdio transport（无论 bridge 是否已连上都要起，Claude Code 侧的
+  // MCP 握手不依赖 bridge；bridge 连上前工具调用会走 grace-queue / 明确报错）
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
 }

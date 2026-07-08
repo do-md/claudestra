@@ -16,6 +16,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
   type Client,
   type TextChannel,
 } from "discord.js";
@@ -320,10 +321,83 @@ function refreshRow() {
   );
 }
 
-async function ensureMessage(discord: Client, channelId: string, embed: EmbedBuilder): Promise<string | null> {
+/**
+ * v2.5.4+ 「存记忆 + Compact」select menu：选一个 agent → bridge 往它的 tmux 发
+ * /save-compact（skill：先挑重点存记忆，再自动 /compact）。Discord 没法把按钮放到
+ * embed field "旁边"，一条消息也放不下每 agent 一个按钮，select 是最干净的形态。
+ */
+function saveCompactRow(agents: AgentStat[]) {
+  const opts = agents
+    .filter((a) => a.channelId)
+    .slice(0, 25)
+    .map((a) => ({
+      label: a.name.replace(/^agent-/, "").slice(0, 100),
+      value: a.channelId,
+      description: `📖 ${formatTokens(a.contextTokens)} (${a.contextPct}%) · 今 ${formatTokens(a.today.tokens)}`.slice(0, 100),
+      emoji: ctxDot(a.contextPct),
+    }));
+  if (!opts.length) return null;
+  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("stats_savecompact")
+      .setPlaceholder("🧹 存记忆 + Compact…（选一个 agent）")
+      .addOptions(opts),
+  );
+}
+
+// ── 上下文阈值提醒 ─────────────────────────────────────────────────────
+// 跨过一档提醒一次（250K/300K/400K/500K/750K），compact 掉下去自动复位、再涨再提醒。
+// bridge 刚启动的第一轮只记 baseline 不提醒，避免每次重启把已超标的 agent 全轰一遍。
+
+const CTX_TIERS = [250_000, 300_000, 400_000, 500_000, 750_000];
+const notifiedTier = new Map<string, number>(); // channelId → 已提醒过的档位（1-based，0=没过档）
+let tierBaselined = false;
+
+function tierOf(tokens: number): number {
+  let t = 0;
+  for (let i = 0; i < CTX_TIERS.length; i++) if (tokens >= CTX_TIERS[i]) t = i + 1;
+  return t;
+}
+
+async function checkContextTiers(discord: Client, agents: AgentStat[]): Promise<void> {
+  const first = !tierBaselined;
+  tierBaselined = true;
+  for (const a of agents) {
+    if (!a.channelId) continue;
+    const tier = tierOf(a.contextTokens);
+    const prev = notifiedTier.get(a.channelId) ?? 0;
+    if (tier === prev) continue;
+    notifiedTier.set(a.channelId, tier); // 涨了记新档；掉了（compact 过）复位
+    if (tier < prev || tier === 0 || first) continue;
+    try {
+      const ch = (await discord.channels.fetch(a.channelId).catch(() => null)) as TextChannel | null;
+      if (!ch || !("send" in ch)) continue;
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`savecompact:${a.channelId}`)
+          .setLabel("🧹 存记忆 + Compact")
+          .setStyle(ButtonStyle.Primary),
+      );
+      await ch.send({
+        content: `⚠️ **${a.name.replace(/^agent-/, "")}** 上下文已到 **${formatTokens(a.contextTokens)}（${a.contextPct}%）**，超过 ${formatTokens(CTX_TIERS[tier - 1])} 档。建议先把关键信息存进记忆再 compact，一键搞定👇`,
+        components: [row as any],
+      });
+      console.log(`📊 上下文档位提醒: ${a.name} → ${formatTokens(a.contextTokens)} (档${tier})`);
+    } catch (e) {
+      console.error(`📊 档位提醒失败 (${a.name}):`, (e as Error).message);
+    }
+  }
+}
+
+async function ensureMessage(
+  discord: Client,
+  channelId: string,
+  embed: EmbedBuilder,
+  extraRows: any[] = [],
+): Promise<string | null> {
   const ch = (await discord.channels.fetch(channelId).catch(() => null)) as TextChannel | null;
   if (!ch || !("send" in ch)) return null;
-  const payload = { embeds: [embed], components: [refreshRow()] };
+  const payload = { embeds: [embed], components: [refreshRow(), ...extraRows] };
   const cfg = await readConfig();
   const existingId = cfg.statsDashboard?.messageId;
   if (existingId) {
@@ -354,7 +428,10 @@ async function doUpdate(discord: Client): Promise<void> {
     const snap = await buildSnapshot();
     const channelId = await ensureChannel(discord);
     if (!channelId) return;
-    await ensureMessage(discord, channelId, renderEmbed(snap));
+    const menu = saveCompactRow(snap.agents);
+    await ensureMessage(discord, channelId, renderEmbed(snap), menu ? [menu] : []);
+    // 上下文跨档提醒（发到各 agent 自己的频道，带一键按钮）
+    await checkContextTiers(discord, snap.agents);
   } catch (e) {
     console.error("📊 看板更新失败:", (e as Error).message);
   } finally {

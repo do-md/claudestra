@@ -583,6 +583,9 @@ async function cmdCreate(
     return;
   }
 
+  // v2.5.4: 会话内补发 /model，确保 pin 真正生效（--model 对 resume 场景不可靠）
+  await enforceSessionModel(tmuxName, model);
+
   // 6. 更新 registry（只有启动成功才落盘）
   const reg = await loadRegistry();
   reg.agents[tmuxName] = {
@@ -767,6 +770,9 @@ async function cmdResume(
     await cleanup(`恢复失败: ${(err as Error).message}`);
     return;
   }
+
+  // v2.5.4: 会话内补发 /model —— resume 是 --model 失效的重灾区（session 保留原模型）
+  await enforceSessionModel(tmuxName, model);
 
   // 更新 registry
   const reg = await loadRegistry();
@@ -1082,6 +1088,38 @@ async function gracefulExit(name: string): Promise<boolean> {
  * 返回 ready（是否就绪）+ recoveredFullSession（是否自动选了「恢复完整会话」，
  * 用于给频道发一条正面"已恢复"信号，取代 watcher 的按钮噪音）。
  */
+/**
+ * v2.5.4: 启动就绪后在会话内补一发 `/model`，强制 pin 的模型真正生效。
+ *
+ * 根因：`--model` 对 `--resume` 的会话经常不生效 —— session 保留它原来的模型，
+ * registry 里的 model 只是"意图"。实测 12 个 agent 里 6 个 registry 写 fable、
+ * 实际还在 opus。会话内 `/model` 是 TUI 层面的切换，可靠且幂等（已在目标模型时
+ * 直接确认不弹框；换模型时弹 "Switch model?" 确认框，❯ 默认在 Yes，Enter 即可）。
+ * 失败不阻塞启动 —— 看板显示的是 jsonl 真相，漂了能看见。
+ */
+async function enforceSessionModel(name: string, model?: string): Promise<boolean> {
+  if (!model?.trim()) return true;
+  const target = windowTarget(name);
+  const resolved = resolveModelAlias(model.trim());
+  try {
+    await tmuxRaw(["send-keys", "-t", target, "-l", `/model ${resolved}`]);
+    await Bun.sleep(400);
+    await tmuxRaw(["send-keys", "-t", target, "Enter"]);
+    for (let i = 0; i < 8; i++) {
+      await Bun.sleep(700);
+      const pane = await captureLast(name, 15);
+      if (/Switch model\?/i.test(pane)) {
+        await tmuxRaw(["send-keys", "-t", target, "Enter"]);
+        continue;
+      }
+      if (/Set model to/i.test(pane)) return true;
+    }
+  } catch {
+    /* 失败不阻塞启动 */
+  }
+  return false;
+}
+
 async function startClaudeInWindow(
   name: string,
   claudeCmd: string
@@ -1227,6 +1265,10 @@ async function cmdRestart(name?: string) {
     });
 
     const started = await startClaudeInWindow(tmuxName, cmd);
+
+    // v2.5.4: 会话内补发 /model，restart 也是 --resume（同样会漂回 session 原模型）
+    if (started.ready) await enforceSessionModel(tmuxName, info.model);
+
     results.push({
       name: tmuxName,
       ok: started.ready,
@@ -1874,11 +1916,19 @@ async function cmdModel(sub: string, ...rest: string[]) {
       }
     }
     await saveRegistry(reg);
+    // v2.5.4: idle 的 agent 顺手在会话内立即生效（忙的跳过，restart 时会补发）
+    const applied: string[] = [];
+    for (const name of changed) {
+      if ((await isAgentIdle(name).catch(() => false)) && (await enforceSessionModel(name, modelVal))) {
+        applied.push(name);
+      }
+    }
     output({
       ok: true,
       model: resolved,
       changed,
-      hint: `已把 ${changed.length} 个 active agent 钉到 ${resolved}。跑 restart（不带名字）全部重启生效。`,
+      appliedLive: applied,
+      hint: `已钉 ${changed.length} 个 active agent 到 ${resolved}；${applied.length} 个 idle 的已当场生效，其余在下次 restart 时自动补发 /model。`,
     });
     return;
   }
@@ -1904,11 +1954,17 @@ async function cmdModel(sub: string, ...rest: string[]) {
   if (!info) { output({ ok: false, error: `找不到 agent: ${tmuxName}` }); return; }
   info.model = modelVal;
   await saveRegistry(reg);
+  // v2.5.4: idle 就当场在会话内生效；忙就等下次 restart 自动补发
+  const appliedLive =
+    (await isAgentIdle(tmuxName).catch(() => false)) && (await enforceSessionModel(tmuxName, modelVal));
   output({
     ok: true,
     agent: tmuxName,
     model: resolveModelAlias(modelVal),
-    hint: `已写入 registry。要让 ${tmuxName} 立即生效，跑: bun src/manager.ts restart ${tmuxName.replace(AGENT_PREFIX, "")}`,
+    appliedLive,
+    hint: appliedLive
+      ? `已写入 registry 并当场生效（会话内 /model）。`
+      : `已写入 registry。agent 正忙，会在下次 restart 时自动补发 /model 生效。`,
   });
 }
 

@@ -2026,12 +2026,10 @@ async function captureChannelScreenshot(channelId: string): Promise<string | nul
 }
 
 /**
- * v2.4.19+ 把 bridge 所在 Mac 的 iTerm2 切到某 channel 对应的 tab。
- * button（focus:）和 /focus slash 命令共用。
- *
- * tmux select-window 只改 tmux 内部 active window —— iTerm CC 模式下每个 tmux
- * window 是原生 tab，tab 焦点归 iTerm 管，得用 AppleScript 按 session 名（CC 模式
- * 显示 "✳ <短名> (node)"）选中 tab。只对 bridge 所在 Mac 有效。
+ * v2.4.19+ 把 iTerm2 切到某 channel 对应的 tmux tab。button（focus:）和 /focus 共用。
+ * 主路径（v2.5.4 定版）：activate 本机 iTerm → tmux select-window → iTerm 自己的
+ * CC 跟随切 tab（前台 1s 内稳定；对远端 ssh -CC attach 的 iTerm 同样生效）。
+ * 位置序号 AppleScript 只做验证失败后的本机兜底。
  */
 async function focusITermTab(targetChannelId: string): Promise<{ ok: boolean; found: boolean; label: string; note: string }> {
   const controlId = process.env.CONTROL_CHANNEL_ID || "";
@@ -2050,66 +2048,81 @@ async function focusITermTab(targetChannelId: string): Promise<{ ok: boolean; fo
     label = agent.name;
   }
 
-  // 先把 tmux 内部 active window 也切过去（保底 + 让 tmux 状态跟 iTerm 一致）
-  await tmuxRaw(["select-window", "-t", targetWindow]).catch(() => {});
+  // v2.5.4 定版方案：**先 activate 再 select-window，让 iTerm 自己的 CC 跟随干活**。
+  //
+  // 实验结论（2026-07-08，逐秒观测）：iTerm CC 模式对 tmux 的 window-changed 通知，
+  // 前台时 1 秒内稳定跟随；后台时 15s+ 有意忽略（spinner 还在动 = 不是卡死/App Nap，
+  // 是防后台抢 tab 焦点的设计）。之前"后台随缘"的根因就是这个 —— 所以把 iTerm 先
+  // activate 到前台再 select-window，跟随就从随缘变确定。这同时惠及**所有** -CC
+  // client：远端设备 ssh attach 的 iTerm（AppleScript 够不着的那台）也收到同一条
+  // select-window 通知，它在用户手上通常本来就是前台 → 一并跟随。
+  // 「位置序号选 tab」降级为验证失败后的兜底（它假设单窗口 + tab 顺序==window 顺序，
+  // 散窗时会错，不再当主路径）。
 
-  // 有没有 control-mode 客户端（= iTerm 正 -CC attach）。没有就没 tab 可切。
+  const idxList = (await tmuxRaw(["list-windows", "-t", MASTER_SESSION, "-F", "#{window_index}"]).catch(() => "")).split("\n").filter(Boolean);
+  const targetIdx = (await tmuxRaw(["display-message", "-p", "-t", targetWindow, "#{window_index}"]).catch(() => "")).trim();
+  const ordinal = idxList.indexOf(targetIdx) + 1; // 1-based 位置（兜底 + 验证用）
+  const tmuxCount = idxList.length;
+
   const clientsOut = await tmuxRaw(["list-clients", "-t", MASTER_SESSION]).catch(() => "");
   const hasCC = /control/.test(clientsOut);
 
-  // v2.4.24: 用「位置序号」定位 tab，不再靠 iTerm 跟随 select-window（后台时 iTerm 会
-  // 忽略），也不靠 session 名字符串匹配（新建 agent 标题是默认 "Claude Code" 会撞名）。
-  // iTerm CC 模式下每个 tmux window 是一个原生 tab，且 tab 顺序跟 `list-windows` 严格
-  // 一致 —— 求出目标在 window 列表里的 1-based 序号，AppleScript 直接 `select tab N`。
-  const idxList = (await tmuxRaw(["list-windows", "-t", MASTER_SESSION, "-F", "#{window_index}"]).catch(() => "")).split("\n").filter(Boolean);
-  const targetIdx = (await tmuxRaw(["display-message", "-p", "-t", targetWindow, "#{window_index}"]).catch(() => "")).trim();
-  const ordinal = idxList.indexOf(targetIdx) + 1; // 1-based 位置
-  const tmuxCount = idxList.length;
+  /** 跑一段 AppleScript，8s 超时 kill（iTerm 无响应时不拖垮 focus）。 */
+  const osaRun = async (script: string): Promise<string> => {
+    const p = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+    const out = await Promise.race([
+      new Response(p.stdout).text().then((t) => t.trim()),
+      new Promise<string>((r) => setTimeout(() => r("timeout"), 8000)),
+    ]);
+    if (out === "timeout") { try { p.kill(); } catch {} }
+    await p.exited.catch(() => {});
+    return out;
+  };
 
+  // 1) iTerm 提到前台（唤醒 CC 跟随）。远程 attach 时本机没开 iTerm 也无妨，照样走 2)。
+  await osaRun('tell application "iTerm2" to activate');
+
+  // 2) 切 tmux window —— 所有 -CC client（本机 + 远端）同时收到通知，前台的会跟。
+  //
+  // 曾把「给远端弹 macOS 通知」的所有路径都实验过（2026-07-08），全部否决，别再试：
+  // - 临时 window 发裸 OSC 9：能弹，但点击必然跳到临时窗口（OSC 9 点击跳发出者 tab）；
+  // - run-shell 注入目标 pane：输出不进 pane 的终端流，通知不发；
+  // - Claude Code `!` bash mode 从目标 pane 发：输出被 CC 捕获渲染在 TUI 里（⎿ 框），
+  //   不写入 pty，OSC 9 到不了 iTerm，还在 agent 会话留痕迹；忙时注入更是排队且不可控。
+  await tmuxRaw(["select-window", "-t", targetWindow]).catch(() => {});
+
+  // 2b) 1.8s 后单次补切（owner 批准，非循环）。对抗 iTerm 的防回显竞态：iTerm 因
+  // App 焦点事件上报自己 tab 时会预扣 _ignoreWindowChangeNotificationCount 计数器
+  // （iTerm2 源码 TmuxController.m），把我们这条切换通知误当回显吃掉，还把旧 tab 回写
+  // 覆盖 tmux（把别的 attach 端拉回去）。补发一次：第一发被误吃时计数器已消耗，第二发
+  // 必然生效；第一发已生效时第二发是 no-op。
+  setTimeout(() => {
+    tmuxRaw(["select-window", "-t", targetWindow]).catch(() => {});
+  }, 1800);
+
+  // 3) 给 1.5s 跟随，然后验证本机 iTerm 的 current tab 序号是否 == 目标序号。
   let outcome = "noattach";
   if (hasCC && ordinal >= 1) {
-    // 找到「承载 tmux tab 的那个 iTerm 窗口」（tab 数正好等于 tmux window 数；退而求其次取 tab 最多的窗口），
-    // 选中第 ordinal 个 tab，再选中该窗口并前置。
-    const script = [
-      'tell application "iTerm2"',
-      '  set targetW to missing value',
-      `  repeat with w in windows`,
-      `    if (count of tabs of w) is ${tmuxCount} then`,
-      '      set targetW to w',
-      '      exit repeat',
-      '    end if',
-      '  end repeat',
-      '  if targetW is missing value then',
-      '    set maxT to 0',
-      '    repeat with w in windows',
-      '      if (count of tabs of w) > maxT then',
-      '        set maxT to (count of tabs of w)',
-      '        set targetW to w',
-      '      end if',
-      '    end repeat',
-      '  end if',
-      '  if targetW is missing value then',
-      '    activate',
-      '    return "nowin"',
-      '  end if',
-      `  if (count of tabs of targetW) < ${ordinal} then`,
-      '    select targetW',
-      '    activate',
-      '    return "outofrange"',
-      '  end if',
-      `  select tab ${ordinal} of targetW`,
-      '  select targetW',
-      '  activate',
-      '  return "ok"',
-      'end tell',
-    ].join("\n");
-    const osa = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
-    outcome = (await new Response(osa.stdout).text()).trim();
-    await osa.exited;
-  } else {
-    // 没 -CC attach 时也把 iTerm 提到前台（用户至少看到 iTerm）
-    const osa = Bun.spawn(["osascript", "-e", 'tell application "iTerm2" to activate'], { stdout: "pipe", stderr: "pipe" });
-    await osa.exited;
+    await new Promise((r) => setTimeout(r, 1500));
+    const idx = await osaRun('tell application "iTerm2" to return index of current tab of current window');
+    if (idx === String(ordinal)) {
+      outcome = "ok";
+    } else {
+      // 4) 没跟上（如本机 iTerm 根本没有 CC 窗口 = 远程 attach）→ 位置序号法兜底强制切。
+      const forced = await osaRun([
+        'tell application "iTerm2"',
+        '  repeat with w in windows',
+        `    if (count of tabs of w) is ${tmuxCount} then`,
+        `      select tab ${ordinal} of w`,
+        '      select w',
+        '      return "ok"',
+        '    end if',
+        '  end repeat',
+        '  return "nolocal"',
+        'end tell',
+      ].join("\n"));
+      outcome = forced || "err";
+    }
   }
 
   const found = outcome === "ok";
@@ -2118,11 +2131,43 @@ async function focusITermTab(targetChannelId: string): Promise<{ ok: boolean; fo
   if (found) {
     note = `🖥 已跳到 **${label}** 的 iTerm tab`;
   } else if (!hasCC) {
-    note = `🖥 iTerm 已前置，但当前没有 -CC attach，无法切 tab（tmux 内部已切到 **${label}**，重连 iTerm 即可）`;
+    note = `🖥 当前没有 -CC attach，无法切 tab（tmux 内部已切到 **${label}**，attach 后可见）`;
+  } else if (outcome === "nolocal") {
+    note = `🖥 tmux 已切到 **${label}**。你像是**远程 attach**（本机没有 CC 窗口）—— 远端 iTerm 前台会自动跟着切，没跟就手动点下 tab`;
+  } else if (outcome === "timeout") {
+    note = `🖥 tmux 已切到 **${label}**，本机 iTerm 的 AppleScript 无响应（超时跳过）。前台 iTerm 会自动跟随`;
   } else {
-    note = `🖥 iTerm 已前置，但没定位到 **${label}** 的 tab（outcome=${outcome}；tmux 内部已切过去）`;
+    note = `🖥 tmux 已切到 **${label}**，但本机 iTerm tab 没跟上（outcome=${outcome}）`;
   }
   return { ok: true, found, label, note };
+}
+
+/**
+ * v2.5.4+ 触发某个 agent 的「存记忆 + Compact」：往它的 tmux 发 /save-compact
+ * （随包 skill：先挑重点存记忆 —— 有 mem0 用 mem0，没有用 CC 自带 memory ——
+ * 再自动安排 /compact）。看板 select 和档位提醒按钮共用。agent 正忙也照发，
+ * TUI 会排队，轮到时执行（跟 cron --target-agent 一个假设）。
+ */
+async function triggerSaveCompact(interaction: any, targetChannelId: string): Promise<void> {
+  try {
+    const listResult = await runManager("list");
+    const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
+    if (!agent) {
+      await interaction.followUp({ content: "❌ 找不到对应 agent（可能已被 kill）", ephemeral: true }).catch(() => {});
+      return;
+    }
+    await tmuxSendLine(`master:${agent.name}`, "/save-compact");
+    console.log(`🧹 save-compact 已发送: ${agent.name} (channel=${targetChannelId})`);
+    await interaction
+      .followUp({
+        content: `🧹 已让 **${String(agent.name).replace(/^agent-/, "")}** 存记忆 + compact（正忙的话会排队，做完它会在自己频道汇报）`,
+        ephemeral: true,
+      })
+      .catch(() => {});
+  } catch (e) {
+    console.error("🧹 save-compact 触发失败:", e);
+    await interaction.followUp({ content: `❌ 触发失败: ${(e as Error).message}`, ephemeral: true }).catch(() => {});
+  }
 }
 
 discord.on("interactionCreate", async (interaction: Interaction) => {
@@ -2289,6 +2334,13 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       // 用量看板「🔄 刷新」按钮 — 强制立即刷新（deferUpdate 已 ack，doUpdate 会编辑消息）
       if (id === "stats_refresh") {
         forceRefreshStatsDashboard(discord).catch((e) => console.error("📊 手动刷新失败:", e));
+        return;
+      }
+
+      // v2.5.4+ 「🧹 存记忆 + Compact」按钮（上下文档位提醒消息上的）
+      if (id.startsWith("savecompact:")) {
+        const targetChannelId = id.slice("savecompact:".length);
+        await triggerSaveCompact(interaction, targetChannelId);
         return;
       }
 
@@ -2781,6 +2833,12 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       const id = interaction.customId;
       const value = interaction.values[0];
       await interaction.deferUpdate().catch(() => {});
+
+      // v2.5.4+ 看板「🧹 存记忆 + Compact」select（value = 目标 agent 的 channelId）
+      if (id === "stats_savecompact") {
+        await triggerSaveCompact(interaction, value);
+        return;
+      }
 
       // v2.0.19+: AskUserQuestion 的 select menu —— 用户选完更新 state，等 Submit 按钮
       // 一并把 selections 翻译成 keystroke 发到 TUI。
