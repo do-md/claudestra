@@ -142,7 +142,6 @@ interface ClientInfo {
 // ============================================================
 
 const clients = new Map<string, ClientInfo>();
-const activeStatusMessages = new Map<string, string>();
 
 /**
  * 记 "Discord 入站消息转发到某个 channel-server，turn 结果还没回到 Discord" 的
@@ -373,8 +372,6 @@ function clearInterAgentPendingsForChannel(channelId: string): number {
   return n;
 }
 
-const typingSafetyTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const TYPING_SAFETY_TIMEOUT_MS = 30 * 60 * 1000; // 30 分钟
 
 // ============================================================
 // v2.0.0+ 路由抽象
@@ -390,7 +387,18 @@ import type {
 } from "./bridge/router.js";
 import { endpointLabel, envelopeLabel, newThreadId, parseChatId } from "./bridge/router.js";
 // v2.6.0+ C1：出站按 transport 分发（设计 §6）
-import { registerAdapter, adapterFor, type ChatAdapter } from "./bridge/adapters.js";
+import { registerAdapter, adapterFor } from "./bridge/adapters.js";
+// v2.6.0+ C2-4：Discord 前端 UI 归属模块（typing / status 消息 / 完成通知 / 按钮）
+import {
+  createDiscordChatAdapter,
+  beginTypingWithSafety,
+  clearSafetyTimer,
+  trackStatusMessage,
+  statusMessageIdFor,
+  finishStatusMessage,
+  agentActionButtons,
+  randomUmaDone,
+} from "./bridge/discord-adapter.js";
 
 /**
  * v2.0.0+ 统一消息投递入口。所有 bridge 的出入站消息（messageCreate 路由 /
@@ -970,172 +978,10 @@ async function renderAgentExchangeToMasterHeader(env: RouterEnvelope): Promise<s
   return env.content;
 }
 
-// 任务完成语（只留抽象搞笑的）
-const UMA_DONE_MESSAGES = [
-  // 复读机系列
-  "哈基米哈基米哈基米哈基米",
-  "哈基米…哈基米…（倒地）",
-  "哈基米（沉思）",
-  "我哈基米完了",
-  "哈？基？米？",
-  "不要叫我哈基米叫我哈尼",
-  "曼波。（转身离开）",
-  "这活干得我都想曼波了",
-  "搞定了别催了你再催我曼波了",
-  "曼波一下怎么了曼波一下又不会怀孕",
-  "曼波是一种精神状态",
-  "うまぴょいうまぴょいうまぴょいうまぴょい",
-  // 马叫/发癫系列
-  "呜嘶～～～～～",
-  "嘶哈嘶哈嘶哈完事了",
-  "嘶。（简洁有力）",
-  "（发出了马的声音）",
-  "嘶嘶嘶别摸我我还没缓过来",
-  "嗷呜——等等我不是狼我是马",
-  // 括号动作系列
-  "（甩尾巴）",
-  "（原地转了三圈然后躺下了）",
-  "（做了一个帅气的pose但是没人看到）",
-  "（刨地）",
-  "（耳朵竖起来了）",
-  "（耳朵耷拉下去了）",
-  "（假装若无其事地舔了一下屏幕）",
-  "（已读）",
-  "草（物理意义上的草）（然后吃掉了）",
-  // 身份危机系列
-  "我不是马我是驴（不是）",
-  "等等我到底是AI还是马",
-  "说起来我有蹄子怎么打字的",
-  // 互联网梗系列
-  "寄",
-  "差不多得了😇",
-  "我超！结束了！",
-  "6",
-  "笑死 根本不难好吧",
-  "就这？就这？？",
-  "赢麻了赢麻了",
-  "难绷 但是跑完了",
-  "你说得对 但是我已经做完了",
-  "鉴定为：完成了",
-  "这波啊 这波是直接秒了",
-  "但是又如何呢（做完了）",
-  "有一说一 确实做完了",
-  "听我说谢谢你——算了不唱了",
-  "完了完了（物理意义上的完了）",
-  "急了急了 谁急了？反正不是我 我做完了",
-  // 哲学系列
-  "完成了。但完成的意义是什么呢。算了不想了",
-  "如果一匹马在赛道上完成了任务 但是没人知道 那它算完成了吗",
-  "做完了。突然觉得有点空虚。再来？",
-  "世界上有两种马 做完活的和没做完活的 我是前者",
-  // 长的无厘头
-  "报告训练员 本马娘已完成任务 请求批准吃三根胡萝卜 两块方糖 以及摸摸头",
-  "我宣布 在座的各位 都没我跑得快 因为我已经到终点了",
-  "做完了做完了 你不夸我一句吗 你怎么不说话 你是不是不爱我了",
 
-  // ───── 第二批补充 50 条 ─────
-
-  // 复读机 2
-  "哈基米是一种生活态度",
-  "哈什么基什么米什么",
-  "哈基曼波 曼波哈基 哈曼基波",
-  "曼波 ≠ 曼波 ≈ 曼波",
-  "曼曼波波曼曼波",
-  // 马叫 2
-  "嗷！！（没有理由的嗷）",
-  "嘶啊——（突然吓到自己）",
-  "咴咴咴咴咴",
-  "嘘——（我在偷偷完成）",
-  // 括号动作 2
-  "（把任务卷起来吃了）",
-  "（对着空气鞠了一躬）",
-  "（试图用蹄子打响指 失败）",
-  "（深吸一口气 吐出彩虹）",
-  "（把自己叠成纸飞机飞走了）",
-  "（和自己的影子击了个掌）",
-  "（做了一个 spin attack）",
-  "（走了 但是是倒着走的）",
-  "（装作没完成的样子完成了）",
-  "（眨眼 慢动作）",
-  "（把键盘藏起来假装没动过）",
-  // 身份危机 2
-  "等等 我是不是在梦里完成的",
-  "我刚才是不是死了一下又复活了",
-  "我是谁 我在哪 我做完了什么",
-  "我感觉有三个我 他们都说做完了",
-  "如果我是你 我也会说我做完了",
-  // 互联网梗 2
-  "这活啊 是真活",
-  "我 做完了 怎么了",
-  "任务：完成 情绪：未知",
-  "确认收货 给五星好评",
-  "你礼貌吗？但是我做完了",
-  "这事有蹊跷 但是做完了",
-  "大无语事件 做完了",
-  "我直接裂开 但是是裂开着做完的",
-  "啊？什么？完了？完了",
-  "不会吧不会吧 真有人这么快就做完了",
-  "蚌埠住了（真的做完了）",
-  "这届任务不行（但是做完了）",
-  "老登做完了",
-  "妈耶 这都能做完",
-  "做了个寂寞 啊不是 做完了",
-  "我是懂做任务的",
-  "完成度 100% 精神度 0%",
-  "刚才那个是谁做完的 哦是我啊",
-  // 哲学/玄学 2
-  "完成的尽头是什么 是又一个完成",
-  "道可道 非常道 完成可完成 非常完成",
-  "有人问我完成是什么 我说是一种震动",
-  "活着就是为了完成 完成就是为了活着",
-  "量子力学告诉我 我既完成了又没完成",
-  // 长抽象 2
-  "这个任务 我仔细一看 里面写着两个字 完成 然后我就完成了",
-  "想了一整晚 最后决定 还是完成一下吧 你开心就好",
-];
-
-function randomUmaDone(): string {
-  return UMA_DONE_MESSAGES[Math.floor(Math.random() * UMA_DONE_MESSAGES.length)];
-}
-
-/** 开始 typing + 设置安全超时 */
+/** 开始 typing + 30min 安全超时（实现在 discord-adapter，这里注入 owner mention） */
 function startTypingWithSafety(channelId: string) {
-  startTyping(channelId, discord);
-  // 清除旧的安全计时器
-  const old = typingSafetyTimers.get(channelId);
-  if (old) clearTimeout(old);
-  // 30 分钟后强制停止 typing（兜底 hooks 失败的情况）
-  const timer = setTimeout(() => {
-    stopTyping(channelId);
-    typingSafetyTimers.delete(channelId);
-    const statusMsgId = activeStatusMessages.get(channelId);
-    if (statusMsgId) {
-      discord.channels.fetch(channelId).then((ch) => {
-        if (ch && "messages" in ch) {
-          const textCh = ch as TextChannel;
-          textCh.messages.fetch(statusMsgId).then((sm) => {
-            sm.edit({ content: "⏰ 超时自动停止", components: [] }).catch(() => {});
-          }).catch(() => {});
-          // 发新消息通知用户
-          const mention = primaryOwnerId() ? `<@${primaryOwnerId()}>` : "";
-          if (mention) {
-            textCh.send(`⏰ 超时自动停止 ${mention}`).catch(() => {});
-          }
-        }
-      }).catch(() => {});
-      activeStatusMessages.delete(channelId);
-    }
-  }, TYPING_SAFETY_TIMEOUT_MS);
-  typingSafetyTimers.set(channelId, timer);
-}
-
-/** 清除安全超时（在 hook 或手动停止时调用） */
-function clearSafetyTimer(channelId: string) {
-  const timer = typingSafetyTimers.get(channelId);
-  if (timer) {
-    clearTimeout(timer);
-    typingSafetyTimers.delete(channelId);
-  }
+  beginTypingWithSafety(discord, channelId, () => (primaryOwnerId() ? `<@${primaryOwnerId()}>` : ""));
 }
 
 // ============================================================
@@ -1156,21 +1002,7 @@ const discord = new Client({
 // —— 挪壳不挪逻辑：分块 / reply_to / components 渲染 / files 都在 discordReply
 // 里，本来就是 Discord 专属职责。send 时 discord client 已 ready（消息只会在
 // ready 后流动）。
-registerAdapter({
-  transport: "discord",
-  caps: { maxTextLen: 2000, buttons: true, edit: true, files: true, typing: true },
-  async send(destId, msg) {
-    const ids = await discordReply(
-      discord,
-      destId,
-      msg.text,
-      msg.replyTo,
-      msg.components as any,
-      msg.files,
-    );
-    return { messageIds: ids || [] };
-  },
-} satisfies ChatAdapter);
+registerAdapter(createDiscordChatAdapter(discord));
 
 discord.once("ready", async () => {
   setBotUserId(discord.user?.id || "");
@@ -1767,15 +1599,7 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
   // 清理上一轮状态 + 重置 tool 追踪
   stopTyping(channelId);
   clearSafetyTimer(channelId);
-  const oldStatusId = activeStatusMessages.get(channelId);
-  if (oldStatusId) {
-    try {
-      const ch = await discord.channels.fetch(channelId) as TextChannel;
-      const sm = await ch.messages.fetch(oldStatusId);
-      await sm.edit({ content: t("✅ 完成", "✅ Done"), components: [] });
-    } catch { /* non-critical */ }
-    activeStatusMessages.delete(channelId);
-  }
+  await finishStatusMessage(discord, channelId, t("✅ 完成", "✅ Done"));
   resetToolTracking(channelId);
   startTypingWithSafety(channelId);
   // 状态消息走 deliver(bridge → user)。discordReply 内部会 buildComponents +
@@ -1794,7 +1618,7 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
     },
   });
   if (statusDelivery.outcome.kind === "sent" && statusDelivery.outcome.discordMessageIds?.[0]) {
-    activeStatusMessages.set(channelId, statusDelivery.outcome.discordMessageIds[0]);
+    trackStatusMessage(channelId, statusDelivery.outcome.discordMessageIds[0]);
   }
 
   // 转发给 channel-server
@@ -2252,15 +2076,6 @@ async function scopePeerToAgentExchange(
  * 不用翻 pin（pin 弹窗里按钮 Discord 点不动）、不用打 /focus。
  * withInterrupt=true 时带打断（工作中），完成态不带。
  */
-function agentActionButtons(channelId: string, withInterrupt: boolean): any[] {
-  const buttons: any[] = [];
-  if (withInterrupt) {
-    buttons.push({ id: `interrupt:${channelId}`, label: t("打断", "Interrupt"), emoji: "⚡", style: "danger" });
-  }
-  buttons.push({ id: `focus:${channelId}`, label: t("跳转", "Focus"), emoji: "🖥", style: "secondary" });
-  buttons.push({ id: `screenshot:${channelId}`, label: t("截图", "Shot"), emoji: "📸", style: "secondary" });
-  return [{ type: "buttons", buttons }];
-}
 
 /** v2.4.22+ button 触发截图（复用 /screenshot slash 的逻辑）。返回 png 路径或 null。 */
 async function captureChannelScreenshot(channelId: string): Promise<string | null> {
@@ -2466,15 +2281,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
           Bun.spawn(["tmux", "-S", TMUX_SOCK, "send-keys", "-t", `master:${agent.name}`, "C-c"]);
           stopTyping(channelId);
           clearSafetyTimer(channelId);
-          const statusMsgId = activeStatusMessages.get(channelId);
-          if (statusMsgId) {
-            try {
-              const ch = await discord.channels.fetch(channelId) as TextChannel;
-              const sm = await ch.messages.fetch(statusMsgId);
-              await sm.edit({ content: t("⚡ 已打断", "⚡ Interrupted"), components: [] });
-            } catch { /* non-critical */ }
-            activeStatusMessages.delete(channelId);
-          }
+          await finishStatusMessage(discord, channelId, t("⚡ 已打断", "⚡ Interrupted"));
           await interaction.reply("⚡ 已发送 Ctrl+C");
         } else {
           await interaction.reply("⚠️ 当前频道没有关联的 agent");
@@ -2813,15 +2620,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
           console.log(`⚡ C-c 已发送给 ${agentLabel}`);
           recordMetric("agent_interrupt", { channelId: targetChannelId, agent: agentLabel, meta: { trigger: "button" } });
 
-          const statusMsgId = activeStatusMessages.get(targetChannelId);
-          if (statusMsgId) {
-            try {
-              const ch = await discord.channels.fetch(targetChannelId) as TextChannel;
-              const sm = await ch.messages.fetch(statusMsgId);
-              await sm.edit({ content: t("⚡ 已打断", "⚡ Interrupted"), components: [] });
-            } catch { /* non-critical */ }
-            activeStatusMessages.delete(targetChannelId);
-          }
+          await finishStatusMessage(discord, targetChannelId, t("⚡ 已打断", "⚡ Interrupted"));
           stopTyping(targetChannelId);
           clearSafetyTimer(targetChannelId);
         } catch (e) {
@@ -3045,18 +2844,13 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         }).catch(() => {});
       } catch { /* non-critical */ }
 
-      // 切换 activeStatusMessages 到这条点击的消息，旧的清成"✅ 完成"
+      // 切换 status 簿记到这条点击的消息，旧的清成"✅ 完成"
       stopTyping(channelId);
       clearSafetyTimer(channelId);
-      const oldStatusId = activeStatusMessages.get(channelId);
-      if (oldStatusId && oldStatusId !== clickedMsgId) {
-        try {
-          const ch = (await discord.channels.fetch(channelId)) as TextChannel;
-          const sm = await ch.messages.fetch(oldStatusId);
-          await sm.edit({ content: t("✅ 完成", "✅ Done"), components: [] });
-        } catch { /* non-critical */ }
+      if (statusMessageIdFor(channelId) !== clickedMsgId) {
+        await finishStatusMessage(discord, channelId, t("✅ 完成", "✅ Done"));
       }
-      if (clickedMsgId) activeStatusMessages.set(channelId, clickedMsgId);
+      if (clickedMsgId) trackStatusMessage(channelId, clickedMsgId);
       resetToolTracking(channelId);
       startTypingWithSafety(channelId);
       await deliver({
@@ -4773,16 +4567,7 @@ async function handleHookRequest(req: Request): Promise<Response> {
       // v2.4.22+ 去掉 interrupt（活干完了），但**保留 focus + screenshot 按钮** ——
       // 这条消息永远在频道底部附近，用户随手能点跳 tab / 截图，不用翻 pin 或打命令。
       for (const cid of channelsToClear) {
-        const statusMsgId = activeStatusMessages.get(cid);
-        if (!statusMsgId) continue;
-        try {
-          const ch = await discord.channels.fetch(cid);
-          if (ch && "messages" in ch) {
-            const sm = await (ch as TextChannel).messages.fetch(statusMsgId);
-            await sm.edit({ content: t("✅ 完成", "✅ Done"), components: buildComponents(agentActionButtons(cid, false)) });
-          }
-        } catch { /* non-critical */ }
-        activeStatusMessages.delete(cid);
+        await finishStatusMessage(discord, cid, t("✅ 完成", "✅ Done"), agentActionButtons(cid, false));
       }
 
       // 发完成通知 @ user（仅 Stop/StopFailure）。watcher 已经把 agent 的消息推
