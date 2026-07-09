@@ -291,11 +291,20 @@ async function deliverToUser(env, to) {
 （内部还是现在的 discordReply，只是挪个壳）。**C1 之后接入 Telegram 就是纯增量**：
 实现 ChatAdapter + 在 principals.json 加身份 + 配置 agent 绑定，核心零改动。
 
-### C2（可缓，渐进）：全面收编
+### C2（owner 2026-07-09 提前立项，首批已完成）：全面收编
 
-把 messageCreate 入站、typing、status 消息、slash、管理按钮等 Discord 专属逻辑逐步
-挪进 discord-adapter 模块。**纯重构、无用户价值，按「顺手改到就挪」的节奏做，
-不专门立项**——避免大爆炸重构（v2.0.0 迁移的教训：一个场景一个场景挪）。
+原计划渐进（D8），owner 审阅「真残留清单」后要求立项清理。首批五项已落地：
+- **C2-1** master 身份判断集中（isMasterChannel / isMasterWs / agentLabelForChannel）
+- **C2-2** fetch_messages/react/edit_message 对非 discord 会话明确报错（原静默失败）
+- **C2-3** Discord 用户鉴权统一走 principals.json（.env ALLOWED_USER_IDS 启动幂等
+  seed 成 discord:<uid> role:owner，保留 fallback；加/禁用户改 principals 即可）
+- **C2-4** typing 生命周期 / 💭 status 消息簿记 / uma 完成语录 / 操作按钮全部迁入
+  `bridge/discord-adapter.ts`，bridge.ts 只留薄包装
+- **C2-5** ChatAdapter 加 provisionConversation：create 的建频道走 adapter 接口
+  （ws 协议名不变），纯 API agent 只差一个 provisioner
+
+仍留在 bridge.ts 的 Discord 逻辑（messageCreate 入站、slash、管理按钮 interaction）
+继续按「顺手改到就挪」处理。已知无解：AUQ/权限确认的 tmux modal 只有 owner 能按。
 
 ### Telegram adapter 蓝图（future，不在本次范围，写此证明接口够用）
 
