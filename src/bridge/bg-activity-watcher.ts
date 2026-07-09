@@ -72,6 +72,8 @@ const seen = new Set<string>();
 const shellCandidates = new Map<string, number>();
 const SHELL_CONFIRM_TIMEOUT_MS = 60_000;
 let baselined = false;
+let ticking = false; // tick 重入保护：首轮 baseline 超过 POLL_MS 时 interval 会并发进入
+let tickCount = 0;
 
 // ── 目录定位 ───────────────────────────────────────────────────────────
 
@@ -296,6 +298,16 @@ async function finalize(act: Activity, reason = "结束"): Promise<void> {
 // ── 主循环 ─────────────────────────────────────────────────────────────
 
 async function tick(): Promise<void> {
+  if (ticking) return; // 上一轮还没跑完（首轮 baseline 慢时尤其关键，否则存量文件被当新文件重播）
+  ticking = true;
+  try {
+    await tickInner();
+  } finally {
+    ticking = false;
+  }
+}
+
+async function tickInner(): Promise<void> {
   const agents = await readRegistryAgents();
   const first = !baselined;
   baselined = true;
@@ -342,6 +354,11 @@ async function tick(): Promise<void> {
     if (!act.finished && Date.now() - act.lastGrowth > IDLE_DONE_MS) {
       await finalize(act).catch(() => {});
     }
+  }
+
+  // seen 集合瘦身（约每小时一次）：源文件已被清理的条目不会再出现，安全移除
+  if (++tickCount % 360 === 0) {
+    for (const f of seen) if (!existsSync(f)) seen.delete(f);
   }
 }
 
