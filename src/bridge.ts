@@ -197,6 +197,31 @@ async function getLocalAgentExchangeId(): Promise<string> {
   return _cachedAgentExchangeId;
 }
 
+// ============================================================
+// v2.6.0+ C2-1：master 身份判断集中（原先 20 处散落的
+// `=== CONTROL_CHANNEL_ID` 比较）。master 的"身份"目前实现为
+// 「#control 频道的 agent」（ws 同时挂 #control 和 #agent-exchange 两个 id）。
+// 将来引入非 Discord 的 master 标识时只改这三个 helper。
+// ============================================================
+
+/** channelId 是否指向 master（#control 或 我方 #agent-exchange） */
+async function isMasterChannel(channelId: string): Promise<boolean> {
+  if (!channelId) return false;
+  if (channelId === CONTROL_CHANNEL_ID) return true;
+  const ex = await getLocalAgentExchangeId();
+  return !!ex && channelId === ex;
+}
+
+/** 该 ws 是否 master 的连接 */
+function isMasterWs(ws: ServerWebSocket<unknown>): boolean {
+  return !!CONTROL_CHANNEL_ID && clients.get(CONTROL_CHANNEL_ID)?.ws === ws;
+}
+
+/** 事件流 / 日志用的 agent 标签（master 特判，查不到用 "?"） */
+function agentLabelForChannel(channelId: string): string {
+  return agentNameForChannel(channelId) || (channelId === CONTROL_CHANNEL_ID ? "master" : "?");
+}
+
 /**
  * v1.9.21+ send_to_agent 推回机制：记录一条 outstanding send_to_agent 调用，
  * 当 target agent 下一次 reply 到自己 channel 时，bridge 自动把那段文字也 push
@@ -354,9 +379,7 @@ async function deliver(env: RouterEnvelope): Promise<RouterDelivery> {
   //    (master 的 client 在 clients 里 channelId 可能是 CONTROL 或 agent-exchange
   //    id，两个都算 master。)
   if (env.from.kind === "peer" && env.to.kind === "local") {
-    const localAgentExchangeId = await getLocalAgentExchangeId();
-    const toIsMaster = env.to.channelId === CONTROL_CHANNEL_ID ||
-      (!!localAgentExchangeId && env.to.channelId === localAgentExchangeId);
+    const toIsMaster = await isMasterChannel(env.to.channelId);
     if (!toIsMaster) {
       try {
         const { readPeers } = await import("./lib/peers.js");
@@ -516,7 +539,7 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
     to.ws.send(JSON.stringify({ type: "message", content, meta }));
     // v2.6.0+ 事件埋点：入站消息镜像 + agent 进入思考态（旁路，不影响主流程）
     {
-      const evAgent = to.agentName || agentNameForChannel(to.channelId) || (to.channelId === CONTROL_CHANNEL_ID ? "master" : "?");
+      const evAgent = to.agentName || agentLabelForChannel(to.channelId);
       emitEvent({ agent: evAgent, chatId: to.channelId, type: "chat_message", data: { direction: "in", from: meta.user || "?", text: env.content, threadId: env.meta.threadId } });
       emitEvent({ agent: evAgent, chatId: to.channelId, type: "agent_status", data: { status: "thinking" } });
     }
@@ -631,7 +654,7 @@ async function deliverToUser(env: RouterEnvelope, to: RouterUserEndpoint): Promi
     // 是 Discord channel id，别的 transport 没有"用户频道=agent 频道"的重合）
     if (env.from.kind === "local" && dest.transport === "discord") {
       const fromLocal = env.from;
-      const isFromMaster = !!CONTROL_CHANNEL_ID && clients.get(CONTROL_CHANNEL_ID)?.ws === fromLocal.ws;
+      const isFromMaster = isMasterWs(fromLocal.ws);
       const targetClient = clients.get(to.channelId);
       // v2.5.5: fromLocal.channelId 为空 = 发送方不是任何已注册的 agent，而是
       // manager/cron 的临时 bridge-client 连接（restart 完成通知、cron 播报这类
@@ -747,10 +770,7 @@ async function renderContentForLocal(env: RouterEnvelope): Promise<string> {
   const fromChannelId = from.kind === "user" ? from.channelId : from.sharedChannelId;
   const localAgentExchangeId = await getLocalAgentExchangeId();
   const isAgentExchange = !!localAgentExchangeId && fromChannelId === localAgentExchangeId;
-  const isMaster = env.to.kind === "local" && (
-    env.to.channelId === CONTROL_CHANNEL_ID ||
-    (!!localAgentExchangeId && env.to.channelId === localAgentExchangeId)
-  );
+  const isMaster = env.to.kind === "local" && (await isMasterChannel(env.to.channelId));
 
   if (isAgentExchange && isMaster) {
     // 我方 #agent-exchange → master：master 的职责是挑 agent 再 send_to_agent，不是自答
@@ -1900,7 +1920,7 @@ async function ensurePeerMentions(discord: Client, channelId: string, text: stri
 
 // 工具：往 master 控制频道发一条通知（系统广播，bridge → user 信道）
 async function notifyMaster(content: string): Promise<void> {
-  const controlChannelId = process.env.CONTROL_CHANNEL_ID || "";
+  const controlChannelId = CONTROL_CHANNEL_ID;
   if (!controlChannelId) return;
   try {
     await deliver({
@@ -2051,7 +2071,7 @@ discord.on("guildMemberAdd", async (member) => {
   });
   // 5. master 如果已经连着，把 #agent-exchange 挂到 master ws 上（让 master 收这里的消息）
   if (exchange) {
-    const controlId = process.env.CONTROL_CHANNEL_ID || "";
+    const controlId = CONTROL_CHANNEL_ID;
     const master = clients.get(controlId);
     if (master) {
       clients.set(exchange.id, { ws: master.ws, channelId: exchange.id, userId: master.userId });
@@ -2221,7 +2241,7 @@ async function captureChannelScreenshot(channelId: string): Promise<string | nul
  * 位置序号 AppleScript 只做验证失败后的本机兜底。
  */
 async function focusITermTab(targetChannelId: string): Promise<{ ok: boolean; found: boolean; label: string; note: string }> {
-  const controlId = process.env.CONTROL_CHANNEL_ID || "";
+  const controlId = CONTROL_CHANNEL_ID;
   let targetWindow: string;
   let label: string;
   if (targetChannelId === controlId) {
@@ -2552,7 +2572,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         const targetWindow = rest.slice(0, idx);
         const ccText = decodeURIComponent(rest.slice(idx + 1));
         const agentName = targetWindow.replace(/^master:/, "");
-        const controlChannelId = process.env.CONTROL_CHANNEL_ID || "";
+        const controlChannelId = CONTROL_CHANNEL_ID;
         if (!controlChannelId) {
           await interaction.followUp({ content: "❌ 未配置 CONTROL_CHANNEL_ID，无法升级", ephemeral: true }).catch(() => {});
           return;
@@ -2716,7 +2736,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         try {
           // master (CONTROL_CHANNEL_ID) 和 #agent-exchange 都 route 到 master:0，
           // 但它们不在 registry.json 里 —— 直接认定目标是 master:0，不用查 registry
-          const controlId = process.env.CONTROL_CHANNEL_ID || "";
+          const controlId = CONTROL_CHANNEL_ID;
           const { readPeers } = await import("./lib/peers.js");
           const peers = await readPeers().catch(() => ({ localAgentExchangeId: "" } as any));
           const exchangeId = (peers as any).localAgentExchangeId || "";
@@ -3138,7 +3158,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
       // v1.9.0+: master 注册 CONTROL_CHANNEL_ID 时，顺便也把 #agent-exchange 指向同一个 ws
       // 这样 peer 在 #agent-exchange 里说的话也由 master 处理（不额外建 session）
-      if (msg.channelId === (process.env.CONTROL_CHANNEL_ID || "")) {
+      if (msg.channelId === CONTROL_CHANNEL_ID && CONTROL_CHANNEL_ID) {
         try {
           const { readPeers } = await import("./lib/peers.js");
           const peers = await readPeers();
@@ -3242,7 +3262,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
         // v2.6.0+ 事件埋点：agent 的正式回复镜像（out）
         {
-          const evAgent = agentNameForChannel(fromChannelId) || (fromChannelId === CONTROL_CHANNEL_ID ? "master" : "?");
+          const evAgent = agentLabelForChannel(fromChannelId);
           emitEvent({ agent: evAgent, chatId: msg.chatId, type: "chat_message", data: { direction: "out", from: evAgent, text, threadId: env.meta.threadId } });
         }
 
@@ -4399,7 +4419,7 @@ async function handleHookRequest(req: Request): Promise<Response> {
       if (event === "Stop" || event === "StopFailure" || event === "stop") {
         updateStatsDashboard(discord);
         // v2.6.0+ 事件埋点：turn 结束（在去抖/通知判断之前 —— 事件流忠实反映 hook）
-        const evAgent = agentNameForChannel(channelId) || (channelId === CONTROL_CHANNEL_ID ? "master" : "?");
+        const evAgent = agentLabelForChannel(channelId);
         emitEvent({ agent: evAgent, chatId: channelId, type: "agent_status", data: { status: "done" } });
       }
       // typing + safety timer：本 channel + 共享 ws 的所有 channel 都停（参见
