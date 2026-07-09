@@ -13,7 +13,7 @@
 
 import type { Client, TextChannel } from "discord.js";
 import { startTyping, stopTyping, buildComponents } from "./components.js";
-import { discordReply } from "./discord-api.js";
+import { discordReply, discordCreateChannel } from "./discord-api.js";
 import { t } from "../lib/i18n.js";
 import type { ChatAdapter } from "./adapters.js";
 
@@ -35,6 +35,10 @@ export function createDiscordChatAdapter(discord: Client): ChatAdapter {
         msg.files,
       );
       return { messageIds: ids || [] };
+    },
+    async provisionConversation(name, opts) {
+      const channelId = await discordCreateChannel(discord, name, opts?.category);
+      return { chatId: channelId };
     },
   };
 }

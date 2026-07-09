@@ -37,6 +37,12 @@ export interface ChatAdapter {
   send(destId: string, msg: NeutralMessage): Promise<{ messageIds: string[] }>;
   edit?(destId: string, messageId: string, msg: NeutralMessage): Promise<void>;
   typing?(destId: string, on: boolean): void;
+  /**
+   * v2.6.0+ C2-5：为一个 agent 供给「主会话地址」（Discord = 建频道并返回
+   * channelId）。manager create 流程经 bridge 调这里，不再硬编码平台。将来
+   * 「纯 API agent」= 一个返回虚拟地址的 provisioner，create 流程零改动。
+   */
+  provisionConversation?(name: string, opts?: { category?: string }): Promise<{ chatId: string }>;
 }
 
 const adapters = new Map<string, ChatAdapter>();

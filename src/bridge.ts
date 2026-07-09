@@ -3213,7 +3213,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "create_channel": {
       try {
-        const channelId = await discordCreateChannel(discord, msg.name, msg.category);
+        // v2.6.0+ C2-5：会话地址供给走 adapter（ws 消息类型保留老名字做协议兼容）。
+        // 将来纯 API agent = 换一个 provisioner，manager create 流程零改动。
+        const adapter = adapterFor("discord");
+        if (!adapter?.provisionConversation) throw new Error("discord adapter 不支持 provisionConversation");
+        const { chatId: channelId } = await adapter.provisionConversation(msg.name, { category: msg.category });
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { channelId } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
