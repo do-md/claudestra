@@ -404,7 +404,7 @@ When a user selects from a menu, you'll receive: [select:unique_id:selected_valu
     {
       name: "fetch_messages",
       description:
-        "Fetch recent messages from a Discord channel. Returns oldest-first.",
+        "Fetch recent messages from a Discord channel. Returns oldest-first. 仅 Discord 会话可用；api: 前缀的会话没有消息历史语义。",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -422,7 +422,7 @@ When a user selects from a menu, you'll receive: [select:unique_id:selected_valu
     },
     {
       name: "react",
-      description: "Add an emoji reaction to a message.",
+      description: "Add an emoji reaction to a message. 仅 Discord 会话可用（chat_id 为 api: 前缀时会报错，直接 reply 即可）。",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -438,7 +438,7 @@ When a user selects from a menu, you'll receive: [select:unique_id:selected_valu
     },
     {
       name: "edit_message",
-      description: "Edit a previously sent bot message.",
+      description: "Edit a previously sent bot message. 仅 Discord 会话可用；API 会话的消息发出后不可编辑，需更正就再 reply 一条。",
       inputSchema: {
         type: "object" as const,
         properties: {

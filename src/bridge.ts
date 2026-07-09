@@ -3335,7 +3335,14 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "fetch_messages": {
       try {
-        const result = await discordFetchMessages(discord, msg.channel, msg.limit);
+        // v2.6.0+ C2-2：这仨工具是 Discord 语义。api:/telegram: 会话没有"消息
+        // 历史/表情/编辑"的等价物 —— 明确报错，别让 agent 拿到静默失败瞎猜。
+        const dest = parseChatId(String(msg.channel || ""));
+        if (dest.transport !== "discord") {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: `fetch_messages 仅支持 Discord 会话（收到 ${dest.transport}: 前缀地址）。API 会话请直接 reply，对方消息会作为新的 user 消息进来。` }));
+          break;
+        }
+        const result = await discordFetchMessages(discord, dest.id, msg.limit);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3345,7 +3352,12 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "react": {
       try {
-        await discordReact(discord, msg.chatId, msg.messageId, msg.emoji);
+        const dest = parseChatId(String(msg.chatId || ""));
+        if (dest.transport !== "discord") {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: `react 仅支持 Discord 会话（收到 ${dest.transport}: 前缀地址），非 Discord 会话无表情语义，直接 reply 即可。` }));
+          break;
+        }
+        await discordReact(discord, dest.id, msg.messageId, msg.emoji);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3355,7 +3367,12 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "edit_message": {
       try {
-        await discordEditMessage(discord, msg.chatId, msg.messageId, msg.text);
+        const dest = parseChatId(String(msg.chatId || ""));
+        if (dest.transport !== "discord") {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: `edit_message 仅支持 Discord 会话（收到 ${dest.transport}: 前缀地址），API 会话的消息发出后不可编辑，需更正就再 reply 一条。` }));
+          break;
+        }
+        await discordEditMessage(discord, dest.id, msg.messageId, msg.text);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
