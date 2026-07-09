@@ -52,6 +52,7 @@ import {
   listModelAliases,
 } from "./lib/claude-launch.js";
 import { printTmuxGuide } from "./lib/tmux-guide.js";
+import { projectsSlug } from "./lib/jsonl-cost.js";
 
 const REGISTRY_PATH = `${process.env.HOME}/.claude-orchestrator/registry.json`;
 const BRIDGE_URL = process.env.BRIDGE_URL || "ws://localhost:3847";
@@ -1046,8 +1047,7 @@ const hasPromptToConfirm = (pane: string) => isAutoConfirmableModal(pane);
 
 /** cwd → ~/.claude/projects/<slug>/（slug 规则与 jsonl-watcher.getJsonlPath 一致） */
 function projectsDirFor(cwd: string): string {
-  const dir = "-" + cwd.replace(/^\//, "").replace(/\//g, "-");
-  return join(process.env.HOME || "~", ".claude", "projects", dir);
+  return join(process.env.HOME || "~", ".claude", "projects", projectsSlug(cwd));
 }
 
 async function listSessionJsonls(cwd: string): Promise<Set<string>> {

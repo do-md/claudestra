@@ -6,7 +6,7 @@
  * cache_read_input_tokens, output_tokens }`。按 model 分类累加。
  */
 
-import { existsSync, readdirSync } from "fs";
+import { existsSync, readdirSync, realpathSync } from "fs";
 
 export interface Usage {
   input: number;
@@ -61,12 +61,28 @@ export async function rollupJsonl(path: string, sinceTs = 0): Promise<ModelUsage
 }
 
 /**
+ * cwd → Claude Code projects 目录 slug（"-" + 去掉开头 / 后把 / 换成 -）。
+ *
+ * ⚠️ 必须先 realpath：Claude Code 是按解析符号链接后的 cwd 算 slug 的。
+ * macOS 上 /tmp → /private/tmp，注册 cwd=/tmp 的 agent 实际 jsonl 落在
+ * -private-tmp/，不 resolve 的话 watcher 会盯着永远不存在的 -tmp/ 目录
+ * （2026-07-09 agent-temp 实例：流式输出全程静默）。
+ */
+export function projectsSlug(cwd: string): string {
+  let resolved = cwd;
+  try {
+    resolved = realpathSync(cwd);
+  } catch {
+    /* 目录已不存在 → 按原样算，让上层走 findJsonlBySessionId 兜底 */
+  }
+  return "-" + resolved.replace(/^\//, "").replace(/\//g, "-");
+}
+
+/**
  * 根据项目 slug 自动推 JSONL 路径。
- * slug = cwd.replace(/\//g, "-") 前加一个 "-"。
  */
 export function projectJsonlPath(cwd: string, sessionId: string): string {
-  const slug = cwd.replace(/^\//, "").replace(/\//g, "-");
-  return `${process.env.HOME}/.claude/projects/-${slug}/${sessionId}.jsonl`;
+  return `${process.env.HOME}/.claude/projects/${projectsSlug(cwd)}/${sessionId}.jsonl`;
 }
 
 /** 兜底：如果上面的路径不存在，遍历 projects 子目录找 session */

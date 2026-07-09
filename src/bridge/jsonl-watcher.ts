@@ -13,6 +13,7 @@ import type { Client } from "discord.js";
 import { TextChannel } from "discord.js";
 import { WATCHER_CONFIG, MCP_TOOL_PREFIX } from "./config.js";
 import { discordReply } from "./discord-api.js";
+import { projectsSlug, findJsonlBySessionId } from "../lib/jsonl-cost.js";
 // v2.6.0+ 旁路事件埋点（设计 D1：只 emit 不改渲染管线）
 import { emitEvent } from "./event-bus.js";
 
@@ -127,8 +128,7 @@ async function flushText(state: WatcherState, discord: Client) {
 }
 
 export function getJsonlPath(cwd: string, sessionId: string): string {
-  const dir = "-" + cwd.replace(/^\//, "").replace(/\//g, "-");
-  return join(process.env.HOME || "~", ".claude", "projects", dir, `${sessionId}.jsonl`);
+  return join(process.env.HOME || "~", ".claude", "projects", projectsSlug(cwd), `${sessionId}.jsonl`);
 }
 
 /**
@@ -467,7 +467,17 @@ export async function startWatching(
   channelId: string, discord: Client
 ) {
   stopWatching(agentName);
-  const jsonlPath = getJsonlPath(cwd, sessionId);
+  let jsonlPath = getJsonlPath(cwd, sessionId);
+
+  // 推算路径不存在 → 按 sessionId 全 projects 扫一遍兜底（slug 规则漂移 /
+  // cwd 记录不准时自愈，而不是傻等一个永远不会出现的文件）
+  if (!existsSync(jsonlPath)) {
+    const found = findJsonlBySessionId(sessionId);
+    if (found) {
+      console.log(`👁 slug 推算落空，按 sessionId 兜底命中: ${agentName} → ${found}`);
+      jsonlPath = found;
+    }
+  }
 
   if (!existsSync(jsonlPath)) {
     const startedAt = Date.now();
