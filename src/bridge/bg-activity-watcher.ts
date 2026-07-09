@@ -25,7 +25,7 @@
 import { existsSync } from "fs";
 import { readdir, stat } from "fs/promises";
 import { join, basename } from "path";
-import { projectsSlug } from "../lib/jsonl-cost.js";
+import { projectsSlug, projectJsonlPath } from "../lib/jsonl-cost.js";
 import { adapterFor, type ChatAdapter } from "./adapters.js";
 import { parseChatId } from "./router.js";
 import { emitEvent } from "./event-bus.js";
@@ -68,6 +68,9 @@ interface AgentLite {
 const activities = new Map<string, Activity>();
 /** 见过的文件（含 baseline + 已结束的），防重复开流 */
 const seen = new Set<string>();
+/** shell 候选（等待 jsonl 确认是真 bg 任务）：filePath → 首见时间 */
+const shellCandidates = new Map<string, number>();
+const SHELL_CONFIRM_TIMEOUT_MS = 60_000;
 let baselined = false;
 
 // ── 目录定位 ───────────────────────────────────────────────────────────
@@ -90,6 +93,24 @@ async function listFiles(dir: string, suffix: string): Promise<string[]> {
     return (await readdir(dir)).filter((f) => f.endsWith(suffix)).map((f) => join(dir, f));
   } catch {
     return [];
+  }
+}
+
+/**
+ * 真 bg 任务确认（2026-07-10 实战教训）：**前台** Bash 调用也会在 tasks/ 下落一个
+ * 瞬时 .output（命令结束即删）—— 不过滤的话每个长命令都会开一个子区然后秒归档。
+ * run_in_background 的任务 id 会出现在主会话 jsonl 的 tool_result 文本里
+ * （"Command running in background with ID: <id>"），拿它做权威判定；jsonl 写入
+ * 可能比文件晚一拍，确认不了先挂 candidate 下轮再试，超时放弃。
+ */
+async function isRealBgTask(agent: AgentLite, taskId: string): Promise<boolean> {
+  try {
+    const f = Bun.file(projectJsonlPath(agent.cwd, agent.sessionId));
+    const size = f.size;
+    const tail = await f.slice(Math.max(0, size - 512_000), size).text();
+    return tail.includes(taskId);
+  } catch {
+    return false;
   }
 }
 
@@ -289,11 +310,30 @@ async function tick(): Promise<void> {
           seen.add(f); // baseline：存量文件不重播
           continue;
         }
+        // shell：先确认是真 bg 任务（前台 Bash 的瞬时 .output 不开子区）
+        if (kind === "shell") {
+          const taskId = basename(f).replace(/\.output$/, "");
+          if (!(await isRealBgTask(agent, taskId))) {
+            const t0 = shellCandidates.get(f) ?? Date.now();
+            shellCandidates.set(f, t0);
+            if (Date.now() - t0 > SHELL_CONFIRM_TIMEOUT_MS) {
+              seen.add(f); // 超时确认不了 = 前台瞬时文件，永久跳过
+              shellCandidates.delete(f);
+            }
+            continue;
+          }
+          shellCandidates.delete(f);
+        }
         await startActivity(kind, agent, f).catch((e) =>
           console.error(`🧵 bg 活动启动失败 (${agent.name}):`, (e as Error).message),
         );
       }
     }
+  }
+
+  // 候选清理：文件已消失（前台命令结束即删）的 candidate 不再保留
+  for (const f of [...shellCandidates.keys()]) {
+    if (!existsSync(f)) shellCandidates.delete(f);
   }
 
   // 消费 + 结束判定
