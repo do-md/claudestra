@@ -28,6 +28,8 @@ export interface AgentStat {
   /** 当前会话上下文占用 ≈ 最后一条 assistant 的 input + cacheRead + cacheCreation */
   contextTokens: number;
   contextPct: number; // 相对 CONTEXT_CEILING
+  /** compact 后还没有新对话：contextTokens 是估算值（底座 + 摘要/4），非 usage 实测 */
+  contextEstimated: boolean;
   today: UsageWindow;
   week: UsageWindow;
   jsonl: string | null;
@@ -45,6 +47,14 @@ export interface AgentLike {
 
 /** 上下文窗口天花板（用于算占比）。会话实测能涨到 ~1M。 */
 export const CONTEXT_CEILING = 1_000_000;
+
+/**
+ * compact 后新上下文的固定底座估算（system prompt + 工具 + CLAUDE.md + MCP 说明）。
+ * 2026-07-09 用 claudestra 自己的 session 实测：压后首条真实 ctx 58K ≈ 55K 底座 +
+ * 3K 摘要（摘要 12.4K chars / 4）。claudestra 是重配置 agent，取 45K 做通用估值 ——
+ * 反正带「~」展示，下一轮真实对话到来就会被 usage 实测覆盖。
+ */
+export const POST_COMPACT_BASE_TOKENS = 45_000;
 
 /** 今天本地 00:00 的 ms 时间戳 */
 export function dayStartTs(now = new Date()): number {
@@ -64,6 +74,7 @@ export function weekStartTs(now = new Date()): number {
 
 interface FileStats {
   contextTokens: number;
+  contextEstimated: boolean;
   today: UsageWindow;
   week: UsageWindow;
   /** 最后一条 assistant 实际用的 model（真相），可能跟 registry 钉的不一样 */
@@ -73,9 +84,10 @@ interface FileStats {
 const fileCache = new Map<string, { key: string; stats: FileStats }>();
 
 /** 单遍扫描一个 JSONL，同时算上下文 + 今日 + 本周；带 (mtime,日界,周界) 缓存 */
-async function readFileStats(path: string): Promise<FileStats> {
+export async function readFileStats(path: string): Promise<FileStats> {
   const empty: FileStats = {
     contextTokens: 0,
+    contextEstimated: false,
     today: { tokens: 0, requests: 0 },
     week: { tokens: 0, requests: 0 },
     model: "",
@@ -94,6 +106,7 @@ async function readFileStats(path: string): Promise<FileStats> {
   const today: UsageWindow = { tokens: 0, requests: 0 };
   const week: UsageWindow = { tokens: 0, requests: 0 };
   let contextTokens = 0;
+  let contextEstimated = false;
   let model = "";
   let ctxFound = false;
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -101,16 +114,34 @@ async function readFileStats(path: string): Promise<FileStats> {
     if (!line) continue;
     let rec: any;
     try { rec = JSON.parse(line); } catch { continue; }
+    // compact 后还没新对话：尾扫会先遇到 compact 摘要而不是带 usage 的 assistant。
+    // 这时最后一条 usage 是**压缩前**的旧值（owner 2026-07-09 报告：compact 完很久
+    // 不聊天，看板一直显示压缩前的红色大数）。真实值要等下一轮对话才有，先按
+    // 底座 + 摘要文本/4 估算，标记 estimated 让展示层加「~」。
+    if (!ctxFound && rec.type === "user" && rec.isCompactSummary === true) {
+      const c = rec?.message?.content;
+      const text =
+        typeof c === "string"
+          ? c
+          : Array.isArray(c)
+            ? c.map((b: any) => (typeof b?.text === "string" ? b.text : "")).join("")
+            : "";
+      contextTokens = POST_COMPACT_BASE_TOKENS + Math.round(text.length / 4);
+      contextEstimated = true;
+      ctxFound = true;
+      continue;
+    }
     if (rec.type !== "assistant") continue;
     const u = rec?.message?.usage;
     if (!u) continue;
+    // model 独立于 ctx 追踪：compact 估算分支拿不到 model，继续往前找最近的真实值
+    if (!model) model = String(rec?.message?.model || "");
     if (!ctxFound) {
-      // 从尾往前第一条带 usage 的 assistant = 当前上下文快照 + 实际在跑的模型
+      // 从尾往前第一条带 usage 的 assistant = 当前上下文快照
       contextTokens =
         Number(u.input_tokens || 0) +
         Number(u.cache_read_input_tokens || 0) +
         Number(u.cache_creation_input_tokens || 0);
-      model = String(rec?.message?.model || "");
       ctxFound = true;
     }
     const ts = new Date(rec.timestamp).getTime();
@@ -127,7 +158,7 @@ async function readFileStats(path: string): Promise<FileStats> {
       today.requests += 1;
     }
   }
-  const stats: FileStats = { contextTokens, today, week, model };
+  const stats: FileStats = { contextTokens, contextEstimated, today, week, model };
   fileCache.set(path, { key, stats });
   return stats;
 }
@@ -150,7 +181,7 @@ export async function computeAgentStats(agents: AgentLike[]): Promise<AgentStat[
     const jsonl = resolveJsonl(a);
     const fs = jsonl
       ? await readFileStats(jsonl)
-      : { contextTokens: 0, today: { tokens: 0, requests: 0 }, week: { tokens: 0, requests: 0 }, model: "" };
+      : { contextTokens: 0, contextEstimated: false, today: { tokens: 0, requests: 0 }, week: { tokens: 0, requests: 0 }, model: "" };
     out.push({
       name: a.name,
       channelId: a.channelId || "",
@@ -159,6 +190,7 @@ export async function computeAgentStats(agents: AgentLike[]): Promise<AgentStat[
       status: a.status || "active",
       contextTokens: fs.contextTokens,
       contextPct: Math.min(100, Math.round((fs.contextTokens / CONTEXT_CEILING) * 100)),
+      contextEstimated: fs.contextEstimated,
       today: fs.today,
       week: fs.week,
       jsonl,

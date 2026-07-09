@@ -136,8 +136,19 @@ async function findIdleScrapeTarget(): Promise<string | null> {
   return null;
 }
 
+/** 手动点「🔄 刷新」置位：本次抓取要更执着（多轮等 idle 窗口），不许静默放弃 */
+let forceNextScrape = false;
+
 async function scrapeAccountUsage(): Promise<AccountUsage | null> {
-  const target = await findIdleScrapeTarget();
+  // 常规（hook/tick 触发）找不到 idle 窗口就算了，沿用旧缓存；手动刷新是用户
+  // 明确要真实数据 —— 多等几轮（刚收尾的 agent 通常几秒内就 idle）。
+  const attempts = forceNextScrape ? 5 : 1;
+  forceNextScrape = false;
+  let target: string | null = null;
+  for (let k = 0; k < attempts && !target; k++) {
+    if (k > 0) await sleep(2000);
+    target = await findIdleScrapeTarget();
+  }
   if (!target) return null; // 没有任何 idle 会话可借，下次再说（沿用旧缓存）
   try {
     await tmuxRaw(["send-keys", "-t", target, "-l", "/status"]);
@@ -185,7 +196,8 @@ async function getAccountUsage(): Promise<AccountUsage | null> {
   if (scraping) return scraping;
   scraping = Promise.race([
     scrapeAccountUsage(),
-    new Promise<null>((r) => setTimeout(() => r(null), 15000)),
+    // force 模式最多 5×2s 等 idle + 抓取本身 ~4s，超时给足 25s（仍防永久冻结）
+    new Promise<null>((r) => setTimeout(() => r(null), 25000)),
   ])
     .then((u) => {
       if (u) accountCache = u;
@@ -226,6 +238,14 @@ function fmtResets(s: string): string {
   return s.replace(/\s*\([^)]*\)\s*$/, "").trim(); // 去掉尾部 (Asia/Singapore)
 }
 
+/** 抓取时间 → "刚刚 / N 分钟前 / N 小时前"（用户要能看出 gauge 数据多旧） */
+function fmtAge(scrapedAt: number): string {
+  const ms = Date.now() - scrapedAt;
+  if (ms < 90_000) return "刚刚";
+  if (ms < 60 * 60_000) return `${Math.round(ms / 60_000)} 分钟前`;
+  return `${(ms / 3_600_000).toFixed(1)} 小时前`;
+}
+
 function bar(pct: number | null, w = 10): string {
   if (pct == null) return "?".padEnd(w + 4);
   const f = Math.round((Math.min(100, pct) / 100) * w);
@@ -264,8 +284,12 @@ function renderEmbed(snap: StatsSnapshot): EmbedBuilder {
     worstLimit = Math.max(g.sessionPct ?? 0, g.weekPct ?? 0);
     desc.push(`⏱ 5h　${limitDot(g.sessionPct)} ${bar(g.sessionPct, 8)}${g.sessionResets ? "　⟳ " + fmtResets(g.sessionResets) : ""}`);
     desc.push(`📆 周　${limitDot(g.weekPct)} ${bar(g.weekPct, 8)}${g.weekResets ? "　⟳ " + fmtResets(g.weekResets) : ""}`);
+    // gauge 数据年龄：embed 的 timestamp 是重渲染时间，账号 % 可能是旧缓存 ——
+    // 不标年龄用户会以为一切都是最新的（owner 2026-07-10 报告"刷新不及时"的根源）
+    const stale = Date.now() - g.scrapedAt > 15 * 60_000;
+    desc.push(`_${stale ? "⚠️ " : ""}账号 gauge 抓取于 ${fmtAge(g.scrapedAt)}${stale ? "（点 🔄 强制重抓）" : ""}_`);
   } else {
-    desc.push("_（/status 抓取中 / master 忙，下次对话完成时刷新）_");
+    desc.push("_（/status 抓取中 / 无空闲会话可借，点 🔄 重试）_");
   }
   desc.push("_🟢 正常 · 🟡 偏高 · 🔴 需注意（点=上下文占用 / 前缀=limit）_");
 
@@ -278,8 +302,12 @@ function renderEmbed(snap: StatsSnapshot): EmbedBuilder {
 
   for (const a of snap.agents.slice(0, 24)) {
     const name = a.name.replace(/^agent-/, "");
+    // compact 后无新对话 → 上下文是估算值，加 ~ 和标注（真实值下轮对话自动校准）
+    const ctx = a.contextEstimated
+      ? `📖 ~${formatTokens(a.contextTokens)} ${a.contextPct}%（刚 compact）`
+      : `📖 ${formatTokens(a.contextTokens)} ${a.contextPct}%`;
     emb.addFields({
-      name: `${ctxDot(a.contextPct)} ${name} · 📖 ${formatTokens(a.contextTokens)} ${a.contextPct}%`,
+      name: `${ctxDot(a.contextPct)} ${name} · ${ctx}`,
       value: `${a.model.replace(/^claude-/, "")} · 今 ${formatTokens(a.today.tokens)} · 周 ${formatTokens(a.week.tokens)}`,
       inline: false,
     });
@@ -443,9 +471,10 @@ async function doUpdate(discord: Client): Promise<void> {
   }
 }
 
-/** 看板「🔄 刷新」按钮：强制刷新账号 gauge（清缓存年龄）+ 立即重渲染。 */
+/** 看板「🔄 刷新」按钮：强制刷新账号 gauge（清缓存年龄 + 多轮等 idle）+ 立即重渲染。 */
 export async function forceRefreshStatsDashboard(discord: Client): Promise<void> {
-  if (accountCache) accountCache.scrapedAt = 0; // 让下次 getAccountUsage 强制重抓
+  if (accountCache) accountCache.scrapedAt = 0; // 让下次 getAccountUsage 绕过 TTL
+  forceNextScrape = true; // 本次抓取多轮等 idle 窗口，不许静默放弃
   await doUpdate(discord);
 }
 
