@@ -121,6 +121,41 @@ export function agentInScope(p: Principal, agentName: string): boolean {
 }
 
 /**
+ * v2.6.0+ C2-3：把 .env 的 ALLOWED_USER_IDS 同步成 discord:<uid> role:owner
+ * principals（principals.json 成为身份真源，.env 保留作 seed/fallback）。
+ * 幂等：已存在的 discord principal 不覆盖（用户手动改过 role/disabled 要保留）。
+ * 返回 true = 文件有变化（已落盘）。
+ */
+export async function syncDiscordOwnersFromEnv(
+  allowedIds: string[],
+  path = PRINCIPALS_PATH,
+): Promise<boolean> {
+  if (allowedIds.length === 0) return false;
+  const file = await readPrincipals(path);
+  let changed = false;
+  for (const uid of allowedIds) {
+    const id = `discord:${uid}`;
+    if (file.principals.some((p) => p.id === id)) continue;
+    file.principals.push({
+      id,
+      role: "owner",
+      agents: ["*", "master"],
+      createdAt: new Date().toISOString(),
+    });
+    changed = true;
+  }
+  if (changed) await writePrincipals(file, path);
+  return changed;
+}
+
+/** principals 里未禁用的 discord principal 的 uid 列表 */
+export function listDiscordPrincipalIds(file: PrincipalsFile): string[] {
+  return file.principals
+    .filter((p) => p.id.startsWith("discord:") && !p.disabled)
+    .map((p) => p.id.slice(8));
+}
+
+/**
  * 内存滑动窗口限流（纯逻辑，可测）。默认 30 次 / 60s。
  * bridge 每个 principal 一个实例；重启清零（可接受）。
  */

@@ -58,8 +58,45 @@ import {
   agentInScope,
   tokenIdOf,
   SlidingWindowLimiter,
+  syncDiscordOwnersFromEnv,
+  listDiscordPrincipalIds,
   type Principal,
 } from "./lib/principals.js";
+
+// ============================================================
+// v2.6.0+ C2-3：Discord 用户鉴权统一走 principals.json（.env 作 seed/fallback）
+// 模块级缓存保持全部调用点的同步语义；30s 懒刷新（principals 变化不频繁）。
+// 语义与老 ALLOWED_USER_IDS 完全一致：列表为空 = 放行所有人。
+// ============================================================
+let cachedDiscordAllowed: string[] = [...ALLOWED_USER_IDS];
+let discordAllowedLoadedAt = 0;
+function refreshDiscordAllowed(): void {
+  discordAllowedLoadedAt = Date.now();
+  readPrincipals()
+    .then((file) => {
+      const ids = listDiscordPrincipalIds(file);
+      // principals 里一个 discord principal 都没有（老安装未 sync）→ 保持 .env
+      if (ids.length > 0) cachedDiscordAllowed = ids;
+    })
+    .catch(() => { /* 保持现值 */ });
+}
+/** 允许对话的 Discord 用户 id 列表（空 = 不限） */
+function allowedDiscordIds(): string[] {
+  if (Date.now() - discordAllowedLoadedAt > 30_000) refreshDiscordAllowed();
+  return cachedDiscordAllowed;
+}
+/** 主 owner 的 Discord uid（@mention / UserEndpoint 兜底用），可能为 "" */
+function primaryOwnerId(): string {
+  const ids = allowedDiscordIds();
+  return ids[0] || "";
+}
+// 启动：.env → principals 单向 seed（幂等），然后立即刷新缓存
+syncDiscordOwnersFromEnv(ALLOWED_USER_IDS)
+  .then((changed) => {
+    if (changed) console.log("👤 已把 .env ALLOWED_USER_IDS 同步进 principals.json（role:owner）");
+    refreshDiscordAllowed();
+  })
+  .catch((e) => console.error("principals owner 同步失败（继续用 .env）:", (e as Error).message));
 import { startPermissionWatcher, permissionMessages, clearPermissionMessage } from "./bridge/permission-watcher.js";
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
 import { updateStatsDashboard, initStatsDashboard, handleStatsRequest, forceRefreshStatsDashboard } from "./bridge/stats-dashboard.js";
@@ -1080,7 +1117,7 @@ function startTypingWithSafety(channelId: string) {
             sm.edit({ content: "⏰ 超时自动停止", components: [] }).catch(() => {});
           }).catch(() => {});
           // 发新消息通知用户
-          const mention = ALLOWED_USER_IDS.length > 0 ? `<@${ALLOWED_USER_IDS[0]}>` : "";
+          const mention = primaryOwnerId() ? `<@${primaryOwnerId()}>` : "";
           if (mention) {
             textCh.send(`⏰ 超时自动停止 ${mention}`).catch(() => {});
           }
@@ -1166,7 +1203,7 @@ discord.once("ready", async () => {
   await registerSlashCommands();
 
   // 启动权限弹窗 watcher
-  startPermissionWatcher(ALLOWED_USER_IDS, discord);
+  startPermissionWatcher(allowedDiscordIds(), discord);
 
   // 启动 wedge watcher — 检测长时间没动静但又不 idle 的 agent
   startWedgeWatcher(discord);
@@ -1630,7 +1667,7 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
   // 保证：我方 reply() 时 bridge 会自动补 @ peer bot（见 ensurePeerMentions），所以我方不会忘。
   if (msg.author.bot) {
     if (!mentionedMe) return;
-  } else if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(msg.author.id)) {
+  } else if (allowedDiscordIds().length > 0 && !allowedDiscordIds().includes(msg.author.id)) {
     // 人类但不在 allowlist：只有 @ 了我们才处理（跨服有人找我们的场景）
     if (!mentionedMe) return;
   }
@@ -1927,7 +1964,7 @@ async function notifyMaster(content: string): Promise<void> {
       from: { kind: "bridge", label: "notifyMaster" },
       to: {
         kind: "user",
-        userId: ALLOWED_USER_IDS[0] || "",
+        userId: primaryOwnerId(),
         channelId: controlChannelId,
       },
       intent: "notification",
@@ -2385,8 +2422,8 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
     console.log(`🎯 Interaction: type=${interaction.type} channel=${channelId} user=${interaction.user?.id}`);
     if (!channelId) return;
 
-    if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(interaction.user.id)) {
-      console.log(`🚫 用户 ${interaction.user.id} 不在 ALLOWED_USER_IDS 中`);
+    if (allowedDiscordIds().length > 0 && !allowedDiscordIds().includes(interaction.user.id)) {
+      console.log(`🚫 用户 ${interaction.user.id} 不在允许列表（principals/.env）中`);
       return;
     }
 
@@ -3885,7 +3922,7 @@ async function resolveReplyTarget(chatId: string): Promise<RouterUserEndpoint | 
     }
   } catch { /* non-critical */ }
   // 3. user channel
-  const userId = ALLOWED_USER_IDS.length > 0 ? ALLOWED_USER_IDS[0] : "";
+  const userId = primaryOwnerId();
   return { kind: "user", userId, channelId: chatId };
 }
 
@@ -4197,7 +4234,7 @@ async function tryRouteForeignAgentExchange(msg: DiscordMessage, channelId: stri
           .trim();
         if (cleanText) {
           try {
-            const userMention = ALLOWED_USER_IDS.length > 0 ? `<@${ALLOWED_USER_IDS[0]}>` : "";
+            const userMention = primaryOwnerId() ? `<@${primaryOwnerId()}>` : "";
             const relayText = [
               `📬 **来自 peer ${peerBotForChannel.name}**（他在自己 guild 的 #agent-exchange 里 @ 了你）${userMention}`,
               ``,
@@ -4209,7 +4246,7 @@ async function tryRouteForeignAgentExchange(msg: DiscordMessage, channelId: stri
               from: { kind: "bridge", label: "peer-relay" },
               to: {
                 kind: "user",
-                userId: ALLOWED_USER_IDS[0] || "",
+                userId: primaryOwnerId(),
                 channelId: peers.localAgentExchangeId,
               },
               intent: "notification",
@@ -4756,7 +4793,7 @@ async function handleHookRequest(req: Request): Promise<Response> {
           const ch = await discord.channels.fetch(channelId);
           if (ch && "messages" in ch) {
             const textCh = ch as TextChannel;
-            const mention = ALLOWED_USER_IDS.length > 0 ? `<@${ALLOWED_USER_IDS[0]}>` : "";
+            const mention = primaryOwnerId() ? `<@${primaryOwnerId()}>` : "";
             if (mention) {
               await textCh.send(`${randomUmaDone()} ${mention}`);
               lastCompletionSent.set(channelId, now);
