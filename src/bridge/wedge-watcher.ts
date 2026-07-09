@@ -34,9 +34,73 @@ interface AgentState {
 
 const agentStates = new Map<string, AgentState>(); // agentName → state
 
+// v2.7+ 链路哨兵：agentName → 首次发现 channel-server 掉线的时间戳
+const linkDownSince = new Map<string, number>();
+const linkNotifiedAt = new Map<string, number>();
+const LINK_DOWN_THRESHOLD_MS = 5 * 60_000;   // 掉线 5 分钟才报（滤掉重启瞬时）
+const LINK_NOTIFY_COOLDOWN_MS = 60 * 60_000; // 同一 agent 一小时最多报一次
+
 function fingerprint(pane: string): string {
   const tail = pane.split("\n").slice(-40).join("\n");
   return createHash("sha1").update(tail).digest("hex").slice(0, 16);
+}
+
+/**
+ * v2.7+ 链路哨兵：tmux 窗口活着（claude 在跑）但该频道没有 channel-server
+ * 连到 bridge —— 用户消息进不来、agent 回复出不去，从 Discord 看是「静默失联」。
+ * 典型成因：agents 视图误触把前台会话换掉、channel-server 崩溃、MCP 配置丢失。
+ * 卡死检测靠 pane 指纹管不到这种（agent 可能正常干活甚至 idle）。
+ */
+async function checkLink(
+  agentName: string,
+  channelId: string,
+  pane: string,
+  connected: boolean,
+  allowedUserIds: string[],
+  discord: Client,
+): Promise<void> {
+  const now = Date.now();
+  if (connected || isAtShell(pane)) {
+    // 在线，或 claude 根本没跑（at-shell 有专门的掉线通知）→ 清计时
+    linkDownSince.delete(agentName);
+    return;
+  }
+  const since = linkDownSince.get(agentName);
+  if (!since) {
+    linkDownSince.set(agentName, now);
+    return;
+  }
+  if (now - since < LINK_DOWN_THRESHOLD_MS) return;
+  const lastNotify = linkNotifiedAt.get(agentName) ?? 0;
+  if (now - lastNotify < LINK_NOTIFY_COOLDOWN_MS) return;
+  linkNotifiedAt.set(agentName, now);
+
+  const minutes = Math.round((now - since) / 60_000);
+  console.log(`🔗 ${agentName} 链路断开 ${minutes} 分钟（窗口活着但 channel-server 不在线）`);
+  recordMetric("agent_link_down", { channelId, agent: agentName, durationMs: now - since });
+  try {
+    const ch = (await discord.channels.fetch(channelId)) as TextChannel;
+    const mention = allowedUserIds.map((id) => `<@${id}>`).join(" ");
+    await ch.send({
+      content: [
+        `🔗 **${agentName}** 链路断开${mention ? " " + mention : ""}`,
+        `tmux 窗口里 Claude Code 在跑，但已 ${minutes} 分钟没有 channel-server 连到 bridge —— Discord 消息进不来也出不去。`,
+        `可能是 agents 视图误触换掉了前台会话、channel-server 崩溃、或 MCP 配置丢失。`,
+        ``,
+        `👉 点重启自动修复（session 被 bg 占用会自动 fork 恢复，上下文不丢）。`,
+      ].join("\n"),
+      components: buildComponents([
+        {
+          type: "buttons",
+          buttons: [
+            { id: `wedge_restart:${agentName}`, label: "重启修复", emoji: "🔀", style: "primary" },
+          ],
+        },
+      ]),
+    });
+  } catch (e) {
+    console.error(`🔗 链路告警发送失败:`, e);
+  }
 }
 
 async function checkAgent(
@@ -45,12 +109,20 @@ async function checkAgent(
   cwd: string,
   sessionId: string,
   allowedUserIds: string[],
-  discord: Client
+  discord: Client,
+  isChannelConnected?: (channelId: string) => boolean,
 ): Promise<void> {
   const target = windowTarget(agentName);
   const pane = await tmuxCapture(target, 40);
   const fp = fingerprint(pane);
   const now = Date.now();
+
+  // v2.7+ 链路哨兵先行：idle 也可能失联（idle + 掉线 = 用户消息进不来，更要报）
+  if (isChannelConnected) {
+    await checkLink(
+      agentName, channelId, pane, isChannelConnected(channelId), allowedUserIds, discord,
+    ).catch(() => {});
+  }
 
   // idle（ready 提示符）→ 正常歇着，不是卡死。清掉状态。
   if (await isIdle(target)) {
@@ -147,7 +219,11 @@ async function checkAgent(
   }
 }
 
-export function startWedgeWatcher(discord: Client) {
+export function startWedgeWatcher(
+  discord: Client,
+  // v2.7+ 链路哨兵：bridge 注入「该频道是否有 channel-server 在线」的查询
+  isChannelConnected?: (channelId: string) => boolean,
+) {
   const tick = async () => {
     try {
       const allowedUserIds = (process.env.ALLOWED_USER_IDS || "").split(",").filter(Boolean);
@@ -157,7 +233,7 @@ export function startWedgeWatcher(discord: Client) {
         if (agent.status !== "active" || !agent.channelId) continue;
         await checkAgent(
           agent.name, agent.channelId, agent.cwd || "", agent.sessionId || "",
-          allowedUserIds, discord,
+          allowedUserIds, discord, isChannelConnected,
         ).catch(() => {});
       }
     } catch { /* non-critical */ }

@@ -10,6 +10,7 @@ import type { Client } from "discord.js";
 import { TextChannel } from "discord.js";
 import {
   tmuxCapture,
+  tmuxRaw,
   windowTarget,
   detectRuntimePermissionPrompt,
   detectSessionIdlePrompt,
@@ -19,6 +20,53 @@ import { buildComponents } from "./components.js";
 import { runManager } from "./management.js";
 
 const POLL_INTERVAL_MS = 8_000;
+
+// v2.7+ agents 视图自动逃逸的通知去重（channelId → 上次通知时间戳）
+const agentsViewNotifiedAt = new Map<string, number>();
+const AGENTS_VIEW_NOTIFY_COOLDOWN_MS = 10 * 60_000;
+
+/**
+ * v2.7+ 自动逃逸：agent 窗口误入 Claude Code 的 agents 视图 / bg 派发界面。
+ *
+ * 空输入框按 ← 会进 agents 视图；在里面切换会话会把当前会话 fork 成 bg job、
+ * 窗口变 attach 旁观视图，Discord/MCP 链路断掉（2026-07-09 事故）。上游没有
+ * 禁用开关（keybindings 管不到、settings 无相关键），只能事后秒级拉回：
+ * 检测 dispatch 界面特征 → 发 Esc 退回对话界面 → 通知频道。
+ * Esc 对正常对话界面无害（顶多取消未提交输入），误判代价低。
+ */
+async function maybeEscapeAgentsView(
+  agentName: string,
+  channelId: string,
+  pane: string,
+  discord: Client,
+): Promise<boolean> {
+  const inAgentsView =
+    pane.includes("describe a task for a new session") ||
+    (pane.includes("enter to collapse") && pane.includes("delete all"));
+  if (!inAgentsView) return false;
+
+  const target = windowTarget(agentName);
+  console.log(`🏃 ${agentName} 误入 agents 视图，自动 Esc 逃逸`);
+  await tmuxRaw(["send-keys", "-t", target, "Escape"]);
+  await Bun.sleep(1_000);
+  const after = await tmuxCapture(target, 30);
+  if (after.includes("describe a task for a new session")) {
+    await tmuxRaw(["send-keys", "-t", target, "Escape"]);
+  }
+
+  const last = agentsViewNotifiedAt.get(channelId) ?? 0;
+  if (Date.now() - last > AGENTS_VIEW_NOTIFY_COOLDOWN_MS) {
+    agentsViewNotifiedAt.set(channelId, Date.now());
+    try {
+      const ch = (await discord.channels.fetch(channelId)) as TextChannel;
+      await ch.send(
+        `🏃 **${agentName}** 的窗口误入了 agents 视图（按了 ←？），已自动 Esc 拉回对话界面。` +
+          `如果切换动作已把会话派发成 bg 分身，稍后对账告警会带清理/收编按钮。`,
+      );
+    } catch { /* non-critical */ }
+  }
+  return true;
+}
 
 // v2.0.23+: session-idle 兜底 grace。manager.ts/launcher.ts 启动路径会自动选
 // 「恢复完整会话」，几秒内消掉 modal。watcher 不该抢在它前面发按钮（重启时
@@ -61,6 +109,9 @@ async function checkAgent(
   discord: Client
 ) {
   const pane = await tmuxCapture(windowTarget(agentName), 30);
+
+  // v2.7+ agents 视图自动逃逸（特征界面刚被 Esc 掉 → 本轮不再做弹窗检测）
+  if (await maybeEscapeAgentsView(agentName, channelId, pane, discord)) return;
 
   // 两种弹窗共用一个 channel 级别的 slot，同时只会有一种出现
   const sessionIdleDesc = detectSessionIdlePrompt(pane);

@@ -51,6 +51,10 @@ import { tmuxScreenshot } from "./bridge/screenshot.js";
 import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel } from "./bridge/jsonl-watcher.js";
 // v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
 import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from "./bridge/event-bus.js";
+// v2.7+ Claude Code agents 模式适配：中性会话清单 + bg job 清理 + 分身对账
+import { collectSessions } from "./bridge/sessions-inventory.js";
+import { cleanupBgJob } from "./lib/bg-jobs.js";
+import { startSessionReconciler } from "./bridge/session-reconciler.js";
 // v2.6.0+ HTTP API 身份与授权（设计 §3.4 / §5）
 import {
   readPrincipals,
@@ -1037,8 +1041,12 @@ discord.once("ready", async () => {
   // 启动权限弹窗 watcher
   startPermissionWatcher(allowedDiscordIds(), discord);
 
-  // 启动 wedge watcher — 检测长时间没动静但又不 idle 的 agent
-  startWedgeWatcher(discord);
+  // 启动 wedge watcher — 检测长时间没动静但又不 idle 的 agent；
+  // v2.7+ 注入链路查询做「窗口活着但 channel-server 掉线」哨兵
+  startWedgeWatcher(discord, (channelId) => clients.has(channelId));
+
+  // v2.7+ bg 对账定时器 — 检测正式 agent 的 bg 分身（agents 视图误触产物）
+  startSessionReconciler(discord);
   recordMetric("bridge_start", { meta: { channels: clients.size } });
 
   // 每 30 分钟自动重扫 skill（新装 plugin / 新建 user skill 不需要 restart bridge 就能出现在 /）
@@ -1139,8 +1147,10 @@ function buildAllSlashCommands(): any[] {
     new SlashCommandBuilder().setName("status").setDescription("查看所有 agent 的状态").toJSON(),
     new SlashCommandBuilder().setName("cron").setDescription("查看和管理定时任务").toJSON(),
     new SlashCommandBuilder().setName("focus").setDescription("把 Mac 上的 iTerm 切到本频道 agent 的 tab").toJSON(),
+    // v2.7+ Claude Code agents 模式：全机器会话总览（bg 分身检测/清理/收编）
+    new SlashCommandBuilder().setName("agents").setDescription("Claude 会话总览：前台/后台/分身检测").toJSON(),
   ];
-  const bridgeNames = new Set(["screenshot", "interrupt", "status", "cron"]);
+  const bridgeNames = new Set(["screenshot", "interrupt", "status", "cron", "agents"]);
 
   for (const item of allRegistrableCommands()) {
     if (item.kind === "builtin") {
@@ -2308,6 +2318,19 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         const panel = await buildStatusPanel();
         const components = panel.components ? buildComponents(panel.components) : undefined;
         await interaction.editReply({ content: panel.text, components });
+        return;
+      }
+
+      // v2.7+ /agents —— Claude 会话总览（前台/后台/分身检测/清理/收编）
+      if (cmd === "agents") {
+        await interaction.deferReply();
+        const panel = await handleMgmtButton("show_sessions_panel", channelId);
+        if (panel) {
+          const components = panel.components ? buildComponents(panel.components) : undefined;
+          await interaction.editReply({ content: panel.text, components });
+        } else {
+          await interaction.editReply("❌ 无法获取会话清单");
+        }
         return;
       }
 
@@ -4707,6 +4730,84 @@ async function handleApiRequest(req: Request, url: URL): Promise<Response> {
     } catch (e) {
       return apiJson(500, { ok: false, error: (e as Error).message });
     }
+  }
+
+  // v2.7+ GET /api/v1/sessions —— 全机器 Claude 会话清单（agents 模式适配，
+  // 中性 NeutralSessionInfo；Discord 面板与 web 前端共用同一数据源）。
+  // scope 规则：全权 token（"*"）看全部（含野生会话）；受限 token 只看 scope
+  // 内 agent 的正式会话及其分身。
+  if (path === "/sessions" && req.method === "GET") {
+    const list = await collectSessions();
+    if (list === null) return apiJson(503, { ok: false, error: "claude agents --json unavailable" });
+    const full = principal.agents.includes("*");
+    const visible = full
+      ? list
+      : list.filter((s) => {
+          const owner = s.registeredAgent ?? s.doppelgangerOf;
+          return owner ? agentInScope(principal, owner) : false;
+        });
+    return apiJson(200, { ok: true, sessions: visible });
+  }
+
+  // v2.7+ POST /api/v1/sessions/:bgId/cleanup —— 清理 bg job（死分身/残留）。
+  // 耗时操作（kill → 等 daemon 静默 → 隔离目录，最长 ~90s）→ 202 后台执行，
+  // 结果以 session_anomaly kind=cleanup_result 进事件流。仅全权 token。
+  const cleanupMatch = path.match(/^\/sessions\/([^/]+)\/cleanup$/);
+  if (cleanupMatch && req.method === "POST") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: "cleanup requires a full-scope token" });
+    }
+    const bgId = decodeURIComponent(cleanupMatch[1]);
+    const list = await collectSessions();
+    const target = list?.find((s) => s.bgId === bgId && s.kind === "background");
+    if (!target) return apiJson(404, { ok: false, error: `bg session "${bgId}" not found` });
+    cleanupBgJob(bgId, { pid: target.pid })
+      .then((r) => {
+        emitEvent({
+          agent: target.doppelgangerOf ?? target.name ?? bgId,
+          chatId: "",
+          type: "session_anomaly",
+          data: { kind: "cleanup_result", bgId, ...r },
+        });
+      })
+      .catch(() => {});
+    return apiJson(202, {
+      ok: true,
+      accepted: true,
+      hint: "cleanup runs in background; watch /api/v1/events for session_anomaly kind=cleanup_result",
+    });
+  }
+
+  // v2.7+ POST /api/v1/sessions/:sessionId/adopt —— 收编：把该 session 立为
+  // 某正式 agent 的会话并重启拉起（body: {"agent": "<name>"}）。仅全权 token。
+  const adoptMatch = path.match(/^\/sessions\/([^/]+)\/adopt$/);
+  if (adoptMatch && req.method === "POST") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: "adopt requires a full-scope token" });
+    }
+    const sid = decodeURIComponent(adoptMatch[1]);
+    let agentName = "";
+    try {
+      agentName = String(((await req.json()) as any)?.agent || "");
+    } catch {
+      /* fallthrough → 400 */
+    }
+    if (!agentName) return apiJson(400, { ok: false, error: 'body must be {"agent": "<name>"}' });
+    runManager("adopt", agentName, sid)
+      .then((r) => {
+        emitEvent({
+          agent: agentName,
+          chatId: "",
+          type: "session_anomaly",
+          data: { kind: "adopt_result", sessionId: sid, ok: !!r?.ok, ...r },
+        });
+      })
+      .catch(() => {});
+    return apiJson(202, {
+      ok: true,
+      accepted: true,
+      hint: "adoption runs in background (~1-2 min); watch /api/v1/events for session_anomaly kind=adopt_result",
+    });
   }
 
   // GET /api/v1/events —— token 版 SSE（按 scope 过滤事件）

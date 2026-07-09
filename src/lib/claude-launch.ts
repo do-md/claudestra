@@ -32,7 +32,10 @@ const DEFAULT_DISALLOWED: readonly string[] = [
   "Bash(git reset --hard:*)",
   "Bash(git clean -f:*)",
   "Bash(chmod 777:*)",
-  "Bash(:(){ :|:&};:)", // fork bomb
+  // fork bomb。规则内不能含空格：--disallowedTools 是空格分隔的单参数编码
+  // （见 buildClaudeCommand 的 join(" ")），带空格的规则会被 CLI 拆成两截并
+  // 报 "matches no known tool"（v2.6.x 前的老写法 "Bash(:(){ :|:&};:)" 从未生效）。
+  "Bash(:(){:|:&};:)",
 ] as const;
 
 export const DISALLOWED_PRESETS: Record<string, readonly string[]> = {
@@ -189,6 +192,14 @@ export interface LaunchOptions {
   sessionId?: string;
   /** resume 模式：传入要 resume 的 session id */
   resumeId?: string;
+  /**
+   * v2.7+ 与 resumeId 连用：`--fork-session` 分支一份副本而不抢占原 session。
+   * 用于 (a) 原 session 被 Claude Code bg agent 占用时的自愈重启（占用的 session
+   * 无法直接 resume，bg daemon 会把被杀的占用者 respawn 回来，进程层面赢不了——
+   * 2026-07-09 事故实证），(b) 收编 bg 分身。fork 出的新 session id 需要启动后
+   * 从 projects 目录 diff 探测并回写 registry。
+   */
+  forkSession?: boolean;
   /** resume 时的显示名 */
   displayName?: string;
   /** 已解析好的 disallowedTools 列表。与 preset 二选一 */
@@ -281,6 +292,7 @@ export function buildClaudeCommand(opts: LaunchOptions): string {
 
   if (opts.resumeId) {
     parts.push("--resume", shellEscape(opts.resumeId));
+    if (opts.forkSession) parts.push("--fork-session");
     if (opts.displayName) parts.push("--name", shellEscape(opts.displayName));
   } else if (opts.sessionId) {
     parts.push("--session-id", shellEscape(opts.sessionId));

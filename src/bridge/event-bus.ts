@@ -19,7 +19,9 @@ export type BridgeEventType =
   | "agent_status"
   | "auto_deny"
   | "question"
-  | "chat_message";
+  | "chat_message"
+  // v2.7+ 会话对账异常：bg 分身出现 / 链路掉线 / 收编与清理结果（agents 模式适配）
+  | "session_anomaly";
 
 export interface BridgeEvent {
   /** 进程内单调递增，SSE 的 id / Last-Event-ID 补发锚点 */
