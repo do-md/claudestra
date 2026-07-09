@@ -43,6 +43,14 @@ export interface ChatAdapter {
    * 「纯 API agent」= 一个返回虚拟地址的 provisioner，create 流程零改动。
    */
   provisionConversation?(name: string, opts?: { category?: string }): Promise<{ chatId: string }>;
+  /**
+   * v2.8+：在一个会话下开「子会话」，给 bg 活动（subagent / 后台 shell / bg task）
+   * 做独立的流式呈现通道，不污染主频道。Discord = thread（子区），Telegram 以后
+   * = topic。返回的 chatId 可直接喂给 send()/edit()。archived 用于活动结束收尾
+   * （Discord = 归档 thread；没有对应概念的平台可 no-op）。
+   */
+  provisionThread?(parentChatId: string, title: string): Promise<{ chatId: string }>;
+  archiveThread?(chatId: string): Promise<void>;
 }
 
 const adapters = new Map<string, ChatAdapter>();

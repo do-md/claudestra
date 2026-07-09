@@ -60,8 +60,10 @@ async function checkLink(
   discord: Client,
 ): Promise<void> {
   const now = Date.now();
-  if (connected || isAtShell(pane)) {
-    // 在线，或 claude 根本没跑（at-shell 有专门的掉线通知）→ 清计时
+  if (connected || isAtShell(pane) || !pane.trim()) {
+    // 在线，或 claude 根本没跑（at-shell / 空白 pane 有专门的掉线通知）→ 清计时。
+    // 空白 pane = claude 退出后 clear 过的 shell（2026-07-09 migration 实例：
+    // 误报成"链路断开（Claude 在跑）"，其实早就退出了）。
     linkDownSince.delete(agentName);
     return;
   }
@@ -134,7 +136,8 @@ async function checkAgent(
   // 输入框同符号，paneLooksIdle 看到 ❯ 但没 bypass banner → 误判"非 idle 卡死"，
   // 对一个根本没 claude 在跑的 window 每小时误报。这是掉线不是卡死：Esc/C-c 没用，
   // 要的是重启。下面按 atShell 分流到不同通知 + 不同阈值。
-  const atShell = isAtShell(pane);
+  // 空白 pane 同样按已退出处理（claude 退出后 clear 的 shell 没有提示符特征）。
+  const atShell = isAtShell(pane) || !pane.trim();
 
   // v2.0.23+: jsonl 活跃度逃生阀。Claude 思考 / 调工具时 session jsonl 一直在追加。
   // 只看 tmux pane 指纹会把"思考中但屏幕暂时没变"误判成卡死（owner 实测 claudestra

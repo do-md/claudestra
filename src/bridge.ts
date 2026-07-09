@@ -55,6 +55,7 @@ import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from 
 import { collectSessions } from "./bridge/sessions-inventory.js";
 import { cleanupBgJob } from "./lib/bg-jobs.js";
 import { startSessionReconciler } from "./bridge/session-reconciler.js";
+import { startBgActivityWatcher } from "./bridge/bg-activity-watcher.js";
 // v2.6.0+ HTTP API 身份与授权（设计 §3.4 / §5）
 import {
   readPrincipals,
@@ -1047,6 +1048,9 @@ discord.once("ready", async () => {
 
   // v2.7+ bg 对账定时器 — 检测正式 agent 的 bg 分身（agents 视图误触产物）
   startSessionReconciler(discord);
+
+  // v2.8+ bg 活动追踪 — subagent / 后台 shell 任务 → 子区流式呈现 + bg_task_* 事件
+  startBgActivityWatcher();
   recordMetric("bridge_start", { meta: { channels: clients.size } });
 
   // 每 30 分钟自动重扫 skill（新装 plugin / 新建 user skill 不需要 restart bridge 就能出现在 /）

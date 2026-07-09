@@ -57,6 +57,7 @@ src/
     claude-launch.ts     统一 Claude Code 启动命令构造（flags, MCP_NAME, shell 转义）
     principals.ts        v2.6.0+ API token 身份/scope/限流（~/.claude-orchestrator/principals.json）
     bg-jobs.ts           v2.7+ bg job 清理配方：杀进程 → 等 daemon 静默 → 隔离目录 → 顽固检测（绝不杀 --fork-session 正主）
+    session-archive.ts   v2.8+ 会话退役归档：kill/fork 换代/adopt/resume 换 session 时快照 jsonl 到 ~/.claude-orchestrator/archive/<agent>/（对抗 CC cleanupPeriodDays）
   ansi2html.ts           ANSI 转义码 → 彩色 HTML
   html2png.ts            HTML → PNG（Playwright headless Chromium）
   discord-reply.ts       Bash fallback：通过 Bridge 直接发消息
@@ -74,6 +75,7 @@ SETUP.md / SETUP.zh-CN.md    面向用户的安装指南
 - **多 agent 编排** — 创建、恢复、销毁、重启、列表、浏览历史。
 - **多前端 API（v2.6.0+）** — 核心与 Discord 解耦（设计文档 `docs/design-multi-frontend.md`）：`GET /events` SSE 实时事件流（断线补发）、`POST /api/v1/agents/:name/messages` token 鉴权入站消息（同步 wait / multipart 传文件 / 轮询兜底）。token 按 agent 圈定 scope（`token-add <名> --agents a,b`，未标 `--external` 的 agent 需 `--force`），API 对话默认镜像回 Discord 频道供审计。接 Telegram 等新前端 = 实现一个 ChatAdapter，核心零改动。Bridge 默认只绑 `127.0.0.1`（`BRIDGE_BIND` 放开）。
 - **Claude Code agents 模式集成（v2.7+）** — CC 2.1.x 的 bg agent 体系（daemon、respawn、← 键 agents 视图）与 tmux 前台模型互相打架：误按 ← 会把前台会话 fork 成 bg 分身、静默炸断 Discord 链路（2026-07-09 事故）。适配三层：**可见性** —— `SessionsInventory` 聚合 `claude agents --json` + jobs state + registry 对账成中性会话清单（分身检测），Discord `/agents` 面板（详情/收编/清理按钮，LLM-free）、`GET /api/v1/sessions`、`POST /api/v1/sessions/:id/cleanup|adopt`（全权 token，202 + `session_anomaly` SSE 事件）三端共用；**自愈** —— `restart` 撞「running as a background agent」自动改 `--fork-session` 重试并探测新 session id 回写 registry，`adopt <名> <sessionId>` 收编分身，`resume --fork` 收编野生会话；**守护** —— permission-watcher 秒级自动 Esc 逃逸 agents 视图、wedge-watcher 链路哨兵（窗口活着但 channel-server 掉线 >5min → 修复按钮）、10 分钟对账器发现新分身即告警带处置按钮。清理配方（`lib/bg-jobs.ts`，事故实证）：杀 bg 进程（绝不杀 `--fork-session` 正主）→ 等 daemon 静默 → 隔离 job 目录 → 顽固 respawn 检测转官方 TUI。
+- **bg 活动子区（v2.8+）** — agent 的后台工作各开一个子会话，不污染主频道。`bridge/bg-activity-watcher.ts` 轮询每个注册 agent 的 session，发现两类活动：**subagent**（`~/.claude/projects/<slug>/<sessionId>/subagents/agent-*.jsonl`，与主会话同格式）和**后台 shell 任务**（`/tmp/claude-<uid>/<slug>/<sessionId>/tasks/*.output`）。新文件出现 → `ChatAdapter.provisionThread` 在 agent 频道下开子区（Discord thread，将来 Telegram topic），工具调用/文本/shell 输出以 2.5s debounce 流入；3 分钟无增长 → 发结束总结 + 归档子区。生命周期同步 SSE（`bg_task_started/update/completed`），web 前端可脱离 Discord 渲染每任务进度线。重启安全：首轮 poll 只记 baseline 不重播存量。**会话归档**（`lib/session-archive.ts`）：session 退役（kill / fork 换代 / adopt / resume 替换 / 手动 `manager.ts archive <name>`）即快照 jsonl（含 subagents）到 `~/.claude-orchestrator/archive/<agent>/` —— CC 的 `cleanupPeriodDays` 会清源文件，归档才是聊天历史的持久层。只在源更大时覆盖；对话内容留在文件里，不入库（owner 2026-07-10 拍板的存储设计）。
 - **Agent 间通信** — `send_to_agent(target, text)` MCP 工具通过 Bridge 直接向另一个 agent 的上下文注入消息。
 - **定时任务** — cron 表达式拉起临时 agent、执行 prompt、汇报、清理。
 - **Discord UI** — 按钮、下拉菜单、slash 命令（`/status`、`/screenshot`、`/interrupt`、`/cron`）。
@@ -113,6 +115,7 @@ pm2 start ecosystem.config.cjs
 bun src/manager.ts create   <name> <dir> [purpose]
 bun src/manager.ts resume   <name> <sessionId> [dir] [--fork]  # --fork: 分支副本收编野生/被占用会话
 bun src/manager.ts adopt    <name> <sessionId>   # 把 bg 分身收编为正式会话并重启
+bun src/manager.ts archive  <name>               # 立即快照该 agent 当前 session 的对话 jsonl 到归档
 bun src/manager.ts kill     <name>
 bun src/manager.ts restart  [name]
 bun src/manager.ts list

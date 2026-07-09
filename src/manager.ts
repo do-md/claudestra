@@ -53,6 +53,7 @@ import {
 } from "./lib/claude-launch.js";
 import { printTmuxGuide } from "./lib/tmux-guide.js";
 import { projectsSlug } from "./lib/jsonl-cost.js";
+import { archiveSession, listArchivedSessions } from "./lib/session-archive.js";
 
 const REGISTRY_PATH = `${process.env.HOME}/.claude-orchestrator/registry.json`;
 const BRIDGE_URL = process.env.BRIDGE_URL || "ws://localhost:3847";
@@ -814,6 +815,11 @@ async function cmdResume(
 
   // 更新 registry
   const reg = await loadRegistry();
+  // v2.8+ 同名 agent 换 session：旧 session 退役先归档快照
+  const prior = reg.agents[tmuxName];
+  if (prior?.sessionId && prior.sessionId !== actualSessionId) {
+    await archiveSession(tmuxName, prior.cwd, prior.sessionId).catch(() => {});
+  }
   reg.agents[tmuxName] = {
     project: dir || resolvedDir.replace(process.env.HOME || "", "~"),
     purpose: `resumed: ${sessionId.slice(0, 8)}${forkSession ? " (fork)" : ""}`,
@@ -901,6 +907,10 @@ async function cmdKill(name: string) {
   // 删除对应的 Discord 频道
   const reg = await loadRegistry();
   const info = reg.agents[tmuxName];
+  // v2.8+ 会话退役 → 归档 jsonl 快照（CC 的 cleanupPeriodDays 会清源文件）
+  if (info?.sessionId) {
+    await archiveSession(tmuxName, info.cwd, info.sessionId).catch(() => {});
+  }
   if (info?.channelId) {
     try {
       await bridgeRequest({ type: "delete_channel", channelId: info.channelId });
@@ -1301,6 +1311,10 @@ async function cmdAdopt(name: string, sessionId: string) {
     return;
   }
   const oldId = info.sessionId;
+  // v2.8+ 被替换的旧 session 先归档快照
+  if (oldId && oldId !== sessionId) {
+    await archiveSession(tmuxName, info.cwd, oldId).catch(() => {});
+  }
   info.sessionId = sessionId;
   info.notes = `claude session: ${sessionId} (adopted${oldId ? `, was ${oldId.slice(0, 8)}` : ""})`;
   await saveRegistry(reg);
@@ -1423,6 +1437,8 @@ async function cmdRestart(name?: string) {
       if (started.ready) {
         const newId = await waitForNewSessionId(cwd, before);
         if (newId) {
+          // v2.8+ fork 换代：旧 session 从 registry 退役，先归档快照
+          await archiveSession(tmuxName, cwd, info.sessionId).catch(() => {});
           reg.agents[tmuxName].sessionId = newId;
           reg.agents[tmuxName].notes = `claude session: ${newId} (forked from ${info.sessionId.slice(0, 8)})`;
           await saveRegistry(reg);
@@ -2899,6 +2915,26 @@ switch (cmd) {
       break;
     }
     await cmdAdopt(name, sessionId);
+    break;
+  }
+
+  // v2.8+ 手动归档：archive <name> —— 立即快照该 agent 当前 session 的 jsonl
+  case "archive": {
+    const [name] = args;
+    if (!name) {
+      output({ ok: false, error: "用法: archive <name> — 立即归档该 agent 当前 session 的对话 jsonl" });
+      break;
+    }
+    const tmuxName = normalizeName(name);
+    const reg = await loadRegistry();
+    const info = reg.agents[tmuxName];
+    if (!info?.sessionId) {
+      output({ ok: false, error: `${tmuxName} 不在 registry 或无 sessionId` });
+      break;
+    }
+    const r = await archiveSession(tmuxName, info.cwd, info.sessionId);
+    const all = await listArchivedSessions(tmuxName);
+    output({ ok: r.ok, note: r.note, archived: r.archived, sessions: all });
     break;
   }
 

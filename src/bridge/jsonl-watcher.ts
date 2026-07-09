@@ -61,7 +61,8 @@ function isHiddenTool(name: string): boolean {
   return false;
 }
 
-function formatTool(name: string, input: any): string {
+// v2.8+ 导出：bg-activity-watcher 渲染 subagent 的工具调用时复用同一套格式
+export function formatTool(name: string, input: any): string {
   const E: Record<string, string> = {
     Read: "📖", Edit: "✏️", Write: "📝", Bash: "💻",
     Glob: "🔍", Grep: "🔎", Agent: "🤖", WebSearch: "🌐",

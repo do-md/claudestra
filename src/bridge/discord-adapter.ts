@@ -40,6 +40,22 @@ export function createDiscordChatAdapter(discord: Client): ChatAdapter {
       const channelId = await discordCreateChannel(discord, name, opts?.category);
       return { chatId: channelId };
     },
+    // v2.8+：bg 活动（subagent / 后台 shell）的子会话 = Discord thread。
+    // thread id 在 Discord API 里就是一种 channel id，send/edit 直接可用。
+    async provisionThread(parentChatId, title) {
+      const ch = (await discord.channels.fetch(parentChatId)) as TextChannel;
+      const thread = await ch.threads.create({
+        name: title.slice(0, 100),
+        autoArchiveDuration: 1440, // 24h 无活动自动归档（Discord 侧兜底）
+      });
+      return { chatId: thread.id };
+    },
+    async archiveThread(chatId) {
+      try {
+        const th = await discord.channels.fetch(chatId);
+        if (th && "setArchived" in th) await (th as any).setArchived(true);
+      } catch { /* thread 已删/已归档，non-critical */ }
+    },
   };
 }
 
