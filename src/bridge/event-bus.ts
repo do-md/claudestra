@@ -1,0 +1,144 @@
+/**
+ * v2.6.0+ 进程内事件总线（多前端架构的只读地基）。
+ *
+ * 设计见 docs/design-multi-frontend.md §4。要点：
+ * - 旁路镜像：jsonl-watcher / bridge 在既有分支里加一行 emit()，Discord 渲染
+ *   管线一字不动。事件流是镜像不是管线上游 —— 新前端（Web/Telegram）订阅
+ *   这里自行渲染，不复用 Discord 的 debounce/edit 逻辑。
+ * - 无持久化：权威历史在 jsonl（lib/agent-stats、lib/jsonl-cost 可查），这里
+ *   只做实时 + 环形缓冲补发。bridge 重启即清零（已知限制 R6）。
+ * - schema additive-only：BridgeEvent 只加字段不删不改语义（对前端作者的
+ *   兼容承诺，设计 D7）。
+ */
+
+export type BridgeEventType =
+  | "tool_start"
+  | "tool_done"
+  | "assistant_text"
+  | "turn_duration"
+  | "agent_status"
+  | "auto_deny"
+  | "question"
+  | "chat_message"
+  // v2.7+ 会话对账异常：bg 分身出现 / 链路掉线 / 收编与清理结果（agents 模式适配）
+  | "session_anomaly"
+  // v2.8+ bg 活动生命周期（subagent / 后台 shell 任务），data.kind 区分
+  | "bg_task_started"
+  | "bg_task_update"
+  | "bg_task_completed";
+
+export interface BridgeEvent {
+  /** 进程内单调递增，SSE 的 id / Last-Event-ID 补发锚点 */
+  seq: number;
+  /** ISO 时间戳 */
+  ts: string;
+  /** registry 里的 agent 名（master 用 "master"） */
+  agent: string;
+  /** 该 agent 的主会话地址（统一 keyspace，裸 id = discord） */
+  chatId: string;
+  type: BridgeEventType;
+  /** 按 type 各自的负载，见设计 §4.1（additive-only） */
+  data: Record<string, unknown>;
+}
+
+export type EventFilter = {
+  /** 只要这个 agent 的事件；省略 = 全部 */
+  agent?: string;
+  /** 只要这些 agent 的事件（token scope 过滤用）；省略 = 不限 */
+  agents?: string[];
+};
+
+type Subscriber = {
+  filter: EventFilter;
+  cb: (evt: BridgeEvent) => void;
+};
+
+/** 每个 agent 的环形缓冲上限（补发窗口） */
+export const RING_LIMIT = 500;
+
+let nextSeq = 1;
+const subscribers = new Set<Subscriber>();
+/** agent → 该 agent 最近 RING_LIMIT 条事件（seq 升序） */
+const rings = new Map<string, BridgeEvent[]>();
+
+function matches(evt: BridgeEvent, filter: EventFilter): boolean {
+  if (filter.agent && evt.agent !== filter.agent) return false;
+  if (filter.agents && !filter.agents.includes(evt.agent)) return false;
+  return true;
+}
+
+/**
+ * 发布一条事件。seq/ts 由总线补齐。订阅者回调异常只 log 不传播 ——
+ * 事件流是旁路，任何情况下不能影响主流程。
+ */
+export function emitEvent(
+  evt: Omit<BridgeEvent, "seq" | "ts"> & { ts?: string },
+): BridgeEvent {
+  const full: BridgeEvent = {
+    seq: nextSeq++,
+    ts: evt.ts ?? new Date().toISOString(),
+    agent: evt.agent,
+    chatId: evt.chatId,
+    type: evt.type,
+    data: evt.data,
+  };
+  let ring = rings.get(full.agent);
+  if (!ring) {
+    ring = [];
+    rings.set(full.agent, ring);
+  }
+  ring.push(full);
+  if (ring.length > RING_LIMIT) ring.splice(0, ring.length - RING_LIMIT);
+
+  for (const sub of subscribers) {
+    if (!matches(full, sub.filter)) continue;
+    try {
+      sub.cb(full);
+    } catch (e) {
+      console.error("event-bus 订阅者回调异常（忽略）:", (e as Error).message);
+    }
+  }
+  return full;
+}
+
+/** 订阅实时事件。返回取消函数。 */
+export function subscribeEvents(
+  filter: EventFilter,
+  cb: (evt: BridgeEvent) => void,
+): () => void {
+  const sub: Subscriber = { filter, cb };
+  subscribers.add(sub);
+  return () => {
+    subscribers.delete(sub);
+  };
+}
+
+/**
+ * 补发：返回 seq > since 的缓冲事件（跨 agent 合并后按 seq 升序）。
+ * since=0 表示"从缓冲最早处开始"。
+ */
+export function replayEventsSince(
+  since: number,
+  filter: EventFilter = {},
+): BridgeEvent[] {
+  const out: BridgeEvent[] = [];
+  for (const ring of rings.values()) {
+    for (const evt of ring) {
+      if (evt.seq > since && matches(evt, filter)) out.push(evt);
+    }
+  }
+  out.sort((a, b) => a.seq - b.seq);
+  return out;
+}
+
+/** 当前订阅者数量（测试/诊断用） */
+export function subscriberCount(): number {
+  return subscribers.size;
+}
+
+/** 测试专用：清空总线状态 */
+export function __resetEventBusForTest(): void {
+  nextSeq = 1;
+  subscribers.clear();
+  rings.clear();
+}

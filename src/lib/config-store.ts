@@ -21,6 +21,8 @@ export interface AppConfig {
   };
   /** 用户在 setup 里选的默认语言，贯穿整个 app（Discord 消息 / 通知 / 日志）。v1.9.31+ */
   lang: AppLang;
+  /** v2.4.25+ 只读用量看板频道 + 常驻消息 id（stats-dashboard 用）。 */
+  statsDashboard?: { channelId: string; messageId: string };
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -40,6 +42,13 @@ function merge(base: AppConfig, raw: any): AppConfig {
       claudeCode: typeof au.claudeCode === "boolean" ? au.claudeCode : base.autoUpdate.claudeCode,
     },
     lang: raw.lang === "en" || raw.lang === "zh" ? raw.lang : base.lang,
+    statsDashboard:
+      raw.statsDashboard && typeof raw.statsDashboard.channelId === "string"
+        ? {
+            channelId: raw.statsDashboard.channelId,
+            messageId: String(raw.statsDashboard.messageId || ""),
+          }
+        : base.statsDashboard,
   };
 }
 
@@ -70,6 +79,13 @@ export async function setAutoUpdate(target: "claudestra" | "claudeCode", enabled
 export async function setLang(lang: AppLang): Promise<AppConfig> {
   const cfg = await readConfig();
   cfg.lang = lang;
+  await writeConfig(cfg);
+  return cfg;
+}
+
+export async function setStatsDashboard(channelId: string, messageId: string): Promise<AppConfig> {
+  const cfg = await readConfig();
+  cfg.statsDashboard = { channelId, messageId };
   await writeConfig(cfg);
   return cfg;
 }

@@ -35,6 +35,7 @@ import { existsSync } from "fs";
 import { homedir } from "os";
 import { spawnSync } from "child_process";
 import { join, resolve, dirname } from "path";
+import { readActiveAgents } from "./registry.js";
 
 const TMUX_SOCK = "/tmp/claude-orchestrator/master.sock";
 
@@ -72,6 +73,8 @@ export interface InstallCliResult {
   bumpedTmuxDashboardLimit?: { from: number; to: number } | null;
   /** ~/.claude/settings.json permissions.allow 加进去的 mcp__<server>__* wildcard 规则（已存在的不重加） */
   allowedMcpTools?: { added: string[]; servers: string[] } | null;
+  /** v2.5.4+ repo skills/ 里随包分发的 skill，symlink 到 ~/.claude/skills/ 的结果 */
+  bundledSkills?: { linked: string[]; skipped: string[] };
   errors: string[];
   warnings: string[];
 }
@@ -441,18 +444,15 @@ async function ensureMcpToolsAllowed(repoRoot: string): Promise<{ added: string[
 
   // 3) project-level：扫所有 Claudestra registry 里 active agent 的 cwd
   //    下的 .mcp.json —— project-level MCP server 都列在那里
-  try {
-    const reg = JSON.parse(await readFile(`${homedir()}/.claude-orchestrator/registry.json`, "utf-8"));
-    for (const info of Object.values(reg?.agents || {}) as any[]) {
-      if (info?.status !== "active" || !info?.cwd) continue;
-      const mcpPath = `${info.cwd}/.mcp.json`;
-      if (!existsSync(mcpPath)) continue;
-      try {
-        const projMcp = JSON.parse(await readFile(mcpPath, "utf-8"));
-        Object.keys(projMcp?.mcpServers || {}).forEach((s) => serverNames.add(s));
-      } catch { /* skip bad json */ }
-    }
-  } catch { /* registry missing */ }
+  for (const info of await readActiveAgents()) {
+    if (!info.cwd) continue;
+    const mcpPath = `${info.cwd}/.mcp.json`;
+    if (!existsSync(mcpPath)) continue;
+    try {
+      const projMcp = JSON.parse(await readFile(mcpPath, "utf-8"));
+      Object.keys(projMcp?.mcpServers || {}).forEach((s) => serverNames.add(s));
+    } catch { /* skip bad json */ }
+  }
 
   // 4) 最起码确保 claudestra 本身在（即使上面都没找到，比如全新装机）
   let mcpName = process.env.MCP_NAME || "";
@@ -530,6 +530,40 @@ async function removeOldAutostartWrapper(): Promise<boolean> {
  *
  * Idempotent —— 跑多次只是重写同一份文件 + 重新 load，无害。每次 update 走一次。
  */
+/**
+ * v2.5.4+ 把 repo skills/ 下随包分发的 skill symlink 到 ~/.claude/skills/。
+ * 用 symlink 而不是拷贝：update 后 skill 内容自动跟着 repo 走，无需重装。
+ * 幂等规则：目标不存在或已是 symlink → (重)建指向本 repo；目标是用户自己的真实
+ * 目录 → 不动（尊重用户自定义），记进 skipped。
+ */
+async function installBundledSkills(repoRoot: string): Promise<{ linked: string[]; skipped: string[] }> {
+  const srcRoot = join(repoRoot, "skills");
+  const dstRoot = join(homedir(), ".claude", "skills");
+  const linked: string[] = [];
+  const skipped: string[] = [];
+  if (!existsSync(srcRoot)) return { linked, skipped };
+  const { readdir, lstat, rm } = await import("fs/promises");
+  await mkdir(dstRoot, { recursive: true });
+  for (const name of await readdir(srcRoot)) {
+    const src = join(srcRoot, name);
+    if (!existsSync(join(src, "SKILL.md"))) continue;
+    const dst = join(dstRoot, name);
+    try {
+      const st = await lstat(dst).catch(() => null);
+      if (st && !st.isSymbolicLink()) {
+        skipped.push(name); // 用户自己的同名 skill，不覆盖
+        continue;
+      }
+      if (st) await rm(dst); // 旧 symlink（可能指向老路径）→ 重建
+      await symlink(src, dst);
+      linked.push(name);
+    } catch {
+      skipped.push(name);
+    }
+  }
+  return { linked, skipped };
+}
+
 export async function installClaudestraCli(repoRoot: string): Promise<InstallCliResult> {
   repoRoot = resolve(repoRoot);
   const errors: string[] = [];
@@ -587,6 +621,10 @@ export async function installClaudestraCli(repoRoot: string): Promise<InstallCli
   //     （参考 ensureMcpToolsAllowed 注释里的多个 bug 案例）
   try { result.allowedMcpTools = await ensureMcpToolsAllowed(repoRoot); }
   catch (e) { warnings.push(`allow mcp__*__* 工具: ${(e as Error).message}`); }
+
+  // 5e) repo skills/ 里的随包 skill → symlink 到 ~/.claude/skills/（save-compact 等）
+  try { result.bundledSkills = await installBundledSkills(repoRoot); }
+  catch (e) { warnings.push(`装 bundled skills: ${(e as Error).message}`); }
 
   // 6) bootstrap 3 个新 plist
   const uid = getUid();

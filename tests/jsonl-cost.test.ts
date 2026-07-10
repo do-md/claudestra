@@ -3,10 +3,10 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, realpathSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { rollupJsonl, mergeByModel, emptyUsage } from "../src/lib/jsonl-cost.js";
+import { rollupJsonl, mergeByModel, emptyUsage, projectsSlug } from "../src/lib/jsonl-cost.js";
 
 function mkJsonl(lines: object[]): string {
   const dir = mkdtempSync(join(tmpdir(), "jsonl-test-"));
@@ -131,5 +131,31 @@ describe("emptyUsage", () => {
     expect(u.input).toBe(0);
     expect(u.output).toBe(0);
     expect(u.requests).toBe(0);
+  });
+});
+
+describe("projectsSlug", () => {
+  test("普通路径：去掉开头 / 后把 / 换成 -", () => {
+    // 用真实存在的目录（realpath 不改变非符号链接路径的语义）
+    const dir = mkdtempSync(join(tmpdir(), "slug-plain-"));
+    const real = realpathSync(dir);
+    expect(projectsSlug(real)).toBe("-" + real.replace(/^\//, "").replace(/\//g, "-"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("符号链接先 resolve 再算 slug（macOS /tmp → /private/tmp 一类）", () => {
+    const base = mkdtempSync(join(tmpdir(), "slug-link-"));
+    const realBase = realpathSync(base);
+    const target = join(realBase, "real-target");
+    const link = join(realBase, "the-link");
+    mkdirSync(target);
+    symlinkSync(target, link);
+    expect(projectsSlug(link)).toBe(projectsSlug(target));
+    expect(projectsSlug(link)).toContain("real-target");
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  test("路径不存在 → 按原样算 slug，不抛错", () => {
+    expect(projectsSlug("/no/such/dir/xyz")).toBe("-no-such-dir-xyz");
   });
 });

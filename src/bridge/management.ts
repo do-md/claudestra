@@ -8,6 +8,14 @@ import { typingIntervals } from "./components.js";
 import { tmuxScreenshot } from "./screenshot.js";
 import { buildComponents } from "./components.js";
 import { discordReply } from "./discord-api.js";
+// v2.7+ Claude Code agents 模式适配：会话总览面板（Discord 是 SessionsInventory
+// 的渲染器之一，HTTP GET /api/v1/sessions 与本面板共用同一数据源）
+import {
+  collectSessions,
+  type NeutralSessionInfo,
+} from "./sessions-inventory.js";
+import { cleanupBgJob } from "../lib/bg-jobs.js";
+import { emitEvent } from "./event-bus.js";
 
 export async function runManager(...args: string[]): Promise<any> {
   const proc = Bun.spawn(["bun", "run", MANAGER_PATH, ...args], {
@@ -123,6 +131,13 @@ export async function buildStatusPanel(): Promise<{
       emoji: "⏰",
       style: "secondary",
     },
+    // v2.7+ Claude Code agents 模式：全机器会话总览（bg 分身检测/清理/收编）
+    {
+      id: "show_sessions_panel",
+      label: "后台会话",
+      emoji: "🧬",
+      style: "secondary",
+    },
   ];
   return {
     text: "**📊 Agent 状态**\n\n" + lines.join("\n\n"),
@@ -133,6 +148,77 @@ export async function buildStatusPanel(): Promise<{
   };
 }
 
+// ============================================================
+// v2.7+ Claude 会话总览面板（agents 模式适配）
+// ============================================================
+
+/** bg 会话一行摘要：名字、bgId、状态、分身标记 */
+function bgSessionLine(s: NeutralSessionInfo): string {
+  const mark = s.doppelgangerOf
+    ? `\n　└ ⚠️ 疑似 **${s.doppelgangerOf}** 的分身（${s.doppelgangerReason === "same-name" ? "同名" : "同目录"}）`
+    : s.registeredAgent
+      ? `\n　└ ✓ 正式会话（${s.registeredAgent}）`
+      : "";
+  const intent = s.intent ? `\n　intent: ${s.intent.slice(0, 80)}` : "";
+  return `**${s.name || "(无名)"}** \`${s.bgId}\` — ${s.status}${mark}${intent}`;
+}
+
+export async function buildSessionsPanel(): Promise<{ text: string; components: any[] }> {
+  const list = await collectSessions();
+  if (list === null) {
+    return { text: "❌ `claude agents --json` 不可用（Claude Code CLI 缺失或版本过旧）", components: [] };
+  }
+  const fg = list.filter((s) => s.kind === "interactive");
+  const bg = list.filter((s) => s.kind === "background");
+  const fgWild = fg.filter((s) => !s.registeredAgent);
+
+  const parts: string[] = ["**🧬 Claude 会话总览**"];
+  parts.push(
+    `**前台**: ${fg.length} 个（${fg.length - fgWild.length} 个已注册${fgWild.length ? `，${fgWild.length} 个未注册` : ""}）`,
+  );
+  for (const s of fgWild) {
+    parts.push(`　· 未注册: \`${s.sessionId.slice(0, 8)}\` @ ${s.cwd || "?"}`);
+  }
+  if (bg.length === 0) {
+    parts.push("**Background**: 无 ✨");
+  } else {
+    parts.push(`**Background**: ${bg.length} 个`);
+    for (const s of bg) parts.push(bgSessionLine(s));
+  }
+
+  // 每个 bg 一行按钮（Discord 上限 5 行 component，留 1 行给刷新）
+  const components: any[] = [];
+  for (const s of bg.slice(0, 4)) {
+    const buttons: any[] = [
+      { id: `sess_detail:${s.bgId}`, label: `详情 ${s.bgId?.slice(0, 8)}`, emoji: "👁", style: "secondary" },
+    ];
+    if (s.doppelgangerOf) {
+      buttons.push({
+        id: `sess_adopt:${s.bgId}`,
+        label: `收编→${s.doppelgangerOf.replace("agent-", "").slice(0, 20)}`,
+        emoji: "⤴️",
+        style: "primary",
+      });
+    }
+    buttons.push({ id: `sess_cleanup:${s.bgId}`, label: "清理", emoji: "🗑", style: "danger" });
+    components.push({ type: "buttons", buttons });
+  }
+  if (bg.length > 4) {
+    parts.push(`（仅前 4 个 bg 会话带按钮，其余用 CLI: \`manager.ts adopt/resume --fork\`）`);
+  }
+  components.push({
+    type: "buttons",
+    buttons: [{ id: "show_sessions_panel", label: "刷新", emoji: "🔄", style: "primary" }],
+  });
+  return { text: parts.join("\n"), components };
+}
+
+/** 按 bgId 反查 bg 会话（按钮回调用） */
+async function findBgSession(bgId: string): Promise<NeutralSessionInfo | null> {
+  const list = await collectSessions();
+  return list?.find((s) => s.kind === "background" && s.bgId === bgId) ?? null;
+}
+
 export async function handleMgmtButton(
   id: string,
   chatId: string,
@@ -141,6 +227,77 @@ export async function handleMgmtButton(
 ): Promise<{ text: string; components?: any[] } | null> {
   if (id === "list_agents") {
     return await buildStatusPanel();
+  }
+
+  // ── v2.7+ 会话总览面板 ──
+  if (id === "show_sessions_panel") {
+    return await buildSessionsPanel();
+  }
+
+  if (id.startsWith("sess_detail:")) {
+    const s = await findBgSession(id.slice("sess_detail:".length));
+    if (!s) return { text: "❌ 该 bg 会话已不存在（可能已被清理）" };
+    const lines = [
+      `**👁 bg 会话详情** \`${s.bgId}\``,
+      `session: \`${s.sessionId}\``,
+      `状态: ${s.status}　tokens: ${s.tokens ?? "?"}　pid: ${s.pid ?? "(无进程)"}`,
+      `cwd: \`${s.cwd || "?"}\``,
+      s.doppelgangerOf ? `⚠️ 疑似 ${s.doppelgangerOf} 的分身` : "",
+      s.intent ? `intent: ${s.intent}` : "",
+      s.detail ? `最后状态: ${s.detail.slice(0, 600)}` : "",
+      s.updatedAt ? `更新: ${s.updatedAt}` : "",
+    ].filter(Boolean);
+    return { text: lines.join("\n") };
+  }
+
+  if (id.startsWith("sess_cleanup:")) {
+    const bgId = id.slice("sess_cleanup:".length);
+    const s = await findBgSession(bgId);
+    if (!s) return { text: "❌ 该 bg 会话已不存在（可能已被清理）" };
+    // 长操作（kill → 等 daemon 静默 → 隔离目录，最长 ~90s）→ 先回执后台跑
+    cleanupBgJob(bgId, { pid: s.pid })
+      .then(async (r) => {
+        emitEvent({
+          agent: s.doppelgangerOf ?? s.name ?? bgId,
+          chatId,
+          type: "session_anomaly",
+          data: { kind: "cleanup_result", bgId, ...r },
+        });
+        if (discord) {
+          const text = r.ok
+            ? `✅ bg 会话 \`${bgId}\` 已清理（job 目录已隔离，可恢复）`
+            : `⚠️ bg 会话 \`${bgId}\` 清理失败: ${r.note}`;
+          await discordReply(discord, chatId, text).catch(() => {});
+        }
+      })
+      .catch(() => {});
+    return { text: `🗑 正在清理 bg 会话 \`${bgId}\`（kill → 等 daemon 写回 → 隔离目录，最长 90 秒，完成后另发结果）` };
+  }
+
+  if (id.startsWith("sess_adopt:")) {
+    const bgId = id.slice("sess_adopt:".length);
+    const s = await findBgSession(bgId);
+    if (!s) return { text: "❌ 该 bg 会话已不存在（可能已被清理）" };
+    if (!s.doppelgangerOf) return { text: "❌ 该会话没有对应的正式 agent（野生会话请用 CLI: `manager.ts resume <新名> <sessionId> --fork`）" };
+    const target = s.doppelgangerOf;
+    runManager("adopt", target, s.sessionId)
+      .then(async (r) => {
+        emitEvent({
+          agent: target,
+          chatId,
+          type: "session_anomaly",
+          data: { kind: "adopt_result", sessionId: s.sessionId, ok: !!r?.ok, ...r },
+        });
+        if (discord) {
+          const ok = r?.ok || r?.results?.some?.((x: any) => x.ok);
+          const text = ok
+            ? `✅ 已收编 \`${s.sessionId.slice(0, 8)}\` 为 ${target} 的正式会话并重启拉起`
+            : `⚠️ 收编失败: ${r?.error || JSON.stringify(r?.results || r).slice(0, 300)}`;
+          await discordReply(discord, chatId, text).catch(() => {});
+        }
+      })
+      .catch(() => {});
+    return { text: `⤴️ 正在收编 \`${s.sessionId.slice(0, 8)}\` → **${target}**（restart 流程约 1-2 分钟，完成后另发结果）` };
   }
 
   if (id === "refresh_status") {

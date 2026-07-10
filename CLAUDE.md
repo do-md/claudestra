@@ -51,7 +51,9 @@ Each Claude Code session has its own `channel-server` subprocess running as a st
 src/
   bridge.ts              Main entry: Discord client, WebSocket server, deliver() dispatch, slash commands, Stop hooks
   bridge/
-    router.ts            v2.0.0+ Envelope/Endpoint types + parseAddress + threadId helpers
+    router.ts            v2.0.0+ Envelope/Endpoint types + parseAddress + threadId helpers; v2.6.0+ parseChatId (unified transport-prefixed chat_id keyspace) + ApiUserEndpoint
+    adapters.ts          v2.6.0+ ChatAdapter interface + registry (NeutralMessage contract); Discord is the first adapter, deliverToUser dispatches by transport
+    event-bus.ts         v2.6.0+ in-process event bus (seq + per-agent ring buffer) mirroring tool calls / assistant text / status → SSE
     config.ts            Shared runtime constants
     components.ts        Discord UI components + typing indicators
     discord-api.ts       Discord API wrappers: discordReply (chunking / reply_to / files / components), channel CRUD, react, edit
@@ -60,7 +62,11 @@ src/
     jsonl-watcher.ts     JSONL session tailer → tool summaries + assistant text stream + drain-on-Stop
     slash-catalog.ts     Hardcoded list of CC built-in slash commands (Discord-friendly subset)
     slash-registry.ts    Runtime registry of discovered skills per scope + per-channel resolver
-    wedge-watcher.ts     Detects agents stuck >30min with no pane change + not idle → Discord alert
+    wedge-watcher.ts     Detects agents stuck >30min with no pane change + not idle → Discord alert; v2.7+ link sentinel (window alive but channel-server offline >5min → repair button)
+    sessions-inventory.ts v2.7+ neutral machine-wide session inventory: `claude agents --json` + jobs state + registry reconciliation → doppelganger detection
+    session-reconciler.ts v2.7+ 10-min bg reconciler: new doppelganger → Discord alert with cleanup/adopt buttons + session_anomaly event
+    bg-activity-watcher.ts v2.8+ bg activity tracker: discovers subagent jsonls + bg shell task outputs per agent session → streams into per-activity threads (ChatAdapter.provisionThread) + bg_task_* SSE events
+    archive-sweeper.ts   v2.9+ daily archive sweep: every 24h snapshots all active agents' session jsonls (idempotent copy-if-larger) — covers crash/never-retired gaps that retirement-time archiving misses
   channel-server.ts      Per-session MCP proxy (stdio MCP ↔ Bridge WebSocket)
   manager.ts             Agent lifecycle + cron + version/update CLI (JSON output)
   cron.ts                Cron scheduler daemon (pm2-managed)
@@ -76,6 +82,11 @@ src/
     skills.ts            SKILL.md discovery — user / plugin / project sources + hardcoded natives
     jsonl-cost.ts        Parse ~/.claude/projects JSONL files → per-model token rollup
     peers.ts             peers.json data model + PeerEvent encode/parse + effective mode
+    principals.ts        v2.6.0+ transport-scoped identity + API token CRUD/scope/rate-limit (~/.claude-orchestrator/principals.json)
+    registry.ts          v2.9+ single reader for ~/.claude-orchestrator/registry.json (field normalization incl. cwd/dir compat); manager.ts stays the sole writer
+    bg-jobs.ts           v2.7+ Claude Code bg job cleanup recipe: kill → wait daemon quiescent → quarantine job dir → on respawn, roster root-fix (v2.9.1: daemon's ~/.claude/daemon/roster.json workers list is the respawn authority — kill worker + transient daemon + drop the entry, only when no other worker would be affected)
+    session-archive.ts   v2.8+ session jsonl snapshot on retirement (kill / fork rotation / adopt / resume-replace) → ~/.claude-orchestrator/archive/<agent>/ — counters CC cleanupPeriodDays
+    session-history.ts   v2.9+ read-only history parsing: live + archived session jsonl → neutral paginated messages, backs GET /api/v1/agents/:name/history
   ansi2html.ts           ANSI escape codes → coloured HTML
   html2png.ts            HTML → PNG via Playwright headless Chromium
   discord-reply.ts       Bash fallback: send a message through the Bridge directly
@@ -107,6 +118,10 @@ SETUP.md                 User-facing installation guide
 - **Idle detection** — Claude Code `Stop` / `Notification` hooks drive Discord typing indicators precisely; a 30-minute safety timeout catches edge cases.
 - **Master guardian** — pm2-managed launcher keeps the master tmux session alive and auto-dismisses Claude Code confirmation prompts.
 - **Safety rails** — `--disallowedTools` blocks `rm -rf`, `git push --force`, `git reset --hard`, `chmod 777`, and other destructive commands for every spawned agent.
+- **Multi-frontend API (v2.6.0+)** — the core is decoupled from Discord (design doc: `docs/design-multi-frontend.md`). Three transport-neutral channels: `GET /events` (SSE stream of tool calls / assistant text / agent status, `Last-Event-ID` replay), `POST /api/v1/agents/:name/messages` (Bearer-token inbound messaging with sync `wait`, multipart file upload, thread polling fallback), and `GET /stats`. Tokens are scoped per-agent (`manager.ts token-add <name> --agents a,b`; non-`--external` agents require `--force` — shared-context leak guard). API conversations are mirrored to the agent's Discord channel for auditability (`--no-mirror` to opt out). Outbound delivery goes through the `ChatAdapter` registry (`bridge/adapters.ts`) — adding Telegram or another platform means implementing one adapter, zero core changes. Bridge HTTP binds `127.0.0.1` by default (`BRIDGE_BIND` to open up).
+- **Claude Code agents-mode integration (v2.7+)** — Claude Code 2.1.x runs a bg-agent daemon (`claude agents`, respawn-on-kill, ← key opens the agents view in every TUI). This system fights Claudestra's tmux-foreground model: a mis-pressed ← can fork a foreground session into a bg job ("doppelganger"), silently breaking the Discord link (2026-07-09 incident). Adaptation layers: **(1) visibility** — `SessionsInventory` (`bridge/sessions-inventory.ts`) merges `claude agents --json` + `~/.claude/jobs/*/state.json` + registry into a neutral session list with doppelganger detection, consumed by the Discord `/agents` panel (LLM-free buttons: detail / adopt / cleanup), `GET /api/v1/sessions`, and `POST /api/v1/sessions/:id/cleanup|adopt` (full-scope token required, 202 + `session_anomaly` SSE events); **(2) self-heal** — `manager.ts restart` detects the "running as a background agent" error and automatically retries with `--fork-session`, then probes the forked session id (projects-dir diff) and writes it back to the registry; `manager.ts adopt <name> <sessionId>` promotes a doppelganger to the official session, `resume --fork` adopts wild sessions; **(3) guards** — permission-watcher auto-escapes agents-view UIs (8s poll, Esc + notify), wedge-watcher's link sentinel alerts when a window is alive but its channel-server has been offline >5min (repair button), and a 10-min reconciler alerts on new doppelgangers with cleanup/adopt buttons. Cleanup recipe (`lib/bg-jobs.ts`, incident-proven): kill bg pids (never `--fork-session` referencers) → wait for daemon quiescence → quarantine the job dir → detect stubborn respawns and defer to the official TUI.
+- **Background-activity threads (v2.8+)** — every agent's background work gets its own sub-conversation instead of polluting the main channel. `bridge/bg-activity-watcher.ts` polls each registered agent's session for two activity kinds: **subagents** (`~/.claude/projects/<slug>/<sessionId>/subagents/agent-*.jsonl`, same format as the main session) and **background shell tasks** (`/tmp/claude-<uid>/<slug>/<sessionId>/tasks/*.output`). A new file → `ChatAdapter.provisionThread` opens a thread under the agent's channel (Discord thread today, Telegram topic later); tool calls / assistant text / shell output stream in with a 2.5s debounce; 3 min of inactivity → completion summary + thread auto-archive. Lifecycle mirrors to SSE as `bg_task_started/update/completed` so a web frontend can render per-task progress lines without Discord. Restart-safe: the first poll baselines existing files without replaying. **Session archive** (`lib/session-archive.ts`): whenever a session retires (kill, fork rotation, adopt, resume-replace, or manual `manager.ts archive <name>`), its jsonl (+ subagents) is snapshotted to `~/.claude-orchestrator/archive/<agent>/` — Claude Code's `cleanupPeriodDays` prunes the originals, the archive is what makes chat history durable. Copy-if-larger semantics; conversation content stays in files, no database (owner-approved storage design 2026-07-10). v2.9+ adds a daily sweeper (`bridge/archive-sweeper.ts`) that re-snapshots every active agent's session, so long-lived sessions that never retire are archived too. SSE `bg_task_*` events carry a stable `id` (file basename: subagent id / shell task id), never server paths.
+- **Read-only history API (v2.9+)** — the web-UI-facing counterpart of the archive: `GET /api/v1/agents/:name/history` lists an agent's sessions (live + archived snapshots merged, live wins when larger), `GET /api/v1/agents/:name/history/:sessionId` returns paginated neutral messages (`?limit=100&before=<seq>` pages backwards like a chat view; `?subagent=agent-xxx` reads a subagent conversation). Parsing lives in `lib/session-history.ts` (pure, unit-tested): user/assistant/compact-boundary entries become `{seq, ts, role, text, tools[], compactSummary?}`, meta entries and tool_result payloads are filtered, tool calls render through jsonl-watcher's `formatTool`. Token scope rules match the messaging endpoint; a killed agent's archives remain readable (that is the point of archiving). sessionId/subagent params are whitelist-validated before touching the filesystem.
 - **Discord slash autocomplete for skills + built-ins** — on startup, the Bridge discovers every available slash command from four sources (user-level `~/.claude/skills/`, installed plugins in `~/.claude/plugins/cache/…`, per-agent `<cwd>/.claude/skills/`, and a curated set of Claude Code built-ins like `/cost`, `/mcp`, `/context`, `/compact`) and registers them as Discord slash commands. Invocations are re-scanned on every `manager.ts create|resume|kill|restart` via the `/skills/rescan` HTTP endpoint. When a user types a registered `/cmd args` in Discord, the bridge forwards the literal text to the channel's agent via `tmux send-keys`, so Claude Code interprets it natively. Project-level skills are filtered: typing a skill that only exists in another agent's cwd yields an ephemeral explanation instead of going through.
 
 ### Cross-Claudestra peer collaboration
@@ -124,24 +139,6 @@ Peers (other Claudestra installs running the same upstream) can share their spec
 - **No-reply fallback (v1.9.37+, replaces the old rescue)** — if the agent ends its turn without calling `reply()`, the `jsonl-watcher` has already been streaming any assistant text to Discord as `💬 ...` (debounced 1.5s). On Stop hook, the Bridge synchronously **drains** that watcher (`drainChannelWatcher`): immediately re-polls the jsonl, cancels the debounce timer, and force-flushes the textQueue before marking the status "✅ 完成". The earlier v1.9.21–v1.9.36 "bridge rescue" mechanism (extract text from jsonl + re-post with `[bridge 兜底]` footer) was removed in 1.9.37 because it duplicated whatever the watcher already streamed — they both read the same jsonl and would each post the same text. Rate-limit messages (`You've hit your limit`) are tagged with `⛔` instead of `💬` and the paired `turn_duration` is suppressed so it doesn't look like real thinking time.
 - **`[EOT]` end-of-thread marker** — agent appends `[EOT]` to its final reply when closing a conversation; receiving bridge drops rather than forwards, preventing two bots from ack-looping in `#agent-exchange`.
 
-### Web client gateway (Web-only mode + coexistence)
-
-A Next.js PWA web client (`web/`, its own `CLAUDE.md`) is a **second front door** alongside Discord. Both can be online at once.
-
-- **Discord optional** — `DISCORD_ENABLED = !!DISCORD_BOT_TOKEN` (`bridge/config.ts`). No token ⇒ Bridge boots **Web-only**: HTTP/WS server + local session orchestration run as usual, only `discord.login()` is skipped (so the `ready` handler, shard watchdogs, slash registration never fire — no per-line gating needed). With a token, behaviour is **byte-for-byte unchanged** (don't break the Discord path — see workspace principle).
-- **Web is an additive output channel, not a replacement.** `bridge/web-hub.ts` holds `subscribeWeb / pushToWeb` keyed by `channelId`. Session output fans out to Discord (if enabled) **and** to Web subscribers (always) → both surfaces mirror the same session. `DISCORD_ENABLED` only gates Discord-specific *outputs* (`deliverToUser` / `deliverToPeer` early-drop; `create_channel` returns a synthetic `local-<uuid>` id; `isLocalChannelId` guards delete/rename).
-- **HTTP gateway on the existing `Bun.serve` (3847)** — `POST /web/inject {channelId,text}` → `deliver(user→local)` (bypasses `messageCreate`, so no Discord "💭 Thinking" UI). `GET /web/stream?channelId=` → SSE subscribed to `web-hub`. `POST /web/agents {name,dir,purpose}` / `/web/agents/kill {name}` / `/web/agents/restart {name}` → reuse `runManager` (create/kill/restart) so the Web front door can spawn/stop sessions without a terminal. The Next.js BFF (auth'd) proxies all of these server-side; the browser never touches 3847.
-- **History is BFF-direct, not a Bridge endpoint** — `GET /api/chat/history?agent=` reads the CC session jsonl directly in the Next process (resolves `sessionId+cwd` from `registry.json`, parses `~/.claude/projects/-<slug>/<sessionId>.jsonl`). Deliberately *not* a `/web/history` on the Bridge: history is a read-only disk op, works for **stopped** agents (no live `clients` entry), and keeps the change off `bridge.ts`. Only live routing (inject/stream/agents) goes through the Bridge.
-- **大总管 (master orchestrator) on Web** — `GET /web/master` returns `{channelId: CONTROL_CHANNEL_ID, cwd: MASTER_DIR, sessionId: <newest jsonl in master slug>, connected}`. The Web client pins a "大总管" entry (reserved name `__master__`) and routes inject/stream/history to `CONTROL_CHANNEL_ID` — same role as Discord's `#control`. In **Web-only** the master runs via `src/launcher.ts` with a synthetic `CONTROL_CHANNEL_ID=local-master-control` (launchd `com.claudestra.web-launcher`), its persona from a rendered `master/CLAUDE.md`. Parity with Discord: the master has **no jsonl-watcher**, so only its `reply()` results + Stop-hook `done` stream to Web (internal tool churn doesn't); history reconstructs full tool cards from the jsonl.
-- **SSE `idleTimeout` invariant** — `Bun.serve`'s top-level `idleTimeout` is raised to `255` (default 10s would close a `/web/stream` SSE response after 10s of silence, dropping any reply that takes >10s to think). Paired with a 15s `[DONE]` heartbeat in `/web/stream`. Don't remove either — long agent turns depend on it.
-- **Output tees** — `jsonl-watcher` tees tool summaries + assistant text to Web (parallel to `discordReply`); the `reply` handler tees the final reply text (reply is a hidden tool, so it doesn't flow through the watcher — and in Web-only mode a `dropped` deliver is ack'd as success since the Web tee delivered it); the Stop hook pushes `done` after drain. Event shape matches `web/lib/chat/events.ts`.
-- **Rich interactions on Web (Phase 2) — interrupt / permission card / AskUserQuestion card.** All three reuse Discord's existing tmux-keystroke logic; only the in/out surface changes. Three POST endpoints on `Bun.serve` (3847), each proxied by an auth'd Next BFF route (`web/app/api/chat/{interrupt,permission,auq}`):
-  - `POST /web/interrupt {channelId}` → `resolveTmuxTarget` (master via `CONTROL_CHANNEL_ID`/exchange, else registry lookup — **shared** by the Discord `interrupt:` button and this endpoint) → `tmux send-keys C-c` → `pushToWeb(done)` so the composer unlocks. Verified live: halts a streaming agent mid-turn.
-  - `POST /web/permission {channelId, action}` → `applyPermissionAction` (in `bridge/permission-watcher.ts`; exports `PERM_KEY_SEQ`/`PERM_LABELS`; confirms the modal is still on-pane, then sends the digit/arrow key seq — **shared** by the Discord perm button). The **`permission-watcher` now tees** every detected permission / session-idle modal to Web (`pushToWeb` + `setPendingInteraction`) in addition to Discord, and pushes `permission-cleared` when the modal disappears. Watcher is **started in Web-only mode too** (it otherwise only fires inside `discord.once("ready")`). Note: agents spawn `bypassPermissions` by default, so runtime permission modals rarely fire in normal use — endpoint + keystroke path are curl/unit-verified, live modal not commonly reachable.
-  - `POST /web/auq {channelId, action:"submit"|"cancel", selections:number[][]}` → `submitAuqSelections`/`cancelAuq` (in `bridge/ask-user-question.ts`; reuse `buildAuqKeystrokes` → `tmux send-keys`). `jsonl-watcher`'s AskUserQuestion detection now calls `registerAuqState` **unconditionally** (was Discord-gated), then tees an `ask` event to Web; Discord `select`-menu posting only if `DISCORD_ENABLED`. Verified live end-to-end: card renders, single/multi-select, submit drives the exact TUI option.
-  - **Pending-interaction replay** (`web-hub.ts` `setPendingInteraction`/`getPendingInteraction`): interaction cards are stateful and an SSE subscriber may connect *after* the modal appeared (switch session / refresh / foreground reconnect). `/web/stream` replays the current pending `permission`/`ask` event to each new subscriber. Cleared on resolve.
-  - New `WebStreamEvent` variants (`permission` / `permission-cleared` / `ask` / `ask-cleared`) are mirrored in **both** `bridge/web-hub.ts` and `web/lib/chat/events.ts` (kept in sync by hand). Frontend: `chat-store` holds `pendingPermission`/`pendingAsk`, rendered by `permission-card.tsx` / `ask-question-card.tsx`; composer shows a **停止** button while `streaming`.
-
 ## Runtime commands
 
 ```bash
@@ -153,7 +150,9 @@ pm2 start ecosystem.config.cjs
 
 # Agent lifecycle
 bun src/manager.ts create   <name> <dir> [purpose]
-bun src/manager.ts resume   <name> <sessionId> [dir]
+bun src/manager.ts resume   <name> <sessionId> [dir] [--fork]   # --fork: adopt a wild/bg-occupied session as a branched copy
+bun src/manager.ts adopt    <name> <sessionId>   # promote a bg doppelganger to the agent's official session + restart
+bun src/manager.ts archive  <name>               # snapshot the agent's current session jsonl to ~/.claude-orchestrator/archive/
 bun src/manager.ts kill     <name>
 bun src/manager.ts restart  [name]
 bun src/manager.ts list
@@ -182,6 +181,12 @@ bun src/manager.ts auto-update status
 bun src/manager.ts auto-update claudestra on|off   # Claudestra self-update (30 min poll)
 bun src/manager.ts auto-update claude on|off       # Claude Code CLI (weekly poll)
 
+# Multi-frontend API tokens (v2.6.0+; scope = per-agent whitelist, "*" = all non-master)
+bun src/manager.ts token-add <name> --agents <a,b|*> [--force] [--no-mirror]
+bun src/manager.ts token-list
+bun src/manager.ts token-revoke <tokenId|name>
+bun src/manager.ts create <name> <dir> --external   # mark agent as safe-to-expose (R1 guard)
+
 # Token usage aggregation (parses ~/.claude/projects/<slug>/<sessionId>.jsonl)
 bun src/manager.ts cost [--agent <name>] [--today|--week]
 
@@ -202,6 +207,7 @@ bun test
 | `USER_NAME` | How the master agent addresses the operator in replies |
 | `BRIDGE_URL` | Optional override for the channel-server's WebSocket target |
 | `MASTER_DIR` | Optional override for the master tmux session's working directory |
+| `BRIDGE_BIND` | HTTP/ws bind address (default `127.0.0.1`; set `0.0.0.0` to expose — bring your own reverse proxy/TLS) |
 
 ## tmux topology
 
@@ -234,6 +240,7 @@ tmux -S /tmp/claude-orchestrator/master.sock -CC attach
 ## Contributing tips
 
 - **Release process**: commits and `git push` to `main` are fine to do autonomously. Creating a `git tag v*` and a GitHub Release (`gh release create`) requires **explicit owner approval** every time — never tag-and-release on your own initiative.
+- **Batch releases, don't spray them** (owner-mandated 2026-07-08 after reviewing 59 releases in 2.5 months): non-urgent changes accumulate in `main` and ship as **one release at the end of a work session/day**, bundling everything since the last release (v2.5.4 is the reference example: five features/fixes, one release). Only production-down hotfixes justify an immediate solo release. Same-day multi-release chains (e.g. 4 releases on 2026-04-25) usually mean the release was cut before verification — verify first, then cut. And keep version semantics honest: new user-facing capability = minor, even if small; patch is for fixes/refactors/polish only.
 - **Version bump rules** (owner-mandated, refined 2026-04-20 starting v1.7.0):
   - **Patch** (`x.y.Z`) — bug fixes, small enhancements, extra CLI subcommands, refactors, tests, docs, UI polish. Most changes land here. If the bump is specifically a bug fix, also **delete the buggy release** via `gh release delete <tag> --yes --cleanup-tag` so the Releases list contains no broken versions. Polish/small-feature patches don't delete the previous version.
   - **Minor** (`x.Y.0`) — genuinely new user-facing capability that deserves a one-line "现在你可以 ..." headline. Examples: v1.3.0 Claude Code auto-update, v1.5.0 Discord slash autocomplete. Older minors are kept as history.

@@ -75,7 +75,20 @@ export interface BridgeEndpoint {
   label?: string;
 }
 
-export type Endpoint = LocalEndpoint | PeerEndpoint | UserEndpoint | BridgeEndpoint;
+/**
+ * v2.6.0+ HTTP API 用户（多前端架构 Phase B，设计 §5）。
+ * 会话地址是虚拟 chat_id `api:<tokenId>`（统一 keyspace，D7）：agent 收到的
+ * meta.chat_id 就是它，reply 原样回传 → resolveReplyTarget 识别前缀 → 这里。
+ */
+export interface ApiUserEndpoint {
+  kind: "api";
+  /** token 短 id（"tok_xxx"），虚拟 chat_id 的 id 部分 */
+  tokenId: string;
+  /** token 的人类名，渲染进 agent 看到的 header */
+  name: string;
+}
+
+export type Endpoint = LocalEndpoint | PeerEndpoint | UserEndpoint | BridgeEndpoint | ApiUserEndpoint;
 
 // ============================================================
 // Envelope：一条待投递的消息
@@ -186,6 +199,8 @@ export function endpointLabel(e: Endpoint): string {
       return `user:${e.userId}@${e.channelId}`;
     case "bridge":
       return `bridge:${e.label ?? "?"}`;
+    case "api":
+      return `api:${e.tokenId}(${e.name})`;
   }
 }
 
@@ -261,6 +276,45 @@ export function formatAddress(a: ParsedAddress): AddressString {
     case "channel":
       return `channel:${a.primary}`;
   }
+}
+
+// ============================================================
+// v2.6.0+ 统一 chat_id keyspace（设计 D7，多前端架构的地址合同）
+// ============================================================
+
+/**
+ * 所有「会话地址」是一个带 transport 前缀的字符串：
+ *   discord:<channelId>   Discord 频道
+ *   api:<tokenId>         HTTP API 用户
+ *   telegram:<chatId>     Telegram（future）
+ *   <裸 id>               兼容形态 = discord:<id>，永久支持
+ *
+ * registry / clients / pendingReplies / thread 把 key 当不透明字符串使用，
+ * agent 的 reply(chat_id) 原样回传 —— 解析只发生在 bridge 的出入口，且
+ * 必须经过这里，核心里禁止再出现对裸 id 的 Discord 假设。
+ */
+export interface ParsedChatId {
+  transport: string;
+  id: string;
+}
+
+const KNOWN_TRANSPORTS = new Set(["discord", "api", "telegram", "web"]);
+
+export function parseChatId(s: string): ParsedChatId {
+  const idx = s.indexOf(":");
+  if (idx > 0) {
+    const prefix = s.slice(0, idx);
+    if (KNOWN_TRANSPORTS.has(prefix)) {
+      return { transport: prefix, id: s.slice(idx + 1) };
+    }
+  }
+  // 裸 id（Discord snowflake 或历史数据）= discord，永久兼容
+  return { transport: "discord", id: s };
+}
+
+/** 格式化回统一 keyspace 字符串。discord 保持裸 id（历史兼容 + registry 主键不变） */
+export function formatChatId(p: ParsedChatId): string {
+  return p.transport === "discord" ? p.id : `${p.transport}:${p.id}`;
 }
 
 // ============================================================

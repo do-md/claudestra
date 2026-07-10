@@ -18,104 +18,55 @@ import {
 import { tmuxScreenshot } from "./screenshot.js";
 import { buildComponents } from "./components.js";
 import { runManager } from "./management.js";
-import { DISCORD_ENABLED } from "./config.js";
-import {
-  pushToWeb,
-  setPendingInteraction,
-  type WebStreamEvent,
-} from "./web-hub.js";
-
-/**
- * 弹窗按钮 → Claude Code TUI 按键**序列**（单一事实源）。
- * Discord 按钮处理器与 Web /web/permission 端点都用它，避免两处漂移。
- * v2.0.22+: session-idle modal 不接受 digit 跳转（按 "2" 不跳 option 2，Enter 只确认
- * 高亮的 option 1 = 从摘要恢复 = compact）。改用 arrow nav：光标默认 option 1，
- * Down 一次到 2，两次到 3。perm 弹窗保留 digit（实测可用）。
- */
-export const PERM_KEY_SEQ: Record<string, string[]> = {
-  perm_allow: ["1", "Enter"],
-  perm_allow_session: ["2", "Enter"],
-  perm_deny: ["3", "Enter"],
-  session_summary: ["Enter"], // option 1（高亮默认）
-  session_full: ["Down", "Enter"], // ↓ 到 option 2
-  session_noask: ["Down", "Down", "Enter"], // ↓↓ 到 option 3
-};
-
-export const PERM_LABELS: Record<string, string> = {
-  perm_allow: "✅ 已允许",
-  perm_allow_session: "✅ 已允许（本会话不再问）",
-  perm_deny: "❌ 已拒绝",
-  session_summary: "✨ 从摘要恢复",
-  session_full: "📜 恢复完整会话",
-  session_noask: "🔕 不再询问",
-};
-
-/**
- * 执行一个权限/session-idle 弹窗响应：解析 channelId→agent，确认弹窗还在，
- * 把对应按键序列发给 agent 的 tmux window。Discord 按钮与 Web 端点共用。
- * 返回 `dialogClosed:true` 表示弹窗已自动关闭（无需操作），此时不发键。
- */
-export async function applyPermissionAction(
-  targetChannelId: string,
-  action: string
-): Promise<{ ok: boolean; error?: string; agentName?: string; dialogClosed?: boolean }> {
-  const keySeq = PERM_KEY_SEQ[action];
-  if (!keySeq) return { ok: false, error: `未知操作 ${action}` };
-  const isPermBtn = action.startsWith("perm_");
-  const isIdleBtn = action.startsWith("session_");
-
-  const listResult = await runManager("list");
-  const agent = (listResult.agents || []).find(
-    (a: any) => a.channelId === targetChannelId
-  );
-  if (!agent) return { ok: false, error: "找不到对应 agent" };
-
-  // 发键前再确认弹窗还在，避免把 digit+Enter 当普通消息提交给 Claude
-  const pane = await tmuxCapture(windowTarget(agent.name), 30);
-  const hasPerm = detectRuntimePermissionPrompt(pane) !== null;
-  const hasIdle = detectSessionIdlePrompt(pane) !== null;
-  const dialogStillActive = (isPermBtn && hasPerm) || (isIdleBtn && hasIdle);
-  if (!dialogStillActive) return { ok: false, dialogClosed: true, agentName: agent.name };
-
-  await tmuxRaw(["send-keys", "-t", `master:${agent.name}`, ...keySeq]);
-  return { ok: true, agentName: agent.name };
-}
-
-/** 把当前 modal 渲染成 Web 交互卡事件（permission/session-idle 共用）。 */
-function buildPermissionWebEvent(
-  key: string,
-  sessionIdleDesc: string | null,
-  permissionDesc: string | null
-): Extract<WebStreamEvent, { t: "permission" }> {
-  if (sessionIdleDesc) {
-    return {
-      t: "permission",
-      id: key,
-      kind: "session-idle",
-      title: "session 已闲置，Claude Code 询问如何继续",
-      desc: sessionIdleDesc,
-      actions: [
-        { action: "session_summary", label: "从摘要恢复", style: "success" },
-        { action: "session_full", label: "恢复完整会话", style: "primary" },
-        { action: "session_noask", label: "不再询问", style: "secondary" },
-      ],
-    };
-  }
-  return {
-    t: "permission",
-    id: key,
-    kind: "permission",
-    title: "需要授权",
-    desc: permissionDesc || "",
-    actions: [
-      { action: "perm_allow", label: "允许", style: "success" },
-      { action: "perm_allow_session", label: "允许 + 本会话不再问", style: "primary" },
-      { action: "perm_deny", label: "拒绝", style: "danger" },
-    ],
-  };
-}
 
 const POLL_INTERVAL_MS = 8_000;
+
+// v2.7+ agents 视图自动逃逸的通知去重（channelId → 上次通知时间戳）
+const agentsViewNotifiedAt = new Map<string, number>();
+const AGENTS_VIEW_NOTIFY_COOLDOWN_MS = 10 * 60_000;
+
+/**
+ * v2.7+ 自动逃逸：agent 窗口误入 Claude Code 的 agents 视图 / bg 派发界面。
+ *
+ * 空输入框按 ← 会进 agents 视图；在里面切换会话会把当前会话 fork 成 bg job、
+ * 窗口变 attach 旁观视图，Discord/MCP 链路断掉（2026-07-09 事故）。上游没有
+ * 禁用开关（keybindings 管不到、settings 无相关键），只能事后秒级拉回：
+ * 检测 dispatch 界面特征 → 发 Esc 退回对话界面 → 通知频道。
+ * Esc 对正常对话界面无害（顶多取消未提交输入），误判代价低。
+ */
+async function maybeEscapeAgentsView(
+  agentName: string,
+  channelId: string,
+  pane: string,
+  discord: Client,
+): Promise<boolean> {
+  const inAgentsView =
+    pane.includes("describe a task for a new session") ||
+    (pane.includes("enter to collapse") && pane.includes("delete all"));
+  if (!inAgentsView) return false;
+
+  const target = windowTarget(agentName);
+  console.log(`🏃 ${agentName} 误入 agents 视图，自动 Esc 逃逸`);
+  await tmuxRaw(["send-keys", "-t", target, "Escape"]);
+  await Bun.sleep(1_000);
+  const after = await tmuxCapture(target, 30);
+  if (after.includes("describe a task for a new session")) {
+    await tmuxRaw(["send-keys", "-t", target, "Escape"]);
+  }
+
+  const last = agentsViewNotifiedAt.get(channelId) ?? 0;
+  if (Date.now() - last > AGENTS_VIEW_NOTIFY_COOLDOWN_MS) {
+    agentsViewNotifiedAt.set(channelId, Date.now());
+    try {
+      const ch = (await discord.channels.fetch(channelId)) as TextChannel;
+      await ch.send(
+        `🏃 **${agentName}** 的窗口误入了 agents 视图（按了 ←？），已自动 Esc 拉回对话界面。` +
+          `如果切换动作已把会话派发成 bg 分身，稍后对账告警会带清理/收编按钮。`,
+      );
+    } catch { /* non-critical */ }
+  }
+  return true;
+}
 
 // v2.0.23+: session-idle 兜底 grace。manager.ts/launcher.ts 启动路径会自动选
 // 「恢复完整会话」，几秒内消掉 modal。watcher 不该抢在它前面发按钮（重启时
@@ -159,6 +110,9 @@ async function checkAgent(
 ) {
   const pane = await tmuxCapture(windowTarget(agentName), 30);
 
+  // v2.7+ agents 视图自动逃逸（特征界面刚被 Esc 掉 → 本轮不再做弹窗检测）
+  if (await maybeEscapeAgentsView(agentName, channelId, pane, discord)) return;
+
   // 两种弹窗共用一个 channel 级别的 slot，同时只会有一种出现
   const sessionIdleDesc = detectSessionIdlePrompt(pane);
   const permissionDesc = sessionIdleDesc ? null : detectRuntimePermissionPrompt(pane);
@@ -179,26 +133,11 @@ async function checkAgent(
 
   const key = computeModalKey(sessionIdleDesc, permissionDesc);
   if (!key) {
-    // modal 消失：若之前通知过 → 推 Web「清卡」+ 清 pending（Discord 侧不动，
-    // 原消息保留处理痕迹）。防止 Web 一直挂着一张早已失效的权限卡。
-    if (lastNotified.has(channelId)) {
-      pushToWeb(channelId, { t: "permission-cleared" });
-      setPendingInteraction(channelId, null);
-    }
     lastNotified.delete(channelId);
     return;
   }
   if (lastNotified.get(channelId) === key) return;
   lastNotified.set(channelId, key);
-
-  // Web tee（附加输出，与 Discord 并行；web-only 也走这里）。SSE 晚连的订阅者
-  // 靠 web-hub 的 pending replay 看到这张卡。
-  const webEvt = buildPermissionWebEvent(key, sessionIdleDesc, permissionDesc);
-  pushToWeb(channelId, webEvt);
-  setPendingInteraction(channelId, webEvt);
-
-  // 以下是 Discord 专属推送（截图 + @ + 按钮）。web-only 模式下直接返回。
-  if (!DISCORD_ENABLED) return;
 
   const pngPath = await tmuxScreenshot(agentName);
   const mention = allowedUserIds.map((id) => `<@${id}>`).join(" ");
@@ -281,7 +220,4 @@ export function clearPermissionMessage(channelId: string) {
   permissionMessages.delete(channelId);
   lastNotified.delete(channelId);
   sessionIdleFirstSeen.delete(channelId);
-  // Web 侧同步清卡（此弹窗已处理/失效）
-  pushToWeb(channelId, { t: "permission-cleared" });
-  setPendingInteraction(channelId, null);
 }

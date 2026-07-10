@@ -52,6 +52,8 @@ import {
   listModelAliases,
 } from "./lib/claude-launch.js";
 import { printTmuxGuide } from "./lib/tmux-guide.js";
+import { projectsSlug } from "./lib/jsonl-cost.js";
+import { archiveSession, listArchivedSessions } from "./lib/session-archive.js";
 
 const REGISTRY_PATH = `${process.env.HOME}/.claude-orchestrator/registry.json`;
 const BRIDGE_URL = process.env.BRIDGE_URL || "ws://localhost:3847";
@@ -98,6 +100,12 @@ interface AgentInfo {
    * ~/.claude/settings.json。改完 restart 生效（是启动 flag）。
    */
   model?: string;
+  /**
+   * v2.6.0+ R1：标记为「可对外暴露的专用 agent」（create --external）。
+   * token-add 把未标 external 的 agent 加进 scope 时要求 --force —— 防止把
+   * owner 日常在用、上下文里有机密的 agent 开放给外部人。
+   */
+  external?: boolean;
 }
 
 interface Registry {
@@ -436,6 +444,17 @@ function extractModelFlag(args: string[]): { rest: string[]; model?: string } {
   return { rest, model };
 }
 
+/** v2.6.0+ 从 argv 提取布尔 flag（--external / --force 这类无值开关） */
+function extractBoolFlag(args: string[], flag: string): { rest: string[]; value: boolean } {
+  const rest: string[] = [];
+  let value = false;
+  for (const a of args) {
+    if (a === flag) value = true;
+    else rest.push(a);
+  }
+  return { rest, value };
+}
+
 // ============================================================
 // 命令实现
 // ============================================================
@@ -448,6 +467,7 @@ async function cmdCreate(
   effort?: string,
   permissionMode?: string,
   model?: string,
+  external?: boolean,
 ) {
   assertValidNewName(name);
   const tmuxName = normalizeName(name);
@@ -549,9 +569,9 @@ async function cmdCreate(
     await clearShellInitPrompts(target);
     await tmuxSendLine(target, cmd);
 
-    // 4. 轮询等待就绪 — 60s budget，与 restart 的 startClaudeInWindow 对齐
+    // 4. 轮询等待就绪 — 与 restart 的 startClaudeInWindow 对齐（CLAUDE_READY_ROUNDS）
     let sessionIdlePicked = false;
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < CLAUDE_READY_ROUNDS; i++) {
       await Bun.sleep(500);
       const pane = await captureLast(tmuxName, 10);
       // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不卡着等用户点按钮
@@ -583,6 +603,9 @@ async function cmdCreate(
     return;
   }
 
+  // v2.5.4: 会话内补发 /model，确保 pin 真正生效（--model 对 resume 场景不可靠）
+  await enforceSessionModel(tmuxName, model);
+
   // 6. 更新 registry（只有启动成功才落盘）
   const reg = await loadRegistry();
   reg.agents[tmuxName] = {
@@ -599,6 +622,7 @@ async function cmdCreate(
     effort,
     permissionMode: mode,
     ...(model ? { model } : {}),
+    ...(external ? { external: true } : {}),
   };
   await saveRegistry(reg);
 
@@ -623,6 +647,11 @@ async function cmdCreate(
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Claude Code 就绪轮询预算：240 轮 × 500ms = 120s。曾是 60s，2026-07-10 实测
+// 大 session（数 MB jsonl）resume + MCP 连接可超 60s，导致实际启动成功却报
+// 「启动超时」（restart 还会误标 recreated）。
+const CLAUDE_READY_ROUNDS = 240;
+
 async function cmdResume(
   name: string,
   sessionId: string,
@@ -631,6 +660,9 @@ async function cmdResume(
   effort?: string,
   permissionMode?: string,
   model?: string,
+  // v2.7+ --fork：--fork-session 分支副本（收编野生 bg 会话 / 源 session 被
+  // bg agent 占用时）。就绪后探测实际新 session id 写 registry。
+  forkSession = false,
 ) {
   if (!UUID_RE.test(sessionId)) {
     throw new Error(`非法 sessionId: "${sessionId}"（应为 UUID 格式）`);
@@ -710,6 +742,7 @@ async function cmdResume(
   }
 
   let ready = false;
+  let forkBefore: Set<string> | null = null;
 
   try {
     // 创建 tmux window（在 master session 里）
@@ -724,6 +757,7 @@ async function cmdResume(
       channelId,
       bridgeUrl: BRIDGE_URL,
       resumeId: sessionId,
+      forkSession,
       displayName,
       disallowedPreset: perms.preset,
       disallowedRaw: perms.disallowedRaw,
@@ -732,11 +766,12 @@ async function cmdResume(
       model,
     });
     await clearShellInitPrompts(target);
+    if (forkSession) forkBefore = await listSessionJsonls(resolvedDir);
     await tmuxSendLine(target, cmd);
 
-    // 轮询等待 — 60s budget，与 restart 的 startClaudeInWindow 对齐
+    // 轮询等待 — 与 restart 的 startClaudeInWindow 对齐（CLAUDE_READY_ROUNDS）
     let sessionIdlePicked = false;
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < CLAUDE_READY_ROUNDS; i++) {
       await Bun.sleep(500);
       const pane = await captureLast(tmuxName, 10);
       // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不卡着等用户点按钮
@@ -768,16 +803,36 @@ async function cmdResume(
     return;
   }
 
+  // v2.5.4: 会话内补发 /model —— resume 是 --model 失效的重灾区（session 保留原模型）
+  await enforceSessionModel(tmuxName, model);
+
+  // v2.7+ fork 模式：registry 必须记 fork 出的实际新 session id，不是源 id
+  let actualSessionId = sessionId;
+  if (forkSession && forkBefore) {
+    const newId = await waitForNewSessionId(resolvedDir, forkBefore);
+    if (newId) {
+      actualSessionId = newId;
+      console.log(`[resume] --fork 探测到新 session ${newId.slice(0, 8)}（源 ${sessionId.slice(0, 8)}）`);
+    } else {
+      console.log(`[resume] ⚠️ --fork 未探测到新 session id，registry 暂记源 id`);
+    }
+  }
+
   // 更新 registry
   const reg = await loadRegistry();
+  // v2.8+ 同名 agent 换 session：旧 session 退役先归档快照
+  const prior = reg.agents[tmuxName];
+  if (prior?.sessionId && prior.sessionId !== actualSessionId) {
+    await archiveSession(tmuxName, prior.cwd, prior.sessionId).catch(() => {});
+  }
   reg.agents[tmuxName] = {
     project: dir || resolvedDir.replace(process.env.HOME || "", "~"),
-    purpose: `resumed: ${sessionId.slice(0, 8)}`,
+    purpose: `resumed: ${sessionId.slice(0, 8)}${forkSession ? " (fork)" : ""}`,
     created: new Date().toISOString(),
     status: "active",
     channelId,
-    notes: `claude session: ${sessionId}`,
-    sessionId,
+    notes: `claude session: ${actualSessionId}${forkSession ? ` (forked from ${sessionId.slice(0, 8)})` : ""}`,
+    sessionId: actualSessionId,
     cwd: resolvedDir,
     displayName: channelName,
     disallowedPreset: perms.preset,
@@ -857,6 +912,10 @@ async function cmdKill(name: string) {
   // 删除对应的 Discord 频道
   const reg = await loadRegistry();
   const info = reg.agents[tmuxName];
+  // v2.8+ 会话退役 → 归档 jsonl 快照（CC 的 cleanupPeriodDays 会清源文件）
+  if (info?.sessionId) {
+    await archiveSession(tmuxName, info.cwd, info.sessionId).catch(() => {});
+  }
   if (info?.channelId) {
     try {
       await bridgeRequest({ type: "delete_channel", channelId: info.channelId });
@@ -992,6 +1051,70 @@ async function cmdRename(oldName: string, newName: string) {
  */
 const hasPromptToConfirm = (pane: string) => isAutoConfirmableModal(pane);
 
+// ────────────────────────────────────────────────
+// v2.7+ fork-session 自愈（Claude Code agents 模式适配）
+// ────────────────────────────────────────────────
+//
+// session 被 Claude Code 的 bg agent 占用时无法 --resume（bg daemon 会把被杀
+// 的占用者 respawn 回来，进程层面赢不了 —— 2026-07-09 事故实证）。唯一可靠
+// 破局是 `--resume <id> --fork-session` 分支副本。fork 出的新 session id 上游
+// 不直接告知，靠启动前后 diff projects 目录探测，拿到后回写 registry。
+
+/** cwd → ~/.claude/projects/<slug>/（slug 规则与 jsonl-watcher.getJsonlPath 一致） */
+function projectsDirFor(cwd: string): string {
+  return join(process.env.HOME || "~", ".claude", "projects", projectsSlug(cwd));
+}
+
+async function listSessionJsonls(cwd: string): Promise<Set<string>> {
+  try {
+    return new Set(
+      (await readdir(projectsDirFor(cwd))).filter((f) => f.endsWith(".jsonl")),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/** 启动前 diff：projects 目录里新出现的 jsonl → 新 session id（多个取 mtime 最新） */
+async function detectNewSessionId(
+  cwd: string,
+  before: Set<string>,
+): Promise<string | null> {
+  try {
+    const dir = projectsDirFor(cwd);
+    const fresh = (await readdir(dir)).filter(
+      (f) => f.endsWith(".jsonl") && !before.has(f),
+    );
+    if (fresh.length === 0) return null;
+    if (fresh.length === 1) return fresh[0].replace(/\.jsonl$/, "");
+    const withMtime = await Promise.all(
+      fresh.map(async (f) => ({
+        f,
+        m: (await stat(join(dir, f)).catch(() => null))?.mtimeMs ?? 0,
+      })),
+    );
+    withMtime.sort((a, b) => b.m - a.m);
+    return withMtime[0].f.replace(/\.jsonl$/, "");
+  } catch {
+    return null;
+  }
+}
+
+/** 轮询探测 fork 出的新 session（jsonl 落盘可能滞后于 TUI 就绪） */
+async function waitForNewSessionId(
+  cwd: string,
+  before: Set<string>,
+  timeoutMs = 20_000,
+): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = await detectNewSessionId(cwd, before);
+    if (found) return found;
+    await Bun.sleep(1_000);
+  }
+  return null;
+}
+
 /**
  * v2.0.22+: 检测到 session-idle 弹窗时自动选「恢复完整会话」(option 2)。
  *
@@ -1082,10 +1205,42 @@ async function gracefulExit(name: string): Promise<boolean> {
  * 返回 ready（是否就绪）+ recoveredFullSession（是否自动选了「恢复完整会话」，
  * 用于给频道发一条正面"已恢复"信号，取代 watcher 的按钮噪音）。
  */
+/**
+ * v2.5.4: 启动就绪后在会话内补一发 `/model`，强制 pin 的模型真正生效。
+ *
+ * 根因：`--model` 对 `--resume` 的会话经常不生效 —— session 保留它原来的模型，
+ * registry 里的 model 只是"意图"。实测 12 个 agent 里 6 个 registry 写 fable、
+ * 实际还在 opus。会话内 `/model` 是 TUI 层面的切换，可靠且幂等（已在目标模型时
+ * 直接确认不弹框；换模型时弹 "Switch model?" 确认框，❯ 默认在 Yes，Enter 即可）。
+ * 失败不阻塞启动 —— 看板显示的是 jsonl 真相，漂了能看见。
+ */
+async function enforceSessionModel(name: string, model?: string): Promise<boolean> {
+  if (!model?.trim()) return true;
+  const target = windowTarget(name);
+  const resolved = resolveModelAlias(model.trim());
+  try {
+    await tmuxRaw(["send-keys", "-t", target, "-l", `/model ${resolved}`]);
+    await Bun.sleep(400);
+    await tmuxRaw(["send-keys", "-t", target, "Enter"]);
+    for (let i = 0; i < 8; i++) {
+      await Bun.sleep(700);
+      const pane = await captureLast(name, 15);
+      if (/Switch model\?/i.test(pane)) {
+        await tmuxRaw(["send-keys", "-t", target, "Enter"]);
+        continue;
+      }
+      if (/Set model to/i.test(pane)) return true;
+    }
+  } catch {
+    /* 失败不阻塞启动 */
+  }
+  return false;
+}
+
 async function startClaudeInWindow(
   name: string,
   claudeCmd: string
-): Promise<{ ready: boolean; recoveredFullSession: boolean }> {
+): Promise<{ ready: boolean; recoveredFullSession: boolean; bgOccupied?: boolean }> {
   const target = windowTarget(name);
 
   // 确保在 shell 提示符
@@ -1101,14 +1256,20 @@ async function startClaudeInWindow(
   await clearShellInitPrompts(target);
   await tmuxSendLine(target, claudeCmd);
 
-  // 轮询处理各种确认提示，最多等 60 秒
+  // 轮询处理各种确认提示（预算见 CLAUDE_READY_ROUNDS）
   let sessionIdlePicked = false;
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < CLAUDE_READY_ROUNDS; i++) {
     await Bun.sleep(500);
     const pane = await captureLast(name, 10);
 
     // Claude Code 就绪
     if (isClaudeReady(pane)) return { ready: true, recoveredFullSession: sessionIdlePicked };
+
+    // v2.7+: session 被 bg agent 占用 → claude 报错退出。提前返回 bgOccupied，
+    // 让 cmdRestart 走 --fork-session 自愈重试（见 projectsDirFor 上方注释）。
+    if (/currently running as a background agent/i.test(pane)) {
+      return { ready: false, recoveredFullSession: false, bgOccupied: true };
+    }
 
     // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不再卡着等用户点按钮。
     // picked 标记防止重复发键；发完给加载留窗口，下轮再判 ready。
@@ -1134,6 +1295,36 @@ async function startClaudeInWindow(
   // "❯ 1. I am using this for local development" 这类选项菜单里被误判。
   const final = await captureLast(name, 10);
   return { ready: isClaudeReady(final), recoveredFullSession: sessionIdlePicked };
+}
+
+/**
+ * v2.7+ 收编（分身替换）：把指定 session（典型来源是 agents 视图误触 fork 出的
+ * bg 分身，其上下文比正式 agent 新）立为该 agent 的正式会话，然后走 cmdRestart
+ * 拉起。restart 的 bg 占用自愈路径会自动 --fork-session 并回写实际新 session id，
+ * 所以这里只需要改 registry —— 占用与否都能正确拉起。
+ */
+async function cmdAdopt(name: string, sessionId: string) {
+  if (!UUID_RE.test(sessionId)) {
+    output({ ok: false, error: `非法 sessionId: "${sessionId}"（应为 UUID 格式）` });
+    return;
+  }
+  const tmuxName = normalizeName(name);
+  const reg = await loadRegistry();
+  const info = reg.agents[tmuxName];
+  if (!info) {
+    output({ ok: false, error: `${tmuxName} 不在 registry（野生会话收编请用 resume <新名> <sessionId> --fork）` });
+    return;
+  }
+  const oldId = info.sessionId;
+  // v2.8+ 被替换的旧 session 先归档快照
+  if (oldId && oldId !== sessionId) {
+    await archiveSession(tmuxName, info.cwd, oldId).catch(() => {});
+  }
+  info.sessionId = sessionId;
+  info.notes = `claude session: ${sessionId} (adopted${oldId ? `, was ${oldId.slice(0, 8)}` : ""})`;
+  await saveRegistry(reg);
+  console.log(`[adopt] ${tmuxName} sessionId ${oldId?.slice(0, 8) ?? "(无)"} → ${sessionId.slice(0, 8)}，restart 拉起`);
+  await cmdRestart(tmuxName);
 }
 
 async function cmdRestart(name?: string) {
@@ -1226,7 +1417,51 @@ async function cmdRestart(name?: string) {
       model: info.model,
     });
 
-    const started = await startClaudeInWindow(tmuxName, cmd);
+    let started = await startClaudeInWindow(tmuxName, cmd);
+
+    // v2.7+ 自愈：session 被 bg agent 占用 → --fork-session 分支副本重试，
+    // 就绪后探测 fork 出的新 session id 并回写 registry（否则 watcher/下次
+    // restart 又会盯回被占用的旧 id）。
+    if (!started.ready && started.bgOccupied) {
+      const cwd = info.cwd || process.env.HOME || "/";
+      console.log(`[restart] ${tmuxName} 的 session 被 bg agent 占用，改用 --fork-session 重试`);
+      const before = await listSessionJsonls(cwd);
+      const forkCmd = buildClaudeCommand({
+        channelId: info.channelId,
+        bridgeUrl: BRIDGE_URL,
+        resumeId: info.sessionId,
+        forkSession: true,
+        displayName,
+        disallowedPreset: info.disallowedPreset,
+        disallowedRaw: info.disallowedRaw,
+        effort: info.effort,
+        permissionMode: info.permissionMode,
+        model: info.model,
+      });
+      started = await startClaudeInWindow(tmuxName, forkCmd);
+      if (started.ready) {
+        const newId = await waitForNewSessionId(cwd, before);
+        if (newId) {
+          // v2.8+ fork 换代：旧 session 从 registry 退役，先归档快照
+          await archiveSession(tmuxName, cwd, info.sessionId).catch(() => {});
+          reg.agents[tmuxName].sessionId = newId;
+          reg.agents[tmuxName].notes = `claude session: ${newId} (forked from ${info.sessionId.slice(0, 8)})`;
+          await saveRegistry(reg);
+          console.log(`[restart] ${tmuxName} fork 出新 session ${newId.slice(0, 8)}，registry 已回写`);
+        } else {
+          console.log(`[restart] ⚠️ ${tmuxName} fork 成功但未探测到新 session id，registry 未更新`);
+        }
+        await bridgeRequest({
+          type: "reply",
+          chatId: info.channelId,
+          text: `🔀 ${displayName} 原 session 被后台 agent 占用，已自动 fork 副本恢复（上下文完整）${newId ? "" : "，⚠️ 新 session id 探测失败请查 registry"}`,
+        }).catch(() => {});
+      }
+    }
+
+    // v2.5.4: 会话内补发 /model，restart 也是 --resume（同样会漂回 session 原模型）
+    if (started.ready) await enforceSessionModel(tmuxName, info.model);
+
     results.push({
       name: tmuxName,
       ok: started.ready,
@@ -1874,11 +2109,19 @@ async function cmdModel(sub: string, ...rest: string[]) {
       }
     }
     await saveRegistry(reg);
+    // v2.5.4: idle 的 agent 顺手在会话内立即生效（忙的跳过，restart 时会补发）
+    const applied: string[] = [];
+    for (const name of changed) {
+      if ((await isAgentIdle(name).catch(() => false)) && (await enforceSessionModel(name, modelVal))) {
+        applied.push(name);
+      }
+    }
     output({
       ok: true,
       model: resolved,
       changed,
-      hint: `已把 ${changed.length} 个 active agent 钉到 ${resolved}。跑 restart（不带名字）全部重启生效。`,
+      appliedLive: applied,
+      hint: `已钉 ${changed.length} 个 active agent 到 ${resolved}；${applied.length} 个 idle 的已当场生效，其余在下次 restart 时自动补发 /model。`,
     });
     return;
   }
@@ -1904,11 +2147,17 @@ async function cmdModel(sub: string, ...rest: string[]) {
   if (!info) { output({ ok: false, error: `找不到 agent: ${tmuxName}` }); return; }
   info.model = modelVal;
   await saveRegistry(reg);
+  // v2.5.4: idle 就当场在会话内生效；忙就等下次 restart 自动补发
+  const appliedLive =
+    (await isAgentIdle(tmuxName).catch(() => false)) && (await enforceSessionModel(tmuxName, modelVal));
   output({
     ok: true,
     agent: tmuxName,
     model: resolveModelAlias(modelVal),
-    hint: `已写入 registry。要让 ${tmuxName} 立即生效，跑: bun src/manager.ts restart ${tmuxName.replace(AGENT_PREFIX, "")}`,
+    appliedLive,
+    hint: appliedLive
+      ? `已写入 registry 并当场生效（会话内 /model）。`
+      : `已写入 registry。agent 正忙，会在下次 restart 时自动补发 /model 生效。`,
   });
 }
 
@@ -2131,6 +2380,108 @@ async function cmdInviteLink(args: string[]) {
       ? `这是一个 **peer 最小权限** 邀请链接。把它发给朋友，他点一下就能把你的 bot 加到他的服务器（只能看被邀请进去的频道、发消息、读历史）。`
       : `这是一个 **owner 完整权限** 邀请链接（含 Manage Channels 等）。你自己安装 bot 到你服务器用这个；别给朋友用它（权限太大）。`,
   });
+}
+
+// ============================================================
+// v2.6.0+ HTTP API token（多前端架构 Phase B，设计 §3.4 / §5.1 / R1）
+// ============================================================
+
+/**
+ * token-add <name> --agents a,b [--force] [--no-mirror]
+ * 生成一个 API token，scope 限定在指定 agent。secret 只显示这一次。
+ * R1 防呆：目标 agent 未标 external:true（create --external）时要求 --force。
+ */
+async function cmdTokenAdd(name: string, agentsCsv: string, force: boolean, noMirror: boolean) {
+  const { readPrincipals, writePrincipals, newTokenPrincipal, tokenIdOf } =
+    await import("./lib/principals.js");
+  const agents = agentsCsv.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!name || agents.length === 0) {
+    output({ ok: false, error: 'token-add <name> --agents <a,b|*> [--force] [--no-mirror]' });
+    return;
+  }
+
+  // scope 里的 agent 校验：存在性 + R1 external 检查（"*" 跳过存在性，仍警告）
+  const reg = await loadRegistry();
+  const warnings: string[] = [];
+  for (const a of agents) {
+    if (a === "*") {
+      if (!force) {
+        output({
+          ok: false,
+          error: `--agents "*" 会把全部 agent 开放给这个 token（master 除外）。上下文共享有泄密风险（R1），确认请加 --force。`,
+        });
+        return;
+      }
+      warnings.push(`"*" scope：所有普通 agent 都对此 token 可见`);
+      continue;
+    }
+    const info = reg.agents[a] || reg.agents[`agent-${a}`];
+    if (!info) {
+      output({ ok: false, error: `agent "${a}" 不存在（registry 里没有 ${a} / agent-${a}）` });
+      return;
+    }
+    if (!info.external && !force) {
+      output({
+        ok: false,
+        error:
+          `agent "${a}" 未标记为对外专用（external）。把日常在用的 agent 开放给外部 token，` +
+          `对方可以套出该 agent 上下文里的既有内容（R1 共享上下文风险）。` +
+          `建议：为外部用途新建专用 agent（create <name> <dir> --external）；` +
+          `确实要开放这个就加 --force。`,
+      });
+      return;
+    }
+    if (!info.external) warnings.push(`"${a}" 未标 external，已用 --force 强制开放`);
+  }
+
+  const file = await readPrincipals();
+  const p = newTokenPrincipal(name, agents);
+  if (noMirror) p.mirror = false;
+  file.principals.push(p);
+  await writePrincipals(file);
+
+  output({
+    ok: true,
+    tokenId: tokenIdOf(p),
+    name,
+    agents,
+    mirror: p.mirror,
+    secret: p.secret,
+    secretNote: "⚠️ secret 只显示这一次，请立即保存。调用方式: Authorization: Bearer <secret>",
+    warnings,
+    usage: `curl -H "Authorization: Bearer ${p.secret}" -X POST http://<bridge>/api/v1/agents/${agents[0] === "*" ? "<agent>" : agents[0]}/messages -H "Content-Type: application/json" -d '{"text":"你好","wait":60}'`,
+  });
+}
+
+async function cmdTokenList() {
+  const { readPrincipals, tokenIdOf } = await import("./lib/principals.js");
+  const file = await readPrincipals();
+  const tokens = file.principals
+    .filter((p) => p.id.startsWith("token:"))
+    .map((p) => ({
+      tokenId: tokenIdOf(p),
+      name: p.name,
+      agents: p.agents,
+      disabled: !!p.disabled,
+      mirror: p.mirror !== false,
+      createdAt: p.createdAt,
+      secretPreview: p.secret ? `${p.secret.slice(0, 8)}…` : "",
+    }));
+  output({ ok: true, count: tokens.length, tokens });
+}
+
+async function cmdTokenRevoke(idOrName: string) {
+  const { readPrincipals, writePrincipals, findToken, tokenIdOf } =
+    await import("./lib/principals.js");
+  const file = await readPrincipals();
+  const p = findToken(file, idOrName);
+  if (!p) {
+    output({ ok: false, error: `找不到 token: ${idOrName}（token-list 查看现有的）` });
+    return;
+  }
+  file.principals = file.principals.filter((x) => x !== p);
+  await writePrincipals(file);
+  output({ ok: true, revoked: tokenIdOf(p), name: p.name, message: "token 已删除，立即失效" });
 }
 
 async function cmdPeerExpose(localAgent: string, peer: string, purpose: string, mode: "direct" | "via_master" = "direct") {
@@ -2497,7 +2848,8 @@ const [cmd, ...args] = process.argv.slice(2);
 try {
 switch (cmd) {
   case "create": {
-    const { rest: afterModel, model } = extractModelFlag(args);
+    const { rest: afterExternal, value: external } = extractBoolFlag(args, "--external");
+    const { rest: afterModel, model } = extractModelFlag(afterExternal);
     const { rest: afterMode, mode } = extractModeFlag(afterModel);
     const { rest: afterEffort, effort } = extractEffortFlag(afterMode);
     const { rest: posArgs, preset, disallowedRaw } = extractPermFlags(afterEffort);
@@ -2505,16 +2857,46 @@ switch (cmd) {
     if (!name || !dir) {
       output({
         ok: false,
-        error: 'create <name> <dir> [purpose] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>] [--model <model>]',
+        error: 'create <name> <dir> [purpose] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>] [--model <model>] [--external]',
       });
       break;
     }
-    await cmdCreate(name, dir, purposeParts.join(" "), { preset, disallowedRaw }, effort, mode, model);
+    await cmdCreate(name, dir, purposeParts.join(" "), { preset, disallowedRaw }, effort, mode, model, external);
+    break;
+  }
+
+  // v2.6.0+ HTTP API token 管理（多前端架构 Phase B）
+  case "token-add": {
+    const { rest: afterForce, value: force } = extractBoolFlag(args, "--force");
+    const { rest: afterMirror, value: noMirror } = extractBoolFlag(afterForce, "--no-mirror");
+    // --agents a,b（也接受 --agents=a,b）
+    let agentsCsv = "";
+    const posArgs: string[] = [];
+    for (let i = 0; i < afterMirror.length; i++) {
+      const a = afterMirror[i];
+      if (a === "--agents") agentsCsv = afterMirror[++i] || "";
+      else if (a.startsWith("--agents=")) agentsCsv = a.slice("--agents=".length);
+      else posArgs.push(a);
+    }
+    await cmdTokenAdd(posArgs.join(" "), agentsCsv, force, noMirror);
+    break;
+  }
+  case "token-list":
+    await cmdTokenList();
+    break;
+  case "token-revoke": {
+    const [idOrName] = args;
+    if (!idOrName) {
+      output({ ok: false, error: "token-revoke <tokenId|name>" });
+      break;
+    }
+    await cmdTokenRevoke(idOrName);
     break;
   }
 
   case "resume": {
-    const { rest: afterModel, model } = extractModelFlag(args);
+    const { rest: afterFork, value: fork } = extractBoolFlag(args, "--fork");
+    const { rest: afterModel, model } = extractModelFlag(afterFork);
     const { rest: afterMode, mode } = extractModeFlag(afterModel);
     const { rest: afterEffort, effort } = extractEffortFlag(afterMode);
     const { rest: posArgs, preset, disallowedRaw } = extractPermFlags(afterEffort);
@@ -2522,11 +2904,42 @@ switch (cmd) {
     if (!name || !sessionId) {
       output({
         ok: false,
-        error: 'resume <name> <sessionId> [dir] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>] [--model <model>]',
+        error: 'resume <name> <sessionId> [dir] [--fork] [--preset <preset>] [--disallowed "..."] [--effort <level>] [--mode <permission-mode>] [--model <model>]',
       });
       break;
     }
-    await cmdResume(name, sessionId, dir, { preset, disallowedRaw }, effort, mode, model);
+    await cmdResume(name, sessionId, dir, { preset, disallowedRaw }, effort, mode, model, fork);
+    break;
+  }
+
+  // v2.7+ 收编：adopt <name> <sessionId> —— 把 bg 分身/任意 session 立为正式会话并重启
+  case "adopt": {
+    const [name, sessionId] = args;
+    if (!name || !sessionId) {
+      output({ ok: false, error: "用法: adopt <name> <sessionId> — 把指定 session（如 bg 分身）收编为该 agent 的正式会话并重启拉起" });
+      break;
+    }
+    await cmdAdopt(name, sessionId);
+    break;
+  }
+
+  // v2.8+ 手动归档：archive <name> —— 立即快照该 agent 当前 session 的 jsonl
+  case "archive": {
+    const [name] = args;
+    if (!name) {
+      output({ ok: false, error: "用法: archive <name> — 立即归档该 agent 当前 session 的对话 jsonl" });
+      break;
+    }
+    const tmuxName = normalizeName(name);
+    const reg = await loadRegistry();
+    const info = reg.agents[tmuxName];
+    if (!info?.sessionId) {
+      output({ ok: false, error: `${tmuxName} 不在 registry 或无 sessionId` });
+      break;
+    }
+    const r = await archiveSession(tmuxName, info.cwd, info.sessionId);
+    const all = await listArchivedSessions(tmuxName);
+    output({ ok: r.ok, note: r.note, archived: r.archived, sessions: all });
     break;
   }
 

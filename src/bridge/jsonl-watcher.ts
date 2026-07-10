@@ -11,9 +11,11 @@ import { existsSync } from "fs";
 import { join } from "path";
 import type { Client } from "discord.js";
 import { TextChannel } from "discord.js";
-import { WATCHER_CONFIG, MCP_TOOL_PREFIX, DISCORD_ENABLED } from "./config.js";
+import { WATCHER_CONFIG, MCP_TOOL_PREFIX } from "./config.js";
 import { discordReply } from "./discord-api.js";
-import { pushToWeb, setPendingInteraction } from "./web-hub.js";
+import { projectsSlug, findJsonlBySessionId } from "../lib/jsonl-cost.js";
+// v2.6.0+ 旁路事件埋点（设计 D1：只 emit 不改渲染管线）
+import { emitEvent } from "./event-bus.js";
 
 interface ToolEntry {
   id: string;
@@ -59,7 +61,8 @@ function isHiddenTool(name: string): boolean {
   return false;
 }
 
-function formatTool(name: string, input: any): string {
+// v2.8+ 导出：bg-activity-watcher 渲染 subagent 的工具调用时复用同一套格式
+export function formatTool(name: string, input: any): string {
   const E: Record<string, string> = {
     Read: "📖", Edit: "✏️", Write: "📝", Bash: "💻",
     Glob: "🔍", Grep: "🔎", Agent: "🤖", WebSearch: "🌐",
@@ -79,25 +82,6 @@ function formatTool(name: string, input: any): string {
       const short = name.startsWith("mcp__") ? name.replace("mcp__", "").replace("__", "/") : name;
       return `${e} ${short}`;
     }
-  }
-}
-
-/** Web 端工具摘要：只出 detail（前端 ToolCard 自带 icon + 显示 name）。 */
-function webToolSummary(name: string, input: any): string {
-  switch (name) {
-    case "Read":
-    case "Edit":
-    case "Write":
-      return input?.file_path?.split("/").pop() || "";
-    case "Bash":
-      return String(input?.description || input?.command || "").replace(/\n/g, " ").slice(0, 120);
-    case "Glob":
-    case "Grep":
-      return String(input?.pattern || "");
-    case "Agent":
-      return String(input?.description || input?.prompt || "").slice(0, 80);
-    default:
-      return "";
   }
 }
 
@@ -136,10 +120,6 @@ async function syncToolMsg(state: WatcherState, discord: Client) {
 async function flushText(state: WatcherState, discord: Client) {
   if (state.textQueue.length === 0) return;
   const items = state.textQueue.splice(0);
-  // Web tee：逐条推助手文本（去掉 💬 前缀，⛔/⏱ 等标记保留）。附加输出，与 Discord 并行。
-  for (const item of items) {
-    pushToWeb(state.channelId, { t: "text", text: item.replace(/^💬 /, "") });
-  }
   const body = items.map((item) => `-# ${item}`).join("\n");
   try {
     await discordReply(discord, state.channelId, body);
@@ -149,8 +129,7 @@ async function flushText(state: WatcherState, discord: Client) {
 }
 
 export function getJsonlPath(cwd: string, sessionId: string): string {
-  const dir = "-" + cwd.replace(/^\//, "").replace(/\//g, "-");
-  return join(process.env.HOME || "~", ".claude", "projects", dir, `${sessionId}.jsonl`);
+  return join(process.env.HOME || "~", ".claude", "projects", projectsSlug(cwd), `${sessionId}.jsonl`);
 }
 
 /**
@@ -297,18 +276,26 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
         // v2.2.0+: auto-mode classifier 拦截检测。被拦的操作在 jsonl 里是一条
         // type:"user" 的 tool_result（is_error），内容稳定含 "denied by the Claude
         // Code auto mode classifier. Reason: …"。检测到 → 频道弹「临时放行」按钮。
+        //
+        // v2.5.5+: 必须查 is_error === true。之前只做字符串正则 → agent 一 Read/
+        // grep 到**含这行字面量的源码**（比如本文件自己），tool_result 里带着这
+        // 句话就误报"被 auto 拦了"，明明 agent 全程 bypass 也弹放行按钮（owner
+        // 2026-07-09 实测：claudestra agent 读 jsonl-watcher.ts 触发）。真 deny
+        // 的 tool_result 一定 is_error，成功的 Read/Bash 结果不会。
         if (entry.type === "user") {
           const uc = entry.message?.content;
           if (Array.isArray(uc)) {
             for (const b of uc) {
               if (
                 b?.type === "tool_result" &&
+                b.is_error === true &&
                 typeof b.content === "string" &&
                 /denied by the Claude Code auto mode classifier/i.test(b.content)
               ) {
                 const rm = b.content.match(/Reason:\s*([\s\S]+?)(?:\.\s+If you|\.\.|$)/i);
                 const reason = rm ? rm[1].trim().replace(/\s+/g, " ").slice(0, 220) : "";
                 maybePostAutoDeny(discord, state, reason).catch(() => {});
+                emitEvent({ agent: state.agentName, chatId: state.channelId, type: "auto_deny", data: { reason } });
               }
             }
           }
@@ -323,6 +310,7 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
           } else {
             const secs = (entry.durationMs / 1000).toFixed(0);
             state.textQueue.push(`⏱ 尼了 ${secs} 秒`);
+            emitEvent({ agent: state.agentName, chatId: state.channelId, type: "turn_duration", data: { durationMs: entry.durationMs } });
           }
         }
 
@@ -335,31 +323,15 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
           // 渲染完跳过本 assistant entry 的其他处理（不进 textQueue / tools），由
           // AUQ 自己的交互回路驱动。
           try {
-            const {
-              detectAskUserQuestion,
-              registerAuqState,
-              buildAuqWebEvent,
-              postAskUserQuestionMessage,
-              auqStates,
-            } = await import("./ask-user-question.js");
+            const { detectAskUserQuestion, postAskUserQuestionMessage, auqStates } =
+              await import("./ask-user-question.js");
             const questions = detectAskUserQuestion(content);
             if (questions && !auqStates.has(state.channelId)) {
               const tmuxTarget = `master:${state.agentName}`;
-              // 先登记 state（与 Discord 无关）→ 再各自 tee 到 Web / Discord
-              registerAuqState(state.channelId, tmuxTarget, questions);
-              // Web tee（附加输出，与 Discord 并行；web-only 也走这里）+ pending replay
-              const webEvt = buildAuqWebEvent(state.channelId);
-              if (webEvt) {
-                pushToWeb(state.channelId, webEvt);
-                setPendingInteraction(state.channelId, webEvt);
-              }
-              // Discord select menu + Submit/Cancel —— 仅 Discord 启用时
-              if (DISCORD_ENABLED) {
-                postAskUserQuestionMessage(discord, state.channelId, questions).catch(
-                  (e) => console.error("AUQ post 失败:", e),
-                );
-              }
-              console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) for ${state.agentName}`);
+              postAskUserQuestionMessage(discord, state.channelId, tmuxTarget, questions)
+                .catch((e) => console.error("AUQ post 失败:", e));
+              console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) → posted Discord components for ${state.agentName}`);
+              emitEvent({ agent: state.agentName, chatId: state.channelId, type: "question", data: { questions } });
               continue; // 跳过本 entry 的 tool/text 处理
             }
           } catch (e) { /* non-critical */ }
@@ -375,20 +347,15 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
 
           for (const block of content) {
             if (block.type === "tool_use" && block.name && !isHiddenTool(block.name) && WATCHER_CONFIG.showToolUse) {
+              const summary = formatTool(block.name, block.input);
               state.tools.push({
                 id: block.id,
-                summary: formatTool(block.name, block.input),
+                summary,
                 done: false,
                 error: false,
               });
               toolsChanged = true;
-              // Web tee：工具加入时推一次（附加输出，与 Discord 并行）
-              pushToWeb(state.channelId, {
-                t: "tool",
-                name: block.name,
-                summary: webToolSummary(block.name, block.input),
-                state: "done",
-              });
+              emitEvent({ agent: state.agentName, chatId: state.channelId, type: "tool_start", data: { toolId: block.id, name: block.name, summary } });
             }
             if (block.type === "text" && block.text?.trim() && WATCHER_CONFIG.showClaudeText && !hasReply) {
               // 以前有 `t.length > 3` 的 filter 防碎片短 text 刷屏，但那会把 "OK"
@@ -402,8 +369,10 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
               if (/You['']?ve hit your limit|Hit your (rate )?limit/i.test(t)) {
                 state.textQueue.push(`⛔ ${t}`);
                 state.rateLimited = true;
+                emitEvent({ agent: state.agentName, chatId: state.channelId, type: "assistant_text", data: { text: t, rateLimited: true } });
               } else {
                 state.textQueue.push(`💬 ${t}`);
+                emitEvent({ agent: state.agentName, chatId: state.channelId, type: "assistant_text", data: { text: t } });
               }
             }
           }
@@ -419,6 +388,7 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
                 tool.done = true;
                 tool.error = !!block.is_error;
                 toolsChanged = true;
+                emitEvent({ agent: state.agentName, chatId: state.channelId, type: "tool_done", data: { toolId: block.tool_use_id, error: tool.error } });
               }
             }
           }
@@ -498,7 +468,17 @@ export async function startWatching(
   channelId: string, discord: Client
 ) {
   stopWatching(agentName);
-  const jsonlPath = getJsonlPath(cwd, sessionId);
+  let jsonlPath = getJsonlPath(cwd, sessionId);
+
+  // 推算路径不存在 → 按 sessionId 全 projects 扫一遍兜底（slug 规则漂移 /
+  // cwd 记录不准时自愈，而不是傻等一个永远不会出现的文件）
+  if (!existsSync(jsonlPath)) {
+    const found = findJsonlBySessionId(sessionId);
+    if (found) {
+      console.log(`👁 slug 推算落空，按 sessionId 兜底命中: ${agentName} → ${found}`);
+      jsonlPath = found;
+    }
+  }
 
   if (!existsSync(jsonlPath)) {
     const startedAt = Date.now();
@@ -575,6 +555,17 @@ export function stopWatching(agentName: string) {
     if (state.pollInterval) clearInterval(state.pollInterval);
     watchers.delete(agentName);
   }
+}
+
+/** v2.6.0+ channelId → agent 名反查（event-bus 埋点用，避免热路径查 registry） */
+export function agentNameForChannel(channelId: string): string | null {
+  for (const [agentName, p] of pendingStartTimers.entries()) {
+    if (p.channelId === channelId) return agentName;
+  }
+  for (const [agentName, state] of watchers.entries()) {
+    if (state.channelId === channelId) return agentName;
+  }
+  return null;
 }
 
 /** 根据 channelId 查找并停止 watcher（websocket 断开时兜底用） */

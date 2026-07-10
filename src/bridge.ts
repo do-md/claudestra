@@ -23,10 +23,7 @@ import {
 } from "discord.js";
 import type { ServerWebSocket } from "bun";
 
-import { DISCORD_TOKEN, DISCORD_ENABLED, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK, MASTER_DIR } from "./bridge/config.js";
-import { existsSync as fsExistsSync, readdirSync as fsReaddirSync, statSync as fsStatSync } from "fs";
-import { resolve as pathResolve } from "path";
-import { subscribeWeb, pushToWeb, setPendingInteraction, getPendingInteraction, isLocalChannelId, type WebStreamEvent } from "./bridge/web-hub.js";
+import { DISCORD_TOKEN, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK } from "./bridge/config.js";
 import {
   startTyping,
   stopTyping,
@@ -51,9 +48,66 @@ import {
   handleMgmtSelect,
 } from "./bridge/management.js";
 import { tmuxScreenshot } from "./bridge/screenshot.js";
-import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup } from "./bridge/jsonl-watcher.js";
-import { startPermissionWatcher, permissionMessages, clearPermissionMessage, PERM_KEY_SEQ, PERM_LABELS, applyPermissionAction } from "./bridge/permission-watcher.js";
+import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel, formatTool } from "./bridge/jsonl-watcher.js";
+import { listAgentSessions, readSessionHistory, isValidSessionId, isValidSubagentId } from "./lib/session-history.js";
+import { existsSync } from "fs";
+// v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
+import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from "./bridge/event-bus.js";
+// v2.7+ Claude Code agents 模式适配：中性会话清单 + bg job 清理 + 分身对账
+import { collectSessions } from "./bridge/sessions-inventory.js";
+import { cleanupBgJob } from "./lib/bg-jobs.js";
+import { startSessionReconciler } from "./bridge/session-reconciler.js";
+import { startBgActivityWatcher } from "./bridge/bg-activity-watcher.js";
+import { startArchiveSweeper } from "./bridge/archive-sweeper.js";
+// v2.6.0+ HTTP API 身份与授权（设计 §3.4 / §5）
+import {
+  readPrincipals,
+  findByBearer,
+  agentInScope,
+  tokenIdOf,
+  SlidingWindowLimiter,
+  syncDiscordOwnersFromEnv,
+  listDiscordPrincipalIds,
+  type Principal,
+} from "./lib/principals.js";
+
+// ============================================================
+// v2.6.0+ C2-3：Discord 用户鉴权统一走 principals.json（.env 作 seed/fallback）
+// 模块级缓存保持全部调用点的同步语义；30s 懒刷新（principals 变化不频繁）。
+// 语义与老 ALLOWED_USER_IDS 完全一致：列表为空 = 放行所有人。
+// ============================================================
+let cachedDiscordAllowed: string[] = [...ALLOWED_USER_IDS];
+let discordAllowedLoadedAt = 0;
+function refreshDiscordAllowed(): void {
+  discordAllowedLoadedAt = Date.now();
+  readPrincipals()
+    .then((file) => {
+      const ids = listDiscordPrincipalIds(file);
+      // principals 里一个 discord principal 都没有（老安装未 sync）→ 保持 .env
+      if (ids.length > 0) cachedDiscordAllowed = ids;
+    })
+    .catch(() => { /* 保持现值 */ });
+}
+/** 允许对话的 Discord 用户 id 列表（空 = 不限） */
+function allowedDiscordIds(): string[] {
+  if (Date.now() - discordAllowedLoadedAt > 30_000) refreshDiscordAllowed();
+  return cachedDiscordAllowed;
+}
+/** 主 owner 的 Discord uid（@mention / UserEndpoint 兜底用），可能为 "" */
+function primaryOwnerId(): string {
+  const ids = allowedDiscordIds();
+  return ids[0] || "";
+}
+// 启动：.env → principals 单向 seed（幂等），然后立即刷新缓存
+syncDiscordOwnersFromEnv(ALLOWED_USER_IDS)
+  .then((changed) => {
+    if (changed) console.log("👤 已把 .env ALLOWED_USER_IDS 同步进 principals.json（role:owner）");
+    refreshDiscordAllowed();
+  })
+  .catch((e) => console.error("principals owner 同步失败（继续用 .env）:", (e as Error).message));
+import { startPermissionWatcher, permissionMessages, clearPermissionMessage } from "./bridge/permission-watcher.js";
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
+import { updateStatsDashboard, initStatsDashboard, handleStatsRequest, forceRefreshStatsDashboard } from "./bridge/stats-dashboard.js";
 import { recordMetric } from "./lib/metrics.js";
 import {
   tmuxCapture,
@@ -96,7 +150,6 @@ interface ClientInfo {
 // ============================================================
 
 const clients = new Map<string, ClientInfo>();
-const activeStatusMessages = new Map<string, string>();
 
 /**
  * 记 "Discord 入站消息转发到某个 channel-server，turn 结果还没回到 Discord" 的
@@ -118,6 +171,48 @@ interface PendingReply {
   threadId?: string;
 }
 const pendingReplies = new Map<string, PendingReply>();
+
+// ============================================================
+// v2.6.0+ HTTP API 会话状态（多前端架构 Phase B，设计 §5）
+// ============================================================
+
+/**
+ * 一次 POST /api/v1/agents/:name/messages 的追踪。key = `${tokenId}|${agentChannelId}`
+ * （同 token 对同 agent 的并发请求按 FIFO 队列 resolve）。
+ * agent 的 reply(chat_id="api:<tokenId>") 进 deliverToApi 时按 key 出队：
+ * resolve 同步 waiter + emit chat_message(out)（带原请求 threadId）+ 存结果供轮询。
+ */
+interface PendingApiRequest {
+  tokenId: string;
+  tokenName: string;
+  agentChannelId: string;
+  agentName: string;
+  threadId: string;
+  ts: number;
+  /** wait 模式挂的 resolver（无 wait 则为空） */
+  resolve?: (result: ApiReplyResult) => void;
+}
+interface ApiReplyResult {
+  reply: string | null;
+  components?: unknown[];
+  files?: { name: string; url: string }[];
+  threadId: string;
+  agent: string;
+  /** true = agent 没调 reply()，文本来自 Stop-hook drain 兜底（R3） */
+  viaFallback?: boolean;
+}
+const pendingApiRequests = new Map<string, PendingApiRequest[]>();
+/** threadId → 已完成结果（轮询兜底用，TTL 清理见 staleCleanup） */
+const apiThreadResults = new Map<string, { result: ApiReplyResult; ts: number }>();
+/** 出站附件登记：opaqueId → 本地路径 + 属主 token（防任意文件读取） */
+const apiFiles = new Map<string, { path: string; tokenId: string; name: string }>();
+/** per-token 限流器（30 req/min，内存态） */
+const apiLimiters = new Map<string, SlidingWindowLimiter>();
+const API_REQUEST_TTL_MS = 10 * 60_000;
+
+function apiReqKey(tokenId: string, agentChannelId: string): string {
+  return `${tokenId}|${agentChannelId}`;
+}
 
 /**
  * thread → 原始请求 envelope 的追踪。deliverToLocal 在 intent=request 时挂一条，
@@ -146,28 +241,29 @@ async function getLocalAgentExchangeId(): Promise<string> {
   return _cachedAgentExchangeId;
 }
 
-/**
- * 把一个 channelId 解析成它对应的 tmux window（打断 / 发键用）。
- * master (CONTROL_CHANNEL_ID) 和 #agent-exchange 都路由到 master:0，且不在 registry.json，
- * 直接认定为 master:0；否则查 registry 取 agent 名。找不到返回 null。
- * Discord 打断按钮与 Web /web/interrupt 端点共用，避免主控识别逻辑两处漂移。
- */
-async function resolveTmuxTarget(
-  targetChannelId: string
-): Promise<{ targetWindow: string; agentLabel: string } | null> {
-  const exchangeId = await getLocalAgentExchangeId();
-  const isMasterChannel =
-    targetChannelId === CONTROL_CHANNEL_ID ||
-    (!!exchangeId && targetChannelId === exchangeId);
-  if (isMasterChannel) {
-    return { targetWindow: `${MASTER_SESSION}:0`, agentLabel: "master" };
-  }
-  const listResult = await runManager("list");
-  const agent = (listResult.agents || []).find(
-    (a: any) => a.channelId === targetChannelId
-  );
-  if (!agent) return null;
-  return { targetWindow: `${MASTER_SESSION}:${agent.name}`, agentLabel: agent.name };
+// ============================================================
+// v2.6.0+ C2-1：master 身份判断集中（原先 20 处散落的
+// `=== CONTROL_CHANNEL_ID` 比较）。master 的"身份"目前实现为
+// 「#control 频道的 agent」（ws 同时挂 #control 和 #agent-exchange 两个 id）。
+// 将来引入非 Discord 的 master 标识时只改这三个 helper。
+// ============================================================
+
+/** channelId 是否指向 master（#control 或 我方 #agent-exchange） */
+async function isMasterChannel(channelId: string): Promise<boolean> {
+  if (!channelId) return false;
+  if (channelId === CONTROL_CHANNEL_ID) return true;
+  const ex = await getLocalAgentExchangeId();
+  return !!ex && channelId === ex;
+}
+
+/** 该 ws 是否 master 的连接 */
+function isMasterWs(ws: ServerWebSocket<unknown>): boolean {
+  return !!CONTROL_CHANNEL_ID && clients.get(CONTROL_CHANNEL_ID)?.ws === ws;
+}
+
+/** 事件流 / 日志用的 agent 标签（master 特判，查不到用 "?"） */
+function agentLabelForChannel(channelId: string): string {
+  return agentNameForChannel(channelId) || (channelId === CONTROL_CHANNEL_ID ? "master" : "?");
 }
 
 /**
@@ -284,8 +380,6 @@ function clearInterAgentPendingsForChannel(channelId: string): number {
   return n;
 }
 
-const typingSafetyTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const TYPING_SAFETY_TIMEOUT_MS = 30 * 60 * 1000; // 30 分钟
 
 // ============================================================
 // v2.0.0+ 路由抽象
@@ -295,10 +389,24 @@ import type {
   LocalEndpoint as RouterLocalEndpoint,
   PeerEndpoint as RouterPeerEndpoint,
   UserEndpoint as RouterUserEndpoint,
+  ApiUserEndpoint as RouterApiUserEndpoint,
   Envelope as RouterEnvelope,
   Delivery as RouterDelivery,
 } from "./bridge/router.js";
-import { endpointLabel, envelopeLabel, newThreadId } from "./bridge/router.js";
+import { endpointLabel, envelopeLabel, newThreadId, parseChatId } from "./bridge/router.js";
+// v2.6.0+ C1：出站按 transport 分发（设计 §6）
+import { registerAdapter, adapterFor } from "./bridge/adapters.js";
+// v2.6.0+ C2-4：Discord 前端 UI 归属模块（typing / status 消息 / 完成通知 / 按钮）
+import {
+  createDiscordChatAdapter,
+  beginTypingWithSafety,
+  clearSafetyTimer,
+  trackStatusMessage,
+  statusMessageIdFor,
+  finishStatusMessage,
+  agentActionButtons,
+  randomUmaDone,
+} from "./bridge/discord-adapter.js";
 
 /**
  * v2.0.0+ 统一消息投递入口。所有 bridge 的出入站消息（messageCreate 路由 /
@@ -324,9 +432,7 @@ async function deliver(env: RouterEnvelope): Promise<RouterDelivery> {
   //    (master 的 client 在 clients 里 channelId 可能是 CONTROL 或 agent-exchange
   //    id，两个都算 master。)
   if (env.from.kind === "peer" && env.to.kind === "local") {
-    const localAgentExchangeId = await getLocalAgentExchangeId();
-    const toIsMaster = env.to.channelId === CONTROL_CHANNEL_ID ||
-      (!!localAgentExchangeId && env.to.channelId === localAgentExchangeId);
+    const toIsMaster = await isMasterChannel(env.to.channelId);
     if (!toIsMaster) {
       try {
         const { readPeers } = await import("./lib/peers.js");
@@ -358,10 +464,85 @@ async function deliver(env: RouterEnvelope): Promise<RouterDelivery> {
         return await deliverToPeer(env, env.to);
       case "user":
         return await deliverToUser(env, env.to);
+      case "api":
+        return await deliverToApi(env, env.to);
     }
   } catch (e) {
     console.error(`deliver 失败 ${envelopeLabel(env)}:`, e);
     return { envelope: env, outcome: { kind: "error", error: e as Error } };
+  }
+}
+
+/**
+ * v2.6.0+ 投递到 HTTP API 用户（设计 §5.3）。不碰 Discord（镜像除外）：
+ * 1. 按 `${tokenId}|${agent频道}` 出队 pendingApiRequest → resolve 同步 waiter；
+ * 2. emit chat_message(out) 事件（带原请求 threadId，SSE 订阅者收到）；
+ * 3. 结果写 apiThreadResults（GET /api/v1/threads/:id 轮询兜底）；
+ * 4. R2 审计镜像：把回复镜像到该 agent 的 Discord 频道（token mirror!==false 时）。
+ */
+async function deliverToApi(env: RouterEnvelope, to: RouterApiUserEndpoint): Promise<RouterDelivery> {
+  const fromChannelId = env.from.kind === "local" ? env.from.channelId : "";
+  const key = apiReqKey(to.tokenId, fromChannelId);
+  const queue = pendingApiRequests.get(key);
+  const pending = queue?.shift();
+  if (queue && queue.length === 0) pendingApiRequests.delete(key);
+
+  // 附件登记 → 下载 URL（属主 = 该 token，GET /api/v1/files/:id 校验）
+  const files = (env.meta.files || []).map((p) => {
+    const id = `f_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const name = p.split("/").pop() || "file";
+    apiFiles.set(id, { path: p, tokenId: to.tokenId, name });
+    return { name, url: `/api/v1/files/${id}` };
+  });
+
+  const threadId = pending?.threadId || env.meta.threadId;
+  const agentName = pending?.agentName ||
+    (env.from.kind === "local" ? env.from.agentName : undefined) ||
+    agentNameForChannel(fromChannelId) || "?";
+  const result: ApiReplyResult = {
+    reply: env.content,
+    components: env.meta.components,
+    files: files.length ? files : undefined,
+    threadId,
+    agent: agentName,
+  };
+  apiThreadResults.set(threadId, { result, ts: Date.now() });
+  pending?.resolve?.(result);
+
+  emitEvent({
+    agent: agentName,
+    chatId: `api:${to.tokenId}`,
+    type: "chat_message",
+    data: { direction: "out", from: agentName, text: env.content, threadId, api: true },
+  });
+
+  // R2 审计镜像（fire-and-forget，走 bridge→user 的 UI 类通道）
+  mirrorApiExchange(to, fromChannelId, `[🌐 API→${to.name}] ${env.content}`).catch(() => {});
+
+  return { envelope: env, outcome: { kind: "sent" } };
+}
+
+/** R2：API 对话镜像到 agent 的 Discord 频道（principal.mirror === false 时不发） */
+async function mirrorApiExchange(to: RouterApiUserEndpoint, agentChannelId: string, text: string): Promise<void> {
+  if (!agentChannelId) return;
+  try {
+    const file = await readPrincipals();
+    const p = file.principals.find((x) => x.id === `token:${to.tokenId}`);
+    if (p?.mirror === false) return;
+    await deliver({
+      from: { kind: "bridge", label: "api-mirror" },
+      to: { kind: "user", userId: "", channelId: agentChannelId },
+      intent: "notification",
+      content: text,
+      meta: {
+        messageId: `api_mirror_${Date.now()}`,
+        triggerKind: "system",
+        ts: new Date().toISOString(),
+        threadId: newThreadId(),
+      },
+    });
+  } catch (e) {
+    console.error("API 镜像失败:", (e as Error).message);
   }
 }
 
@@ -398,6 +579,10 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
     meta.user = `bridge${env.from.label ? `:${env.from.label}` : ""}`;
     meta.user_id = "bridge";
     meta.is_bridge = "true";
+  } else if (env.from.kind === "api") {
+    meta.user = env.from.name;
+    meta.user_id = `api:${env.from.tokenId}`;
+    meta.api = "true";
   }
   if (env.meta.attachments && env.meta.attachments.length > 0) {
     meta.attachment_count = String(env.meta.attachments.length);
@@ -405,6 +590,12 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
   }
   try {
     to.ws.send(JSON.stringify({ type: "message", content, meta }));
+    // v2.6.0+ 事件埋点：入站消息镜像 + agent 进入思考态（旁路，不影响主流程）
+    {
+      const evAgent = to.agentName || agentLabelForChannel(to.channelId);
+      emitEvent({ agent: evAgent, chatId: to.channelId, type: "chat_message", data: { direction: "in", from: meta.user || "?", text: env.content, threadId: env.meta.threadId } });
+      emitEvent({ agent: evAgent, chatId: to.channelId, type: "agent_status", data: { status: "thinking" } });
+    }
     // intent=request 挂 pending + thread 追踪。response 端到端，不挂新 pending。
     if (env.intent === "request") {
       pendingReplies.set(replyBackChannel, {
@@ -450,6 +641,8 @@ function resolveReplyBackChannel(env: RouterEnvelope): string {
   if (env.from.kind === "user") return env.from.channelId;
   if (env.from.kind === "peer") return env.from.sharedChannelId;
   if (env.from.kind === "local") return env.from.channelId;
+  // v2.6.0+ API 用户：虚拟 chat_id（统一 keyspace D7），agent reply 原样回传
+  if (env.from.kind === "api") return `api:${env.from.tokenId}`;
   return "";
 }
 
@@ -460,10 +653,6 @@ function resolveReplyBackChannel(env: RouterEnvelope): string {
  * 支持 chunking / reply_to / files / components（通过 meta 透传 discordReply）。
  */
 async function deliverToPeer(env: RouterEnvelope, to: RouterPeerEndpoint): Promise<RouterDelivery> {
-  // Web-only：peer 协作靠 Discord #agent-exchange，无 Discord 即无 peer 出口。
-  if (!DISCORD_ENABLED) {
-    return { envelope: env, outcome: { kind: "dropped", reason: "Discord disabled (Web-only)" } };
-  }
   let text = env.content;
   if (!env.meta.skipAutoMention) {
     text = await ensurePeerMentions(discord, to.sharedChannelId, text);
@@ -500,30 +689,37 @@ async function deliverToPeer(env: RouterEnvelope, to: RouterPeerEndpoint): Promi
  */
 async function deliverToUser(env: RouterEnvelope, to: RouterUserEndpoint): Promise<RouterDelivery> {
   try {
-    // Web-only：跳过 Discord 出口（Web tee 已负责把内容送 Web），但保留下面的
-    // cross-agent forward（纯 ws，Discord 无关，两种模式都要能用）。
-    const ids = DISCORD_ENABLED
-      ? await discordReply(
-          discord,
-          to.channelId,
-          env.content,
-          env.meta.replyTo,
-          env.meta.components as any,
-          env.meta.files,
-        )
-      : [];
-    // v2.0.15+ cross-agent forward —— 见函数注释
-    if (env.from.kind === "local") {
+    // v2.6.0+ C1：按 transport 分发（设计 §6）。to.channelId 是统一 keyspace
+    // 地址（裸 id = discord）。当前只注册了 discord adapter；Telegram 等未来
+    // transport 只需 registerAdapter，一行不改这里。
+    const dest = parseChatId(to.channelId);
+    const adapter = adapterFor(dest.transport);
+    if (!adapter) {
+      return { envelope: env, outcome: { kind: "dropped", reason: `no adapter for transport "${dest.transport}"` } };
+    }
+    const { messageIds: ids } = await adapter.send(dest.id, {
+      text: env.content,
+      replyTo: env.meta.replyTo,
+      components: env.meta.components,
+      files: env.meta.files,
+    });
+    // v2.0.15+ cross-agent forward —— 见函数注释（Discord 专属：clients 的 key
+    // 是 Discord channel id，别的 transport 没有"用户频道=agent 频道"的重合）
+    if (env.from.kind === "local" && dest.transport === "discord") {
       const fromLocal = env.from;
-      const isFromMaster = !!CONTROL_CHANNEL_ID && clients.get(CONTROL_CHANNEL_ID)?.ws === fromLocal.ws;
+      const isFromMaster = isMasterWs(fromLocal.ws);
       const targetClient = clients.get(to.channelId);
-      if (!isFromMaster && targetClient && targetClient.ws !== fromLocal.ws) {
+      // v2.5.5: fromLocal.channelId 为空 = 发送方不是任何已注册的 agent，而是
+      // manager/cron 的临时 bridge-client 连接（restart 完成通知、cron 播报这类
+      // **给用户看的管理消息**）。这类只发 Discord，不 forward 进目标 agent 的
+      // 上下文 —— 否则 agent 收到"你自己已重启"的通知，判断一轮不用回应（内心戏
+      // 被 jsonl-watcher 以 💬 播到频道），ia-watchdog 又 nudge 一轮，一条通知
+      // 变三条噪音 + 两轮 LLM 消耗（owner 2026-07-08 报的"重启后一堆乱七八糟
+      // bridge 消息"）。真 agent reply 到别的 agent 频道时 channelId 非空，不受影响。
+      if (!isFromMaster && fromLocal.channelId && targetClient && targetClient.ws !== fromLocal.ws) {
         forwardReplyToAgentClaude(fromLocal, env.content, to.channelId, targetClient)
           .catch((e) => console.error("reply→别agent频道 forward 异常:", e));
       }
-    }
-    if (!DISCORD_ENABLED) {
-      return { envelope: env, outcome: { kind: "dropped", reason: "Discord disabled (Web-only)" } };
     }
     return { envelope: env, outcome: { kind: "sent", discordMessageIds: ids } };
   } catch (e) {
@@ -588,6 +784,18 @@ async function renderContentForLocal(env: RouterEnvelope): Promise<string> {
     return env.content;
   }
 
+  // v2.6.0+ HTTP API 用户（设计 §5.2）：header 明示对话方不是 Discord 用户 ——
+  // 没有 @mention/push 语义，且这是外部 principal（R1 纵深防御：agent 可据此
+  // 对上下文里的敏感内容保持沉默）。reply 直接回 meta.chat_id（api:<tokenId>）。
+  if (from.kind === "api") {
+    return [
+      `[🌐 来自 API 用户「${from.name}」（外部 token 接入，非 Discord）。`,
+      `直接用 reply() 回答到本 chat_id 即可；对方看不到本频道历史，不要在回复里引用与本请求无关的既有上下文内容。]`,
+      ``,
+      env.content,
+    ].join("\n");
+  }
+
   // 本地 agent → agent 转发（send_to_agent / pushback / reply→别agent forward）。
   // v2.0.17 引入了 imperative framing 强迫 agent 处理；v2.4.16 又往回收了一段 ——
   // 实测 "必须 reply() 报告、就算只是知会也 reply() 收到" 这种强约束跟 drain兜底
@@ -615,10 +823,7 @@ async function renderContentForLocal(env: RouterEnvelope): Promise<string> {
   const fromChannelId = from.kind === "user" ? from.channelId : from.sharedChannelId;
   const localAgentExchangeId = await getLocalAgentExchangeId();
   const isAgentExchange = !!localAgentExchangeId && fromChannelId === localAgentExchangeId;
-  const isMaster = env.to.kind === "local" && (
-    env.to.channelId === CONTROL_CHANNEL_ID ||
-    (!!localAgentExchangeId && env.to.channelId === localAgentExchangeId)
-  );
+  const isMaster = env.to.kind === "local" && (await isMasterChannel(env.to.channelId));
 
   if (isAgentExchange && isMaster) {
     // 我方 #agent-exchange → master：master 的职责是挑 agent 再 send_to_agent，不是自答
@@ -781,172 +986,10 @@ async function renderAgentExchangeToMasterHeader(env: RouterEnvelope): Promise<s
   return env.content;
 }
 
-// 任务完成语（只留抽象搞笑的）
-const UMA_DONE_MESSAGES = [
-  // 复读机系列
-  "哈基米哈基米哈基米哈基米",
-  "哈基米…哈基米…（倒地）",
-  "哈基米（沉思）",
-  "我哈基米完了",
-  "哈？基？米？",
-  "不要叫我哈基米叫我哈尼",
-  "曼波。（转身离开）",
-  "这活干得我都想曼波了",
-  "搞定了别催了你再催我曼波了",
-  "曼波一下怎么了曼波一下又不会怀孕",
-  "曼波是一种精神状态",
-  "うまぴょいうまぴょいうまぴょいうまぴょい",
-  // 马叫/发癫系列
-  "呜嘶～～～～～",
-  "嘶哈嘶哈嘶哈完事了",
-  "嘶。（简洁有力）",
-  "（发出了马的声音）",
-  "嘶嘶嘶别摸我我还没缓过来",
-  "嗷呜——等等我不是狼我是马",
-  // 括号动作系列
-  "（甩尾巴）",
-  "（原地转了三圈然后躺下了）",
-  "（做了一个帅气的pose但是没人看到）",
-  "（刨地）",
-  "（耳朵竖起来了）",
-  "（耳朵耷拉下去了）",
-  "（假装若无其事地舔了一下屏幕）",
-  "（已读）",
-  "草（物理意义上的草）（然后吃掉了）",
-  // 身份危机系列
-  "我不是马我是驴（不是）",
-  "等等我到底是AI还是马",
-  "说起来我有蹄子怎么打字的",
-  // 互联网梗系列
-  "寄",
-  "差不多得了😇",
-  "我超！结束了！",
-  "6",
-  "笑死 根本不难好吧",
-  "就这？就这？？",
-  "赢麻了赢麻了",
-  "难绷 但是跑完了",
-  "你说得对 但是我已经做完了",
-  "鉴定为：完成了",
-  "这波啊 这波是直接秒了",
-  "但是又如何呢（做完了）",
-  "有一说一 确实做完了",
-  "听我说谢谢你——算了不唱了",
-  "完了完了（物理意义上的完了）",
-  "急了急了 谁急了？反正不是我 我做完了",
-  // 哲学系列
-  "完成了。但完成的意义是什么呢。算了不想了",
-  "如果一匹马在赛道上完成了任务 但是没人知道 那它算完成了吗",
-  "做完了。突然觉得有点空虚。再来？",
-  "世界上有两种马 做完活的和没做完活的 我是前者",
-  // 长的无厘头
-  "报告训练员 本马娘已完成任务 请求批准吃三根胡萝卜 两块方糖 以及摸摸头",
-  "我宣布 在座的各位 都没我跑得快 因为我已经到终点了",
-  "做完了做完了 你不夸我一句吗 你怎么不说话 你是不是不爱我了",
 
-  // ───── 第二批补充 50 条 ─────
-
-  // 复读机 2
-  "哈基米是一种生活态度",
-  "哈什么基什么米什么",
-  "哈基曼波 曼波哈基 哈曼基波",
-  "曼波 ≠ 曼波 ≈ 曼波",
-  "曼曼波波曼曼波",
-  // 马叫 2
-  "嗷！！（没有理由的嗷）",
-  "嘶啊——（突然吓到自己）",
-  "咴咴咴咴咴",
-  "嘘——（我在偷偷完成）",
-  // 括号动作 2
-  "（把任务卷起来吃了）",
-  "（对着空气鞠了一躬）",
-  "（试图用蹄子打响指 失败）",
-  "（深吸一口气 吐出彩虹）",
-  "（把自己叠成纸飞机飞走了）",
-  "（和自己的影子击了个掌）",
-  "（做了一个 spin attack）",
-  "（走了 但是是倒着走的）",
-  "（装作没完成的样子完成了）",
-  "（眨眼 慢动作）",
-  "（把键盘藏起来假装没动过）",
-  // 身份危机 2
-  "等等 我是不是在梦里完成的",
-  "我刚才是不是死了一下又复活了",
-  "我是谁 我在哪 我做完了什么",
-  "我感觉有三个我 他们都说做完了",
-  "如果我是你 我也会说我做完了",
-  // 互联网梗 2
-  "这活啊 是真活",
-  "我 做完了 怎么了",
-  "任务：完成 情绪：未知",
-  "确认收货 给五星好评",
-  "你礼貌吗？但是我做完了",
-  "这事有蹊跷 但是做完了",
-  "大无语事件 做完了",
-  "我直接裂开 但是是裂开着做完的",
-  "啊？什么？完了？完了",
-  "不会吧不会吧 真有人这么快就做完了",
-  "蚌埠住了（真的做完了）",
-  "这届任务不行（但是做完了）",
-  "老登做完了",
-  "妈耶 这都能做完",
-  "做了个寂寞 啊不是 做完了",
-  "我是懂做任务的",
-  "完成度 100% 精神度 0%",
-  "刚才那个是谁做完的 哦是我啊",
-  // 哲学/玄学 2
-  "完成的尽头是什么 是又一个完成",
-  "道可道 非常道 完成可完成 非常完成",
-  "有人问我完成是什么 我说是一种震动",
-  "活着就是为了完成 完成就是为了活着",
-  "量子力学告诉我 我既完成了又没完成",
-  // 长抽象 2
-  "这个任务 我仔细一看 里面写着两个字 完成 然后我就完成了",
-  "想了一整晚 最后决定 还是完成一下吧 你开心就好",
-];
-
-function randomUmaDone(): string {
-  return UMA_DONE_MESSAGES[Math.floor(Math.random() * UMA_DONE_MESSAGES.length)];
-}
-
-/** 开始 typing + 设置安全超时 */
+/** 开始 typing + 30min 安全超时（实现在 discord-adapter，这里注入 owner mention） */
 function startTypingWithSafety(channelId: string) {
-  startTyping(channelId, discord);
-  // 清除旧的安全计时器
-  const old = typingSafetyTimers.get(channelId);
-  if (old) clearTimeout(old);
-  // 30 分钟后强制停止 typing（兜底 hooks 失败的情况）
-  const timer = setTimeout(() => {
-    stopTyping(channelId);
-    typingSafetyTimers.delete(channelId);
-    const statusMsgId = activeStatusMessages.get(channelId);
-    if (statusMsgId) {
-      discord.channels.fetch(channelId).then((ch) => {
-        if (ch && "messages" in ch) {
-          const textCh = ch as TextChannel;
-          textCh.messages.fetch(statusMsgId).then((sm) => {
-            sm.edit({ content: "⏰ 超时自动停止", components: [] }).catch(() => {});
-          }).catch(() => {});
-          // 发新消息通知用户
-          const mention = ALLOWED_USER_IDS.length > 0 ? `<@${ALLOWED_USER_IDS[0]}>` : "";
-          if (mention) {
-            textCh.send(`⏰ 超时自动停止 ${mention}`).catch(() => {});
-          }
-        }
-      }).catch(() => {});
-      activeStatusMessages.delete(channelId);
-    }
-  }, TYPING_SAFETY_TIMEOUT_MS);
-  typingSafetyTimers.set(channelId, timer);
-}
-
-/** 清除安全超时（在 hook 或手动停止时调用） */
-function clearSafetyTimer(channelId: string) {
-  const timer = typingSafetyTimers.get(channelId);
-  if (timer) {
-    clearTimeout(timer);
-    typingSafetyTimers.delete(channelId);
-  }
+  beginTypingWithSafety(discord, channelId, () => (primaryOwnerId() ? `<@${primaryOwnerId()}>` : ""));
 }
 
 // ============================================================
@@ -963,6 +1006,12 @@ const discord = new Client({
   ],
 });
 
+// v2.6.0+ C1：Discord 作为第一个 ChatAdapter（设计 §6）。内部就是 discordReply
+// —— 挪壳不挪逻辑：分块 / reply_to / components 渲染 / files 都在 discordReply
+// 里，本来就是 Discord 专属职责。send 时 discord client 已 ready（消息只会在
+// ready 后流动）。
+registerAdapter(createDiscordChatAdapter(discord));
+
 discord.once("ready", async () => {
   setBotUserId(discord.user?.id || "");
   console.log(`✅ Discord 已连接: ${discord.user?.tag}`);
@@ -974,6 +1023,10 @@ discord.once("ready", async () => {
   // 没法编辑。启动后扫所有 registered channel 的近期消息，把遗留的思考中消息
   // 编辑成"bridge 已重启"。
   cleanupStaleThinkingMessages().catch((e) => console.error("清理遗留思考中消息失败:", e));
+
+  // v2.4.25+ 用量看板：启动后确保只读频道 + 常驻消息存在，并刷一次。延迟几秒等
+  // channel-server 重连、master TUI 稳定，再抓 /status。
+  setTimeout(() => void initStatsDashboard(discord), 6000);
 
   // 扫 skill + 为已有 active agent 扫项目级
   await scanGlobalSkills();
@@ -990,10 +1043,20 @@ discord.once("ready", async () => {
   await registerSlashCommands();
 
   // 启动权限弹窗 watcher
-  startPermissionWatcher(ALLOWED_USER_IDS, discord);
+  startPermissionWatcher(allowedDiscordIds(), discord);
 
-  // 启动 wedge watcher — 检测长时间没动静但又不 idle 的 agent
-  startWedgeWatcher(discord);
+  // 启动 wedge watcher — 检测长时间没动静但又不 idle 的 agent；
+  // v2.7+ 注入链路查询做「窗口活着但 channel-server 掉线」哨兵
+  startWedgeWatcher(discord, (channelId) => clients.has(channelId));
+
+  // v2.7+ bg 对账定时器 — 检测正式 agent 的 bg 分身（agents 视图误触产物）
+  startSessionReconciler(discord);
+
+  // v2.8+ bg 活动追踪 — subagent / 后台 shell 任务 → 子区流式呈现 + bg_task_* 事件
+  startBgActivityWatcher();
+
+  // v2.9+ 归档每日兜底 — 退役归档之外，每 24h 对 active agent 补快照（幂等）
+  startArchiveSweeper();
   recordMetric("bridge_start", { meta: { channels: clients.size } });
 
   // 每 30 分钟自动重扫 skill（新装 plugin / 新建 user skill 不需要 restart bridge 就能出现在 /）
@@ -1088,13 +1151,16 @@ function truncateDesc(desc: string, fallback: string): string {
  */
 function buildAllSlashCommands(): any[] {
   const commands: any[] = [
-    // bridge 自己的 4 个
+    // bridge 自己的 5 个
     new SlashCommandBuilder().setName("screenshot").setDescription("截取当前 agent 的终端画面").toJSON(),
     new SlashCommandBuilder().setName("interrupt").setDescription("打断当前 agent 的操作 (Ctrl+C)").toJSON(),
     new SlashCommandBuilder().setName("status").setDescription("查看所有 agent 的状态").toJSON(),
     new SlashCommandBuilder().setName("cron").setDescription("查看和管理定时任务").toJSON(),
+    new SlashCommandBuilder().setName("focus").setDescription("把 Mac 上的 iTerm 切到本频道 agent 的 tab").toJSON(),
+    // v2.7+ Claude Code agents 模式：全机器会话总览（bg 分身检测/清理/收编）
+    new SlashCommandBuilder().setName("agents").setDescription("Claude 会话总览：前台/后台/分身检测").toJSON(),
   ];
-  const bridgeNames = new Set(["screenshot", "interrupt", "status", "cron"]);
+  const bridgeNames = new Set(["screenshot", "interrupt", "status", "cron", "agents"]);
 
   for (const item of allRegistrableCommands()) {
     if (item.kind === "builtin") {
@@ -1133,8 +1199,6 @@ function buildAllSlashCommands(): any[] {
 }
 
 async function registerSlashCommands(): Promise<void> {
-  // Web-only：无 Discord 连接，slash commands 是 Discord 专属（discord.user 为 null）。
-  if (!DISCORD_ENABLED) return;
   try {
     const commands = buildAllSlashCommands();
     // 用 hash 去重 — 命令列表没变就不 REST PUT，省 Discord 配额
@@ -1455,7 +1519,7 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
   // 保证：我方 reply() 时 bridge 会自动补 @ peer bot（见 ensurePeerMentions），所以我方不会忘。
   if (msg.author.bot) {
     if (!mentionedMe) return;
-  } else if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(msg.author.id)) {
+  } else if (allowedDiscordIds().length > 0 && !allowedDiscordIds().includes(msg.author.id)) {
     // 人类但不在 allowlist：只有 @ 了我们才处理（跨服有人找我们的场景）
     if (!mentionedMe) return;
   }
@@ -1555,15 +1619,7 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
   // 清理上一轮状态 + 重置 tool 追踪
   stopTyping(channelId);
   clearSafetyTimer(channelId);
-  const oldStatusId = activeStatusMessages.get(channelId);
-  if (oldStatusId) {
-    try {
-      const ch = await discord.channels.fetch(channelId) as TextChannel;
-      const sm = await ch.messages.fetch(oldStatusId);
-      await sm.edit({ content: t("✅ 完成", "✅ Done"), components: [] });
-    } catch { /* non-critical */ }
-    activeStatusMessages.delete(channelId);
-  }
+  await finishStatusMessage(discord, channelId, t("✅ 完成", "✅ Done"));
   resetToolTracking(channelId);
   startTypingWithSafety(channelId);
   // 状态消息走 deliver(bridge → user)。discordReply 内部会 buildComponents +
@@ -1578,14 +1634,11 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
       triggerKind: "bridge_synth",
       ts: new Date().toISOString(),
       threadId: newThreadId(),
-      components: [{
-        type: "buttons",
-        buttons: [{ id: `interrupt:${channelId}`, label: t("打断", "Interrupt"), emoji: "⚡", style: "danger" }],
-      }],
+      components: agentActionButtons(channelId, true),
     },
   });
   if (statusDelivery.outcome.kind === "sent" && statusDelivery.outcome.discordMessageIds?.[0]) {
-    activeStatusMessages.set(channelId, statusDelivery.outcome.discordMessageIds[0]);
+    trackStatusMessage(channelId, statusDelivery.outcome.discordMessageIds[0]);
   }
 
   // 转发给 channel-server
@@ -1748,14 +1801,14 @@ async function ensurePeerMentions(discord: Client, channelId: string, text: stri
 
 // 工具：往 master 控制频道发一条通知（系统广播，bridge → user 信道）
 async function notifyMaster(content: string): Promise<void> {
-  const controlChannelId = process.env.CONTROL_CHANNEL_ID || "";
+  const controlChannelId = CONTROL_CHANNEL_ID;
   if (!controlChannelId) return;
   try {
     await deliver({
       from: { kind: "bridge", label: "notifyMaster" },
       to: {
         kind: "user",
-        userId: ALLOWED_USER_IDS[0] || "",
+        userId: primaryOwnerId(),
         channelId: controlChannelId,
       },
       intent: "notification",
@@ -1899,7 +1952,7 @@ discord.on("guildMemberAdd", async (member) => {
   });
   // 5. master 如果已经连着，把 #agent-exchange 挂到 master ws 上（让 master 收这里的消息）
   if (exchange) {
-    const controlId = process.env.CONTROL_CHANNEL_ID || "";
+    const controlId = CONTROL_CHANNEL_ID;
     const master = clients.get(controlId);
     if (master) {
       clients.set(exchange.id, { ws: master.ws, channelId: exchange.id, userId: master.userId });
@@ -2037,14 +2090,175 @@ async function scopePeerToAgentExchange(
 // Interaction 处理（按钮、菜单、Slash Commands）
 // ============================================================
 
+/**
+ * v2.4.22+ agent 频道消息底部的通用操作按钮行。挂在「💭 思考中」/「✅ 完成」/
+ * button-click 回执这些**永远在频道底部、正文里**的消息上，用户一眼就能点 ——
+ * 不用翻 pin（pin 弹窗里按钮 Discord 点不动）、不用打 /focus。
+ * withInterrupt=true 时带打断（工作中），完成态不带。
+ */
+
+/** v2.4.22+ button 触发截图（复用 /screenshot slash 的逻辑）。返回 png 路径或 null。 */
+async function captureChannelScreenshot(channelId: string): Promise<string | null> {
+  const listResult = await runManager("list");
+  const agent = (listResult.agents || []).find((a: any) => a.channelId === channelId);
+  const windowName = agent ? agent.name : "master";
+  console.log(`📸 截图（button）: window=${windowName} channel=${channelId}`);
+  return tmuxScreenshot(windowName);
+}
+
+/**
+ * v2.4.19+ 把 iTerm2 切到某 channel 对应的 tmux tab。button（focus:）和 /focus 共用。
+ * 主路径（v2.5.4 定版）：activate 本机 iTerm → tmux select-window → iTerm 自己的
+ * CC 跟随切 tab（前台 1s 内稳定；对远端 ssh -CC attach 的 iTerm 同样生效）。
+ * 位置序号 AppleScript 只做验证失败后的本机兜底。
+ */
+async function focusITermTab(targetChannelId: string): Promise<{ ok: boolean; found: boolean; label: string; note: string }> {
+  const controlId = CONTROL_CHANNEL_ID;
+  let targetWindow: string;
+  let label: string;
+  if (targetChannelId === controlId) {
+    targetWindow = `${MASTER_SESSION}:0`;
+    label = "master";
+  } else {
+    const listResult = await runManager("list");
+    const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
+    if (!agent) {
+      return { ok: false, found: false, label: "?", note: "❌ 找不到对应 agent（可能已被 kill）" };
+    }
+    targetWindow = `${MASTER_SESSION}:${agent.name}`;
+    label = agent.name;
+  }
+
+  // v2.5.4 定版方案：**先 activate 再 select-window，让 iTerm 自己的 CC 跟随干活**。
+  //
+  // 实验结论（2026-07-08，逐秒观测）：iTerm CC 模式对 tmux 的 window-changed 通知，
+  // 前台时 1 秒内稳定跟随；后台时 15s+ 有意忽略（spinner 还在动 = 不是卡死/App Nap，
+  // 是防后台抢 tab 焦点的设计）。之前"后台随缘"的根因就是这个 —— 所以把 iTerm 先
+  // activate 到前台再 select-window，跟随就从随缘变确定。这同时惠及**所有** -CC
+  // client：远端设备 ssh attach 的 iTerm（AppleScript 够不着的那台）也收到同一条
+  // select-window 通知，它在用户手上通常本来就是前台 → 一并跟随。
+  // 「位置序号选 tab」降级为验证失败后的兜底（它假设单窗口 + tab 顺序==window 顺序，
+  // 散窗时会错，不再当主路径）。
+
+  const idxList = (await tmuxRaw(["list-windows", "-t", MASTER_SESSION, "-F", "#{window_index}"]).catch(() => "")).split("\n").filter(Boolean);
+  const targetIdx = (await tmuxRaw(["display-message", "-p", "-t", targetWindow, "#{window_index}"]).catch(() => "")).trim();
+  const ordinal = idxList.indexOf(targetIdx) + 1; // 1-based 位置（兜底 + 验证用）
+  const tmuxCount = idxList.length;
+
+  const clientsOut = await tmuxRaw(["list-clients", "-t", MASTER_SESSION]).catch(() => "");
+  const hasCC = /control/.test(clientsOut);
+
+  /** 跑一段 AppleScript，8s 超时 kill（iTerm 无响应时不拖垮 focus）。 */
+  const osaRun = async (script: string): Promise<string> => {
+    const p = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+    const out = await Promise.race([
+      new Response(p.stdout).text().then((t) => t.trim()),
+      new Promise<string>((r) => setTimeout(() => r("timeout"), 8000)),
+    ]);
+    if (out === "timeout") { try { p.kill(); } catch {} }
+    await p.exited.catch(() => {});
+    return out;
+  };
+
+  // 1) iTerm 提到前台（唤醒 CC 跟随）。远程 attach 时本机没开 iTerm 也无妨，照样走 2)。
+  await osaRun('tell application "iTerm2" to activate');
+
+  // 2) 切 tmux window —— 所有 -CC client（本机 + 远端）同时收到通知，前台的会跟。
+  //
+  // 曾把「给远端弹 macOS 通知」的所有路径都实验过（2026-07-08），全部否决，别再试：
+  // - 临时 window 发裸 OSC 9：能弹，但点击必然跳到临时窗口（OSC 9 点击跳发出者 tab）；
+  // - run-shell 注入目标 pane：输出不进 pane 的终端流，通知不发；
+  // - Claude Code `!` bash mode 从目标 pane 发：输出被 CC 捕获渲染在 TUI 里（⎿ 框），
+  //   不写入 pty，OSC 9 到不了 iTerm，还在 agent 会话留痕迹；忙时注入更是排队且不可控。
+  await tmuxRaw(["select-window", "-t", targetWindow]).catch(() => {});
+
+  // 2b) 1.8s 后单次补切（owner 批准，非循环）。对抗 iTerm 的防回显竞态：iTerm 因
+  // App 焦点事件上报自己 tab 时会预扣 _ignoreWindowChangeNotificationCount 计数器
+  // （iTerm2 源码 TmuxController.m），把我们这条切换通知误当回显吃掉，还把旧 tab 回写
+  // 覆盖 tmux（把别的 attach 端拉回去）。补发一次：第一发被误吃时计数器已消耗，第二发
+  // 必然生效；第一发已生效时第二发是 no-op。
+  setTimeout(() => {
+    tmuxRaw(["select-window", "-t", targetWindow]).catch(() => {});
+  }, 1800);
+
+  // 3) 给 1.5s 跟随，然后验证本机 iTerm 的 current tab 序号是否 == 目标序号。
+  let outcome = "noattach";
+  if (hasCC && ordinal >= 1) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const idx = await osaRun('tell application "iTerm2" to return index of current tab of current window');
+    if (idx === String(ordinal)) {
+      outcome = "ok";
+    } else {
+      // 4) 没跟上（如本机 iTerm 根本没有 CC 窗口 = 远程 attach）→ 位置序号法兜底强制切。
+      const forced = await osaRun([
+        'tell application "iTerm2"',
+        '  repeat with w in windows',
+        `    if (count of tabs of w) is ${tmuxCount} then`,
+        `      select tab ${ordinal} of w`,
+        '      select w',
+        '      return "ok"',
+        '    end if',
+        '  end repeat',
+        '  return "nolocal"',
+        'end tell',
+      ].join("\n"));
+      outcome = forced || "err";
+    }
+  }
+
+  const found = outcome === "ok";
+  console.log(`🖥 focus: ${targetWindow} → tab #${ordinal}/${tmuxCount} outcome=${outcome} (hasCC=${hasCC})`);
+  let note: string;
+  if (found) {
+    note = `🖥 已跳到 **${label}** 的 iTerm tab`;
+  } else if (!hasCC) {
+    note = `🖥 当前没有 -CC attach，无法切 tab（tmux 内部已切到 **${label}**，attach 后可见）`;
+  } else if (outcome === "nolocal") {
+    note = `🖥 tmux 已切到 **${label}**。你像是**远程 attach**（本机没有 CC 窗口）—— 远端 iTerm 前台会自动跟着切，没跟就手动点下 tab`;
+  } else if (outcome === "timeout") {
+    note = `🖥 tmux 已切到 **${label}**，本机 iTerm 的 AppleScript 无响应（超时跳过）。前台 iTerm 会自动跟随`;
+  } else {
+    note = `🖥 tmux 已切到 **${label}**，但本机 iTerm tab 没跟上（outcome=${outcome}）`;
+  }
+  return { ok: true, found, label, note };
+}
+
+/**
+ * v2.5.4+ 触发某个 agent 的「存记忆 + Compact」：往它的 tmux 发 /save-compact
+ * （随包 skill：先挑重点存记忆 —— 有 mem0 用 mem0，没有用 CC 自带 memory ——
+ * 再自动安排 /compact）。看板 select 和档位提醒按钮共用。agent 正忙也照发，
+ * TUI 会排队，轮到时执行（跟 cron --target-agent 一个假设）。
+ */
+async function triggerSaveCompact(interaction: any, targetChannelId: string): Promise<void> {
+  try {
+    const listResult = await runManager("list");
+    const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
+    if (!agent) {
+      await interaction.followUp({ content: "❌ 找不到对应 agent（可能已被 kill）", ephemeral: true }).catch(() => {});
+      return;
+    }
+    await tmuxSendLine(`master:${agent.name}`, "/save-compact");
+    console.log(`🧹 save-compact 已发送: ${agent.name} (channel=${targetChannelId})`);
+    await interaction
+      .followUp({
+        content: `🧹 已让 **${String(agent.name).replace(/^agent-/, "")}** 存记忆 + compact（正忙的话会排队，做完它会在自己频道汇报）`,
+        ephemeral: true,
+      })
+      .catch(() => {});
+  } catch (e) {
+    console.error("🧹 save-compact 触发失败:", e);
+    await interaction.followUp({ content: `❌ 触发失败: ${(e as Error).message}`, ephemeral: true }).catch(() => {});
+  }
+}
+
 discord.on("interactionCreate", async (interaction: Interaction) => {
   try {
     const channelId = interaction.channelId;
     console.log(`🎯 Interaction: type=${interaction.type} channel=${channelId} user=${interaction.user?.id}`);
     if (!channelId) return;
 
-    if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(interaction.user.id)) {
-      console.log(`🚫 用户 ${interaction.user.id} 不在 ALLOWED_USER_IDS 中`);
+    if (allowedDiscordIds().length > 0 && !allowedDiscordIds().includes(interaction.user.id)) {
+      console.log(`🚫 用户 ${interaction.user.id} 不在允许列表（principals/.env）中`);
       return;
     }
 
@@ -2087,18 +2301,24 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
           Bun.spawn(["tmux", "-S", TMUX_SOCK, "send-keys", "-t", `master:${agent.name}`, "C-c"]);
           stopTyping(channelId);
           clearSafetyTimer(channelId);
-          const statusMsgId = activeStatusMessages.get(channelId);
-          if (statusMsgId) {
-            try {
-              const ch = await discord.channels.fetch(channelId) as TextChannel;
-              const sm = await ch.messages.fetch(statusMsgId);
-              await sm.edit({ content: t("⚡ 已打断", "⚡ Interrupted"), components: [] });
-            } catch { /* non-critical */ }
-            activeStatusMessages.delete(channelId);
-          }
+          await finishStatusMessage(discord, channelId, t("⚡ 已打断", "⚡ Interrupted"));
           await interaction.reply("⚡ 已发送 Ctrl+C");
         } else {
           await interaction.reply("⚠️ 当前频道没有关联的 agent");
+        }
+        return;
+      }
+
+      if (cmd === "focus") {
+        // v2.4.20+ 可靠版跳 iTerm tab（不依赖 pin 弹窗里的按钮）。ephemeral 回执。
+        try {
+          await interaction.deferReply({ ephemeral: true });
+        } catch { return; }
+        try {
+          const r = await focusITermTab(channelId);
+          await interaction.editReply({ content: r.note }).catch(() => {});
+        } catch (e) {
+          await interaction.editReply({ content: `❌ 切换失败: ${(e as Error).message}` }).catch(() => {});
         }
         return;
       }
@@ -2108,6 +2328,19 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         const panel = await buildStatusPanel();
         const components = panel.components ? buildComponents(panel.components) : undefined;
         await interaction.editReply({ content: panel.text, components });
+        return;
+      }
+
+      // v2.7+ /agents —— Claude 会话总览（前台/后台/分身检测/清理/收编）
+      if (cmd === "agents") {
+        await interaction.deferReply();
+        const panel = await handleMgmtButton("show_sessions_panel", channelId);
+        if (panel) {
+          const components = panel.components ? buildComponents(panel.components) : undefined;
+          await interaction.editReply({ content: panel.text, components });
+        } else {
+          await interaction.editReply("❌ 无法获取会话清单");
+        }
         return;
       }
 
@@ -2184,6 +2417,19 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         await interaction.deferReply({ ephemeral: true }).catch(() => {});
       });
 
+      // 用量看板「🔄 刷新」按钮 — 强制立即刷新（deferUpdate 已 ack，doUpdate 会编辑消息）
+      if (id === "stats_refresh") {
+        forceRefreshStatsDashboard(discord).catch((e) => console.error("📊 手动刷新失败:", e));
+        return;
+      }
+
+      // v2.5.4+ 「🧹 存记忆 + Compact」按钮（上下文档位提醒消息上的）
+      if (id.startsWith("savecompact:")) {
+        const targetChannelId = id.slice("savecompact:".length);
+        await triggerSaveCompact(interaction, targetChannelId);
+        return;
+      }
+
       // TUI modal 选项按钮 — 把键转发给 tmux，再截图 + 可能再出菜单
       if (id.startsWith("modal:")) {
         const rest = id.slice("modal:".length);
@@ -2203,7 +2449,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         const targetWindow = rest.slice(0, idx);
         const ccText = decodeURIComponent(rest.slice(idx + 1));
         const agentName = targetWindow.replace(/^master:/, "");
-        const controlChannelId = process.env.CONTROL_CHANNEL_ID || "";
+        const controlChannelId = CONTROL_CHANNEL_ID;
         if (!controlChannelId) {
           await interaction.followUp({ content: "❌ 未配置 CONTROL_CHANNEL_ID，无法升级", ephemeral: true }).catch(() => {});
           return;
@@ -2331,67 +2577,31 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         return;
       }
 
-      // v2.4.19+ 跳到 iTerm tab 按钮（LLM-free）。
-      // tmux select-window 只改 tmux 内部的 active window —— iTerm CC 模式下
-      // 每个 tmux window 是一个原生 tab，tab 焦点归 iTerm 管，得用 AppleScript
-      // 按 session 名（CC 模式显示为 "✳ <短名> (node)"）找到 tab 并 select。
-      // 只对 bridge 所在的这台 Mac 有效 —— 手机上点也行，Mac 那头会切好等你回来。
+      // v2.4.19+ 跳到 iTerm tab 按钮（LLM-free）。逻辑抽到 focusITermTab()，
+      // /focus slash 命令复用同一份（button 在 pin 弹窗里点不动，slash 更可靠）。
       if (id.startsWith("focus:")) {
         const targetChannelId = id.slice("focus:".length);
         try {
-          const controlId = process.env.CONTROL_CHANNEL_ID || "";
-          let targetWindow: string;
-          let label: string;
-          let tabNeedle: string; // iTerm session 名匹配串
-          if (targetChannelId === controlId) {
-            targetWindow = `${MASTER_SESSION}:0`;
-            label = "master";
-            tabNeedle = " Claude Code ("; // master 的 CC tab 名
-          } else {
-            const listResult = await runManager("list");
-            const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
-            if (!agent) {
-              await interaction.followUp({ content: "❌ 找不到对应 agent（可能已被 kill）", ephemeral: true }).catch(() => {});
-              return;
-            }
-            targetWindow = `${MASTER_SESSION}:${agent.name}`;
-            label = agent.name;
-            // tab 名用 agent 短名（去 "agent-" 前缀），两侧界定符防前缀嵌套误匹配
-            const short = String(agent.name).replace(/^agent-/, "");
-            tabNeedle = ` ${short} (`;
-          }
-          // tmux 内部状态也同步一下（非 CC attach 的裸 tmux 场景仍有用）
-          await tmuxRaw(["select-window", "-t", targetWindow]).catch(() => {});
-          // AppleScript：遍历 iTerm windows/tabs/sessions 按名选 tab + 前置
-          const esc = tabNeedle.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-          const script = [
-            'tell application "iTerm2"',
-            '  repeat with w in windows',
-            '    repeat with t in tabs of w',
-            '      repeat with s in sessions of t',
-            `        if name of s contains "${esc}" then`,
-            '          select w',
-            '          select t',
-            '          activate',
-            '          return "found"',
-            '        end if',
-            '      end repeat',
-            '    end repeat',
-            '  end repeat',
-            '  activate',
-            '  return "notfound"',
-            'end tell',
-          ].join("\n");
-          const osa = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
-          const found = (await new Response(osa.stdout).text()).trim();
-          await osa.exited;
-          console.log(`🖥 focus 按钮: ${targetWindow} → iTerm tab ${found === "found" ? "已选中" : "没找到（仅前置 iTerm）"}`);
-          const note = found === "found"
-            ? `🖥 已跳到 **${label}** 的 iTerm tab`
-            : `🖥 iTerm 已前置，但没找到 **${label}** 的 tab（iTerm 没 -CC attach？tmux 内部已切过去）`;
-          await interaction.followUp({ content: note, ephemeral: true }).catch(() => {});
+          const r = await focusITermTab(targetChannelId);
+          await interaction.followUp({ content: r.note, ephemeral: true }).catch(() => {});
         } catch (e) {
           await interaction.followUp({ content: `❌ 切换失败: ${(e as Error).message}`, ephemeral: true }).catch(() => {});
+        }
+        return;
+      }
+
+      // v2.4.22+ 截图按钮（复用 /screenshot 逻辑）。ephemeral 回执带图，不刷屏。
+      if (id.startsWith("screenshot:")) {
+        const targetChannelId = id.slice("screenshot:".length);
+        try {
+          const pngPath = await captureChannelScreenshot(targetChannelId);
+          if (pngPath) {
+            await interaction.followUp({ content: "📸 终端截图", files: [{ attachment: pngPath }], ephemeral: true }).catch(() => {});
+          } else {
+            await interaction.followUp({ content: "❌ 截图失败：PNG 生成失败", ephemeral: true }).catch(() => {});
+          }
+        } catch (e) {
+          await interaction.followUp({ content: `❌ 截图失败: ${(e as Error).message}`, ephemeral: true }).catch(() => {});
         }
         return;
       }
@@ -2402,14 +2612,31 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         console.log(`⚡ 打断按钮点击: channel=${targetChannelId}`);
         try {
           // master (CONTROL_CHANNEL_ID) 和 #agent-exchange 都 route 到 master:0，
-          // 但它们不在 registry.json 里 —— resolveTmuxTarget 直接认定为 master:0。
-          const resolved = await resolveTmuxTarget(targetChannelId);
-          if (!resolved) {
-            console.error(`⚡ 打断失败：channel=${targetChannelId} 找不到对应 agent`);
-            await interaction.followUp({ content: "❌ 打断失败：找不到对应 agent", ephemeral: true }).catch(() => {});
-            return;
+          // 但它们不在 registry.json 里 —— 直接认定目标是 master:0，不用查 registry
+          const controlId = CONTROL_CHANNEL_ID;
+          const { readPeers } = await import("./lib/peers.js");
+          const peers = await readPeers().catch(() => ({ localAgentExchangeId: "" } as any));
+          const exchangeId = (peers as any).localAgentExchangeId || "";
+          const isMasterChannel =
+            targetChannelId === controlId ||
+            (exchangeId && targetChannelId === exchangeId);
+
+          let targetWindow: string;
+          let agentLabel: string;
+          if (isMasterChannel) {
+            targetWindow = `${MASTER_SESSION}:0`;
+            agentLabel = "master";
+          } else {
+            const listResult = await runManager("list");
+            const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
+            if (!agent) {
+              console.error(`⚡ 打断失败：channel=${targetChannelId} 找不到对应 agent`);
+              await interaction.followUp({ content: "❌ 打断失败：找不到对应 agent", ephemeral: true }).catch(() => {});
+              return;
+            }
+            targetWindow = `master:${agent.name}`;
+            agentLabel = agent.name;
           }
-          const { targetWindow, agentLabel } = resolved;
 
           console.log(`⚡ 发送 C-c 到 tmux window: ${targetWindow}`);
           const proc = Bun.spawn(
@@ -2426,15 +2653,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
           console.log(`⚡ C-c 已发送给 ${agentLabel}`);
           recordMetric("agent_interrupt", { channelId: targetChannelId, agent: agentLabel, meta: { trigger: "button" } });
 
-          const statusMsgId = activeStatusMessages.get(targetChannelId);
-          if (statusMsgId) {
-            try {
-              const ch = await discord.channels.fetch(targetChannelId) as TextChannel;
-              const sm = await ch.messages.fetch(statusMsgId);
-              await sm.edit({ content: t("⚡ 已打断", "⚡ Interrupted"), components: [] });
-            } catch { /* non-critical */ }
-            activeStatusMessages.delete(targetChannelId);
-          }
+          await finishStatusMessage(discord, targetChannelId, t("⚡ 已打断", "⚡ Interrupted"));
           stopTyping(targetChannelId);
           clearSafetyTimer(targetChannelId);
         } catch (e) {
@@ -2450,13 +2669,46 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       ];
       if (promptBtnPrefixes.some((p) => id.startsWith(p))) {
         const [action, targetChannelId] = id.split(":");
-        console.log(`🔔 弹窗响应: channel=${targetChannelId} action=${action}`);
+        // 按钮对应的 Claude Code 按键**序列**。
+        // v2.0.22+: session-idle modal 不接受 digit 跳转（按 "2" 不会跳到 option 2，
+        // Enter 还是确认高亮的 option 1 = 从摘要恢复 = compact）。改用 arrow nav：
+        // 光标默认在 option 1，Down 一次到 2，两次到 3。perm 弹窗保留 digit（实测可用）。
+        const keySeqMap: Record<string, string[]> = {
+          perm_allow: ["1", "Enter"],
+          perm_allow_session: ["2", "Enter"],
+          perm_deny: ["3", "Enter"],
+          session_summary: ["Enter"],              // option 1（高亮默认）
+          session_full: ["Down", "Enter"],         // ↓ 到 option 2
+          session_noask: ["Down", "Down", "Enter"],// ↓↓ 到 option 3
+        };
+        const labelMap: Record<string, string> = {
+          perm_allow: "✅ 已允许",
+          perm_allow_session: "✅ 已允许（本会话不再问）",
+          perm_deny: "❌ 已拒绝",
+          session_summary: "✨ 从摘要恢复",
+          session_full: "📜 恢复完整会话",
+          session_noask: "🔕 不再询问",
+        };
+        const keySeq = keySeqMap[action] || ["Enter"];
+        const isPermBtn = action.startsWith("perm_");
+        const isIdleBtn = action.startsWith("session_");
+        console.log(`🔔 弹窗响应: channel=${targetChannelId} action=${action} keys=${keySeq.join(" ")}`);
         try {
-          // 键序列 + 弹窗仍在校验 + 发键，全在 applyPermissionAction 内（Web 端点共用）
-          const res = await applyPermissionAction(targetChannelId, action);
+          const listResult = await runManager("list");
+          const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
+          if (!agent) {
+            await interaction.followUp({ content: "❌ 找不到对应 agent", ephemeral: true }).catch(() => {});
+            return;
+          }
 
-          if (res.dialogClosed) {
-            console.log(`🔔 弹窗已关闭，跳过发键: channel=${targetChannelId}`);
+          // 发键前再确认弹窗还在，避免把 digit+Enter 当成普通消息提交给 Claude
+          const pane = await tmuxCapture(windowTarget(agent.name), 30);
+          const hasPerm = detectRuntimePermissionPrompt(pane) !== null;
+          const hasIdle = detectSessionIdlePrompt(pane) !== null;
+          const dialogStillActive = (isPermBtn && hasPerm) || (isIdleBtn && hasIdle);
+
+          if (!dialogStillActive) {
+            console.log(`🔔 弹窗已关闭，跳过发键: channel=${targetChannelId} hasPerm=${hasPerm} hasIdle=${hasIdle}`);
             const msgId = permissionMessages.get(targetChannelId);
             if (msgId) {
               try {
@@ -2464,28 +2716,31 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
                 const sm = await ch.messages.fetch(msgId);
                 await sm.edit({ content: `🔕 弹窗已自动关闭，无需操作`, components: [] });
               } catch { /* non-critical */ }
+              clearPermissionMessage(targetChannelId);
             }
-            clearPermissionMessage(targetChannelId); // 内部会清 Web 卡
-            return;
-          }
-          if (!res.ok) {
-            await interaction.followUp({ content: `❌ ${res.error || "处理失败"}`, ephemeral: true }).catch(() => {});
             return;
           }
 
-          // 成功发键：编辑原消息显示已处理（保留指纹让下次 poll 自然清理，避免竞争条件）
+          const proc = Bun.spawn(
+            ["tmux", "-S", TMUX_SOCK, "send-keys", "-t", `master:${agent.name}`, ...keySeq],
+            { stdout: "pipe", stderr: "pipe" }
+          );
+          await proc.exited;
+          if (proc.exitCode !== 0) {
+            const stderr = await new Response(proc.stderr).text();
+            console.error(`🔔 tmux send-keys 失败: ${stderr}`);
+          }
+
+          // 编辑原消息显示已处理（保留指纹让下次 poll 自然清理，避免竞争条件）
           const msgId = permissionMessages.get(targetChannelId);
           if (msgId) {
             try {
               const ch = await discord.channels.fetch(targetChannelId) as TextChannel;
               const sm = await ch.messages.fetch(msgId);
-              await sm.edit({ content: `🔔 ${PERM_LABELS[action] || "已处理"}`, components: [] });
+              await sm.edit({ content: `🔔 ${labelMap[action]}`, components: [] });
             } catch { /* non-critical */ }
             permissionMessages.delete(targetChannelId);
           }
-          // Web：卡片清掉（应答完成）
-          pushToWeb(targetChannelId, { t: "permission-cleared" });
-          setPendingInteraction(targetChannelId, null);
         } catch (e) {
           console.error(`🔔 权限响应流程异常:`, e);
         }
@@ -2539,7 +2794,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       // v2.0.19+: AskUserQuestion 的 Submit / Cancel 按钮
       if (id.startsWith("auq:")) {
         try {
-          const { auqStates, submitAuqSelections, cancelAuq } =
+          const { auqStates, buildAuqKeystrokes, clearAuqState } =
             await import("./bridge/ask-user-question.js");
           const parts = id.split(":");
           const auqChannel = parts[1];
@@ -2550,24 +2805,30 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
             return;
           }
           if (action === "submit") {
-            // Discord select 菜单已把用户选择写进 state.selections；直接提交它。
-            // submitAuqSelections 内部：发键 + 清状态 + 清 Web 卡（Web 端点共用）。
-            const numQ = state.questions.length;
-            const res = await submitAuqSelections(auqChannel, state.selections);
+            const keys = buildAuqKeystrokes(state);
+            // 一次 tmux send-keys 批量发，tmux 内部按顺序处理键序列；比一键一调用快得多
+            if (keys.length > 0) {
+              await tmuxRaw(["send-keys", "-t", state.tmuxTarget, ...keys]);
+            }
+            const summary = state.selections.map((sel, i) => {
+              if (sel.length === 0) return `Q${i + 1}: (none)`;
+              const labels = sel.map((oi) => state.questions[i].options[oi]?.label || `?${oi}`).join(", ");
+              return `Q${i + 1}: ${labels}`;
+            }).join("\n");
             await interaction.editReply({
-              content: res.ok
-                ? `✅ 已提交 AskUserQuestion 选择：\n${res.summary}`
-                : `⚠️ ${res.error || "提交失败"}`,
+              content: `✅ 已提交 AskUserQuestion 选择：\n${summary}`,
               components: [],
             }).catch(() => {});
-            recordMetric("auq_submit", { channelId: auqChannel, meta: { questions: String(numQ) } });
+            recordMetric("auq_submit", { channelId: auqChannel, meta: { questions: String(state.questions.length) } });
+            clearAuqState(auqChannel);
           } else if (action === "cancel") {
-            await cancelAuq(auqChannel);
+            await tmuxRaw(["send-keys", "-t", state.tmuxTarget, "Escape"]);
             await interaction.editReply({
               content: `❌ 已取消 AskUserQuestion（发了 Esc 给 agent）`,
               components: [],
             }).catch(() => {});
             recordMetric("auq_cancel", { channelId: auqChannel });
+            clearAuqState(auqChannel);
           }
         } catch (e) {
           console.error("AUQ button 处理异常:", e);
@@ -2612,34 +2873,17 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         const origContent = interaction.message?.content || "";
         await interaction.editReply({
           content: `${origContent}\n\n✅ 已点击：**${label}**`,
-          components: buildComponents([
-            {
-              type: "buttons",
-              buttons: [
-                {
-                  id: `interrupt:${channelId}`,
-                  label: t("打断", "Interrupt"),
-                  emoji: "⚡",
-                  style: "danger",
-                },
-              ],
-            },
-          ]),
+          components: buildComponents(agentActionButtons(channelId, true)),
         }).catch(() => {});
       } catch { /* non-critical */ }
 
-      // 切换 activeStatusMessages 到这条点击的消息，旧的清成"✅ 完成"
+      // 切换 status 簿记到这条点击的消息，旧的清成"✅ 完成"
       stopTyping(channelId);
       clearSafetyTimer(channelId);
-      const oldStatusId = activeStatusMessages.get(channelId);
-      if (oldStatusId && oldStatusId !== clickedMsgId) {
-        try {
-          const ch = (await discord.channels.fetch(channelId)) as TextChannel;
-          const sm = await ch.messages.fetch(oldStatusId);
-          await sm.edit({ content: t("✅ 完成", "✅ Done"), components: [] });
-        } catch { /* non-critical */ }
+      if (statusMessageIdFor(channelId) !== clickedMsgId) {
+        await finishStatusMessage(discord, channelId, t("✅ 完成", "✅ Done"));
       }
-      if (clickedMsgId) activeStatusMessages.set(channelId, clickedMsgId);
+      if (clickedMsgId) trackStatusMessage(channelId, clickedMsgId);
       resetToolTracking(channelId);
       startTypingWithSafety(channelId);
       await deliver({
@@ -2662,6 +2906,12 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       const id = interaction.customId;
       const value = interaction.values[0];
       await interaction.deferUpdate().catch(() => {});
+
+      // v2.5.4+ 看板「🧹 存记忆 + Compact」select（value = 目标 agent 的 channelId）
+      if (id === "stats_savecompact") {
+        await triggerSaveCompact(interaction, value);
+        return;
+      }
 
       // v2.0.19+: AskUserQuestion 的 select menu —— 用户选完更新 state，等 Submit 按钮
       // 一并把 selections 翻译成 keystroke 发到 TUI。
@@ -2772,7 +3022,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
       // v1.9.0+: master 注册 CONTROL_CHANNEL_ID 时，顺便也把 #agent-exchange 指向同一个 ws
       // 这样 peer 在 #agent-exchange 里说的话也由 master 处理（不额外建 session）
-      if (msg.channelId === (process.env.CONTROL_CHANNEL_ID || "")) {
+      if (msg.channelId === CONTROL_CHANNEL_ID && CONTROL_CHANNEL_ID) {
         try {
           const { readPeers } = await import("./lib/peers.js");
           const peers = await readPeers();
@@ -2784,28 +3034,15 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         } catch { /* non-critical */ }
       }
 
-      // 启动 JSONL watcher（tool use / 助手文本流 tee 到 Discord + Web）。
-      // fresh session 时 registry 可能还没写（manager 在 ready 之后才落盘，见
-      // cmdCreate 步骤 6），而 channel-server 在 claude 启动时就 register 了 → 首次
-      // 查不到 sessionId。故后台重试几次直到 registry 落盘，避免新会话没 watcher
-      // （无 watcher = 工具/文本流既不到 Discord 也不到 Web）。
-      {
-        const regChannelId = msg.channelId;
-        (async () => {
-          for (let i = 0; i < 10; i++) {
-            try {
-              const regResult = await runManager("list");
-              const agent = (regResult.agents || []).find((a: any) => a.channelId === regChannelId);
-              if (agent?.sessionId && agent?.project) {
-                const cwd = agent.project.replace(/^~/, process.env.HOME || "~");
-                startWatching(agent.name, cwd, agent.sessionId, regChannelId, discord);
-                return;
-              }
-            } catch { /* retry */ }
-            await Bun.sleep(1000);
-          }
-        })();
-      }
+      // 启动 JSONL watcher（仅用于 tool use 流式展示，空闲检测由 hooks 处理）
+      try {
+        const regResult = await runManager("list");
+        const agent = (regResult.agents || []).find((a: any) => a.channelId === msg.channelId);
+        if (agent?.sessionId && agent?.project) {
+          const cwd = agent.project.replace(/^~/, process.env.HOME || "~");
+          startWatching(agent.name, cwd, agent.sessionId, msg.channelId, discord);
+        }
+      } catch { /* non-critical */ }
 
       break;
     }
@@ -2876,19 +3113,8 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
             skipAutoMention: isDirectReply,
           },
         };
-        // Web tee：把回复文本推给该 agent 频道的 Web 订阅者（与 Discord 并行；
-        // reply() 是 jsonl-watcher 的隐藏工具，不走 watcher，必须在此单独 tee）。
-        if (fromChannelId && text.trim()) {
-          pushToWeb(fromChannelId, { t: "text", text: text.trim() });
-        }
         const delivery = await deliver(env);
         if (delivery.outcome.kind !== "sent") {
-          // Web-only 模式：deliverToUser/Peer 恒 dropped（无 Discord 出口），但回复
-          // 已经过 Web tee 送达 —— 给 agent 回成功 ack，别让它以为 reply 失败。
-          if (!DISCORD_ENABLED && delivery.outcome.kind === "dropped") {
-            ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { messageIds: [] } }));
-            break;
-          }
           const errMsg = delivery.outcome.kind === "dropped"
             ? `reply dropped: ${delivery.outcome.reason}`
             : (delivery.outcome as any).error?.message || "unknown";
@@ -2897,6 +3123,12 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         }
         const ids = delivery.outcome.discordMessageIds || [];
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { messageIds: ids } }));
+
+        // v2.6.0+ 事件埋点：agent 的正式回复镜像（out）
+        {
+          const evAgent = agentLabelForChannel(fromChannelId);
+          emitEvent({ agent: evAgent, chatId: msg.chatId, type: "chat_message", data: { direction: "out", from: evAgent, text, threadId: env.meta.threadId } });
+        }
 
         // v1.9.21+ send_to_agent 推回机制：
         // 如果 reply 的 chat_id 正好是某个 pending send_to_agent 的 target agent 的
@@ -2967,7 +3199,14 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "fetch_messages": {
       try {
-        const result = await discordFetchMessages(discord, msg.channel, msg.limit);
+        // v2.6.0+ C2-2：这仨工具是 Discord 语义。api:/telegram: 会话没有"消息
+        // 历史/表情/编辑"的等价物 —— 明确报错，别让 agent 拿到静默失败瞎猜。
+        const dest = parseChatId(String(msg.channel || ""));
+        if (dest.transport !== "discord") {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: `fetch_messages 仅支持 Discord 会话（收到 ${dest.transport}: 前缀地址）。API 会话请直接 reply，对方消息会作为新的 user 消息进来。` }));
+          break;
+        }
+        const result = await discordFetchMessages(discord, dest.id, msg.limit);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -2977,7 +3216,12 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "react": {
       try {
-        await discordReact(discord, msg.chatId, msg.messageId, msg.emoji);
+        const dest = parseChatId(String(msg.chatId || ""));
+        if (dest.transport !== "discord") {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: `react 仅支持 Discord 会话（收到 ${dest.transport}: 前缀地址），非 Discord 会话无表情语义，直接 reply 即可。` }));
+          break;
+        }
+        await discordReact(discord, dest.id, msg.messageId, msg.emoji);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -2987,7 +3231,12 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "edit_message": {
       try {
-        await discordEditMessage(discord, msg.chatId, msg.messageId, msg.text);
+        const dest = parseChatId(String(msg.chatId || ""));
+        if (dest.transport !== "discord") {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: `edit_message 仅支持 Discord 会话（收到 ${dest.transport}: 前缀地址），API 会话的消息发出后不可编辑，需更正就再 reply 一条。` }));
+          break;
+        }
+        await discordEditMessage(discord, dest.id, msg.messageId, msg.text);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -2997,11 +3246,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "create_channel": {
       try {
-        // Web-only（无 Discord）：合成本地 channelId。会话照常 register / 路由 / Web 按此 id 订阅。
-        // Discord 开时不变：建真频道，Web 亦可订阅同一 channelId（两端镜像同一 session）。
-        const channelId = DISCORD_ENABLED
-          ? await discordCreateChannel(discord, msg.name, msg.category)
-          : `local-${crypto.randomUUID()}`;
+        // v2.6.0+ C2-5：会话地址供给走 adapter（ws 消息类型保留老名字做协议兼容）。
+        // 将来纯 API agent = 换一个 provisioner，manager create 流程零改动。
+        const adapter = adapterFor("discord");
+        if (!adapter?.provisionConversation) throw new Error("discord adapter 不支持 provisionConversation");
+        const { chatId: channelId } = await adapter.provisionConversation(msg.name, { category: msg.category });
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { channelId } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3011,10 +3260,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "delete_channel": {
       try {
-        // 合成本地 channel 或 Web-only 模式：无 Discord 频道可删，直接 ok。
-        if (DISCORD_ENABLED && !isLocalChannelId(msg.channelId)) {
-          await discordDeleteChannel(discord, msg.channelId);
-        }
+        await discordDeleteChannel(discord, msg.channelId);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3024,11 +3270,9 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "rename_channel": {
       try {
-        if (DISCORD_ENABLED && !isLocalChannelId(msg.channelId)) {
-          const ch = await discord.channels.fetch(msg.channelId);
-          if (!ch || !("setName" in ch)) throw new Error("channel 不存在或不可重命名");
-          await (ch as TextChannel).setName(msg.name);
-        }
+        const ch = await discord.channels.fetch(msg.channelId);
+        if (!ch || !("setName" in ch)) throw new Error("channel 不存在或不可重命名");
+        await (ch as TextChannel).setName(msg.name);
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3039,6 +3283,8 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
     case "announce_focus": {
       // v2.4.19+ manager create/resume 后调：在 agent 频道发一条置顶公告，带
       // 「🖥 跳到 iTerm tab」按钮（focus:<channelId>，LLM-free 直接执行）。
+      // v2.4.20+ 主推 /focus slash 命令 —— pin 弹窗里的按钮 Discord 点不动，得
+      // 先跳到消息才行。公告文案改成引导用 /focus，按钮留作从消息本体点的备选。
       // 返回 messageId 给 manager 存 registry，避免 restart 重复发。
       try {
         const annChannelId = msg.channelId as string;
@@ -3046,7 +3292,7 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         const ids = await discordReply(
           discord,
           annChannelId,
-          `📌 **${annAgentName}** 控制台\n-# 点按钮把 Mac 上的 iTerm 切到这个 agent 的 tab`,
+          `📌 **${annAgentName}** 控制台\n-# 在本频道输入 \`/focus\` 即可把 Mac 的 iTerm 切到这个 agent 的 tab（下面的按钮从 pin 弹窗里点不动，用 /focus 更省事）`,
           undefined,
           [{
             type: "buttons",
@@ -3471,7 +3717,18 @@ async function resolvePeerDirectCandidate(
  *      作为 userId。deliverToUser 不自动 @ user（push 通知在 Stop hook 完成通知
  *      里另管）。
  */
-async function resolveReplyTarget(chatId: string): Promise<RouterUserEndpoint | RouterPeerEndpoint> {
+async function resolveReplyTarget(chatId: string): Promise<RouterUserEndpoint | RouterPeerEndpoint | RouterApiUserEndpoint> {
+  // v2.6.0+ 虚拟 chat_id `api:<tokenId>`（统一 keyspace D7）→ API 用户
+  const parsed = parseChatId(chatId);
+  if (parsed.transport === "api") {
+    let name = parsed.id;
+    try {
+      const file = await readPrincipals();
+      const p = file.principals.find((x) => x.id === `token:${parsed.id}`);
+      if (p?.name) name = p.name;
+    } catch { /* 名字仅展示用，查不到就用 tokenId */ }
+    return { kind: "api", tokenId: parsed.id, name };
+  }
   try {
     const { readPeers } = await import("./lib/peers.js");
     const peers = await readPeers();
@@ -3496,7 +3753,7 @@ async function resolveReplyTarget(chatId: string): Promise<RouterUserEndpoint | 
     }
   } catch { /* non-critical */ }
   // 3. user channel
-  const userId = ALLOWED_USER_IDS.length > 0 ? ALLOWED_USER_IDS[0] : "";
+  const userId = primaryOwnerId();
   return { kind: "user", userId, channelId: chatId };
 }
 
@@ -3808,7 +4065,7 @@ async function tryRouteForeignAgentExchange(msg: DiscordMessage, channelId: stri
           .trim();
         if (cleanText) {
           try {
-            const userMention = ALLOWED_USER_IDS.length > 0 ? `<@${ALLOWED_USER_IDS[0]}>` : "";
+            const userMention = primaryOwnerId() ? `<@${primaryOwnerId()}>` : "";
             const relayText = [
               `📬 **来自 peer ${peerBotForChannel.name}**（他在自己 guild 的 #agent-exchange 里 @ 了你）${userMention}`,
               ``,
@@ -3820,7 +4077,7 @@ async function tryRouteForeignAgentExchange(msg: DiscordMessage, channelId: stri
               from: { kind: "bridge", label: "peer-relay" },
               to: {
                 kind: "user",
-                userId: ALLOWED_USER_IDS[0] || "",
+                userId: primaryOwnerId(),
                 channelId: peers.localAgentExchangeId,
               },
               intent: "notification",
@@ -3983,6 +4240,24 @@ setInterval(() => {
       console.log(`🧹 pendingPeerInbound stale: 清掉 agent=${pending.localAgentName} (peer=${pending.peerBotName})`);
     }
   }
+  // v2.6.0+ API 会话状态 TTL（10min）：pending 请求、轮询结果、附件登记
+  for (const [key, queue] of pendingApiRequests.entries()) {
+    const fresh = queue.filter((p) => now - p.ts <= API_REQUEST_TTL_MS);
+    if (fresh.length === 0) pendingApiRequests.delete(key);
+    else if (fresh.length !== queue.length) pendingApiRequests.set(key, fresh);
+  }
+  for (const [tid, hit] of apiThreadResults.entries()) {
+    if (now - hit.ts > API_REQUEST_TTL_MS) apiThreadResults.delete(tid);
+  }
+  if (apiFiles.size > 200) {
+    // 附件登记只按容量截断（文件本身在 TMP_DIR，系统自己清）
+    const excess = apiFiles.size - 200;
+    let i = 0;
+    for (const k of apiFiles.keys()) {
+      if (i++ >= excess) break;
+      apiFiles.delete(k);
+    }
+  }
   for (const [channelId, pending] of pendingInterAgentMsg.entries()) {
     if (now - pending.ts > STALE_MS) {
       pendingInterAgentMsg.delete(channelId);
@@ -4025,6 +4300,13 @@ async function handleHookRequest(req: Request): Promise<Response> {
     // 兼容旧版 hook 发的 "stop"
     if (event === "Stop" || event === "StopFailure" || event === "Notification" || event === "stop") {
       console.log(`🏁 Hook 收到 ${event}: channel=${channelId}`);
+      // v2.4.25+ 对话完成 → 刷用量看板（防抖合并，内部惰性缓存 /status）
+      if (event === "Stop" || event === "StopFailure" || event === "stop") {
+        updateStatsDashboard(discord);
+        // v2.6.0+ 事件埋点：turn 结束（在去抖/通知判断之前 —— 事件流忠实反映 hook）
+        const evAgent = agentLabelForChannel(channelId);
+        emitEvent({ agent: evAgent, chatId: channelId, type: "agent_status", data: { status: "done" } });
+      }
       // typing + safety timer：本 channel + 共享 ws 的所有 channel 都停（参见
       // sameWsChannels 的注释）。
       stopTyping(channelId);
@@ -4124,9 +4406,6 @@ async function handleHookRequest(req: Request): Promise<Response> {
             const drainResult = await drainChannelWatcher(cid, discord);
             const drainedText = drainResult.text;
 
-            // Web tee：drain 把残留 tool/text 刷完后，通知 Web 本轮结束。
-            pushToWeb(cid, { t: "done" });
-
             // v2.0.13+ 兜底 1: 本地 send_to_agent caller 在等 push。如果 target 这轮
             // 走了 watcher drain（assistant 文字直接 post 到自己 channel）而**不是**
             // reply()，老 pushback 路径根本不触发 → caller 永远等不到。这里在 Stop
@@ -4224,6 +4503,31 @@ async function handleHookRequest(req: Request): Promise<Response> {
               }
             }
 
+            // v2.6.0+ R3: API waiter 兜底 —— agent end_turn 没 reply() 时，用
+            // drain 出的 assistant 文本 resolve 挂着的 API 请求，wait 调用方不必
+            // 干等到超时。连文本都没有 → resolve reply:null（"结束但没回复"）。
+            for (const [pKey, pQueue] of pendingApiRequests.entries()) {
+              if (!pQueue.length || pQueue[0].agentChannelId !== cid) continue;
+              pendingApiRequests.delete(pKey);
+              for (const p of pQueue) {
+                const result: ApiReplyResult = {
+                  reply: drainedText || null,
+                  threadId: p.threadId,
+                  agent: p.agentName,
+                  viaFallback: true,
+                };
+                apiThreadResults.set(p.threadId, { result, ts: Date.now() });
+                p.resolve?.(result);
+                emitEvent({
+                  agent: p.agentName,
+                  chatId: `api:${p.tokenId}`,
+                  type: "chat_message",
+                  data: { direction: "out", from: p.agentName, text: drainedText || "", threadId: p.threadId, api: true, viaFallback: true },
+                });
+                console.log(`🌐 API waiter drain 兜底: ${p.agentName} → token ${p.tokenId}（${drainedText ? drainedText.length + " chars" : "no-text"}）`);
+              }
+            }
+
             // v2.0.16+ inter-agent 看门狗: 这一轮结束时如果 cid 还挂着 inter-agent
             // 消息 pending（agent 既没 reply 也没 send_to_agent —— 大概率收到消息后
             // 啥也没干或没报告），注一条 nudge 到它的 ws 提醒处理 + reply() 报告。
@@ -4296,18 +4600,11 @@ async function handleHookRequest(req: Request): Promise<Response> {
         }
       }
 
-      // 把所有相关 channel 的"💭 思考中..."状态消息改成"✅ 完成"并去掉 interrupt 按钮
+      // 把所有相关 channel 的"💭 思考中..."状态消息改成"✅ 完成"。
+      // v2.4.22+ 去掉 interrupt（活干完了），但**保留 focus + screenshot 按钮** ——
+      // 这条消息永远在频道底部附近，用户随手能点跳 tab / 截图，不用翻 pin 或打命令。
       for (const cid of channelsToClear) {
-        const statusMsgId = activeStatusMessages.get(cid);
-        if (!statusMsgId) continue;
-        try {
-          const ch = await discord.channels.fetch(cid);
-          if (ch && "messages" in ch) {
-            const sm = await (ch as TextChannel).messages.fetch(statusMsgId);
-            await sm.edit({ content: t("✅ 完成", "✅ Done"), components: [] });
-          }
-        } catch { /* non-critical */ }
-        activeStatusMessages.delete(cid);
+        await finishStatusMessage(discord, cid, t("✅ 完成", "✅ Done"), agentActionButtons(cid, false));
       }
 
       // 发完成通知 @ user（仅 Stop/StopFailure）。watcher 已经把 agent 的消息推
@@ -4318,7 +4615,7 @@ async function handleHookRequest(req: Request): Promise<Response> {
           const ch = await discord.channels.fetch(channelId);
           if (ch && "messages" in ch) {
             const textCh = ch as TextChannel;
-            const mention = ALLOWED_USER_IDS.length > 0 ? `<@${ALLOWED_USER_IDS[0]}>` : "";
+            const mention = primaryOwnerId() ? `<@${primaryOwnerId()}>` : "";
             if (mention) {
               await textCh.send(`${randomUmaDone()} ${mention}`);
               lastCompletionSent.set(channelId, now);
@@ -4338,12 +4635,408 @@ async function handleHookRequest(req: Request): Promise<Response> {
   }
 }
 
+/**
+ * v2.6.0+ GET /events —— 结构化事件流（SSE）。设计 §4.3。
+ * ?agent=<name> 过滤单 agent；?since=<seq> 或 Last-Event-ID 断线补发。
+ * 30s 心跳注释防代理超时。本机部署默认免鉴权（服务只绑 127.0.0.1，见下）。
+ */
+function handleEventsRequest(req: Request, extraFilter?: EventFilter): Response {
+  const url = new URL(req.url);
+  const agent = url.searchParams.get("agent") || undefined;
+  const sinceParam = url.searchParams.get("since") ?? req.headers.get("Last-Event-ID");
+  const since = sinceParam !== null ? Number(sinceParam) : NaN;
+  const filter: EventFilter = { ...(extraFilter || {}), ...(agent ? { agent } : {}) };
+  let unsub: (() => void) | null = null;
+  let ping: ReturnType<typeof setInterval> | null = null;
+  const cleanup = () => {
+    unsub?.();
+    unsub = null;
+    if (ping) { clearInterval(ping); ping = null; }
+  };
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      const send = (evt: { seq: number }) => {
+        try {
+          controller.enqueue(enc.encode(`id: ${evt.seq}\ndata: ${JSON.stringify(evt)}\n\n`));
+        } catch {
+          cleanup(); // controller 已关（客户端断开），停止推送
+        }
+      };
+      if (Number.isFinite(since)) {
+        for (const evt of replayEventsSince(since, filter)) send(evt);
+      }
+      unsub = subscribeEvents(filter, send);
+      ping = setInterval(() => {
+        try { controller.enqueue(enc.encode(`: ping\n\n`)); } catch { cleanup(); }
+      }, 30_000);
+    },
+    cancel() { cleanup(); },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
+
+// ============================================================
+// v2.6.0+ /api/v1/* —— token 鉴权的入站 HTTP API（设计 §5）
+// ============================================================
+
+function apiJson(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** Bearer 鉴权 + 限流。失败直接返回 Response，成功返回 principal。 */
+async function authApi(req: Request): Promise<Principal | Response> {
+  const auth = req.headers.get("Authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return apiJson(401, { ok: false, error: "missing Authorization: Bearer <secret>" });
+  const file = await readPrincipals();
+  const p = findByBearer(file, m[1].trim());
+  if (!p) return apiJson(401, { ok: false, error: "invalid or revoked token" });
+  const tid = tokenIdOf(p);
+  let limiter = apiLimiters.get(tid);
+  if (!limiter) {
+    limiter = new SlidingWindowLimiter();
+    apiLimiters.set(tid, limiter);
+  }
+  if (!limiter.tryAcquire()) return apiJson(429, { ok: false, error: "rate limit exceeded (30 req/min)" });
+  return p;
+}
+
+/** registry 名双向兼容（"worker" ↔ "agent-worker"），返回 manager list 里的条目 */
+async function findApiAgent(name: string): Promise<{ name: string; channelId: string; idle?: boolean; status?: string; purpose?: string; cwd?: string; sessionId?: string } | null> {
+  try {
+    const listResult = await runManager("list");
+    const agents = (listResult.agents || []) as any[];
+    return agents.find((a) => a.name === name || a.name === `agent-${name}` || `agent-${a.name}` === name) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function handleApiRequest(req: Request, url: URL): Promise<Response> {
+  const auth = await authApi(req);
+  if (auth instanceof Response) return auth;
+  const principal = auth;
+  const tokenId = tokenIdOf(principal);
+  const path = url.pathname.slice("/api/v1".length);
+
+  // GET /api/v1/agents —— scope 内的 agent 快照
+  if (path === "/agents" && req.method === "GET") {
+    try {
+      const listResult = await runManager("list");
+      const agents = ((listResult.agents || []) as any[])
+        .filter((a) => agentInScope(principal, a.name))
+        .map((a) => ({ name: a.name, status: a.status, idle: a.idle, purpose: a.purpose }));
+      return apiJson(200, { ok: true, agents });
+    } catch (e) {
+      return apiJson(500, { ok: false, error: (e as Error).message });
+    }
+  }
+
+  // v2.7+ GET /api/v1/sessions —— 全机器 Claude 会话清单（agents 模式适配，
+  // 中性 NeutralSessionInfo；Discord 面板与 web 前端共用同一数据源）。
+  // scope 规则：全权 token（"*"）看全部（含野生会话）；受限 token 只看 scope
+  // 内 agent 的正式会话及其分身。
+  if (path === "/sessions" && req.method === "GET") {
+    const list = await collectSessions();
+    if (list === null) return apiJson(503, { ok: false, error: "claude agents --json unavailable" });
+    const full = principal.agents.includes("*");
+    const visible = full
+      ? list
+      : list.filter((s) => {
+          const owner = s.registeredAgent ?? s.doppelgangerOf;
+          return owner ? agentInScope(principal, owner) : false;
+        });
+    return apiJson(200, { ok: true, sessions: visible });
+  }
+
+  // v2.7+ POST /api/v1/sessions/:bgId/cleanup —— 清理 bg job（死分身/残留）。
+  // 耗时操作（kill → 等 daemon 静默 → 隔离目录，最长 ~90s）→ 202 后台执行，
+  // 结果以 session_anomaly kind=cleanup_result 进事件流。仅全权 token。
+  const cleanupMatch = path.match(/^\/sessions\/([^/]+)\/cleanup$/);
+  if (cleanupMatch && req.method === "POST") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: "cleanup requires a full-scope token" });
+    }
+    const bgId = decodeURIComponent(cleanupMatch[1]);
+    const list = await collectSessions();
+    const target = list?.find((s) => s.bgId === bgId && s.kind === "background");
+    if (!target) return apiJson(404, { ok: false, error: `bg session "${bgId}" not found` });
+    cleanupBgJob(bgId, { pid: target.pid })
+      .then((r) => {
+        emitEvent({
+          agent: target.doppelgangerOf ?? target.name ?? bgId,
+          chatId: "",
+          type: "session_anomaly",
+          data: { kind: "cleanup_result", bgId, ...r },
+        });
+      })
+      .catch(() => {});
+    return apiJson(202, {
+      ok: true,
+      accepted: true,
+      hint: "cleanup runs in background; watch /api/v1/events for session_anomaly kind=cleanup_result",
+    });
+  }
+
+  // v2.7+ POST /api/v1/sessions/:sessionId/adopt —— 收编：把该 session 立为
+  // 某正式 agent 的会话并重启拉起（body: {"agent": "<name>"}）。仅全权 token。
+  const adoptMatch = path.match(/^\/sessions\/([^/]+)\/adopt$/);
+  if (adoptMatch && req.method === "POST") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: "adopt requires a full-scope token" });
+    }
+    const sid = decodeURIComponent(adoptMatch[1]);
+    let agentName = "";
+    try {
+      agentName = String(((await req.json()) as any)?.agent || "");
+    } catch {
+      /* fallthrough → 400 */
+    }
+    if (!agentName) return apiJson(400, { ok: false, error: 'body must be {"agent": "<name>"}' });
+    runManager("adopt", agentName, sid)
+      .then((r) => {
+        emitEvent({
+          agent: agentName,
+          chatId: "",
+          type: "session_anomaly",
+          data: { kind: "adopt_result", sessionId: sid, ok: !!r?.ok, ...r },
+        });
+      })
+      .catch(() => {});
+    return apiJson(202, {
+      ok: true,
+      accepted: true,
+      hint: "adoption runs in background (~1-2 min); watch /api/v1/events for session_anomaly kind=adopt_result",
+    });
+  }
+
+  // GET /api/v1/events —— token 版 SSE（按 scope 过滤事件）
+  if (path === "/events" && req.method === "GET") {
+    let scopeAgents: string[] | undefined;
+    if (!principal.agents.includes("*")) {
+      // 双向兼容前缀：scope 里存裸名时补 agent- 前缀的变体
+      scopeAgents = principal.agents.flatMap((a) => [a, `agent-${a}`]);
+    }
+    return handleEventsRequest(req, scopeAgents ? { agents: scopeAgents } : undefined);
+  }
+
+  // GET /api/v1/threads/:threadId —— wait 超时后的轮询兜底
+  const threadMatch = path.match(/^\/threads\/([^/]+)$/);
+  if (threadMatch && req.method === "GET") {
+    const hit = apiThreadResults.get(threadMatch[1]);
+    if (!hit) return apiJson(404, { ok: false, error: "thread not found (not answered yet, or expired)" });
+    return apiJson(200, { ok: true, ...hit.result });
+  }
+
+  // GET /api/v1/files/:id —— 出站附件下载（校验属主 token）
+  const fileMatch = path.match(/^\/files\/([^/]+)$/);
+  if (fileMatch && req.method === "GET") {
+    const entry = apiFiles.get(fileMatch[1]);
+    if (!entry || entry.tokenId !== tokenId) return apiJson(404, { ok: false, error: "file not found" });
+    const f = Bun.file(entry.path);
+    if (!(await f.exists())) return apiJson(410, { ok: false, error: "file no longer on disk" });
+    return new Response(f, {
+      headers: { "Content-Disposition": `attachment; filename="${encodeURIComponent(entry.name)}"` },
+    });
+  }
+
+  // v2.9+ GET /api/v1/agents/:name/history —— session 清单（live + 归档快照）。
+  // agent 已被 kill 时归档仍可读（这正是归档存在的意义），所以 registry 查不到
+  // 不算 404，降级为只列归档。响应不含服务器路径（path 字段剥掉）。
+  const histListMatch = path.match(/^\/agents\/([^/]+)\/history$/);
+  if (histListMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(histListMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    const canonical = agent?.name ?? (agentParam.startsWith("agent-") ? agentParam : `agent-${agentParam}`);
+    const sessions = await listAgentSessions(canonical, {
+      cwd: agent?.cwd,
+      currentSessionId: agent?.sessionId,
+    });
+    if (!agent && !sessions.length) {
+      return apiJson(404, { ok: false, error: `agent "${agentParam}" not found (no registry entry, no archives)` });
+    }
+    return apiJson(200, {
+      ok: true,
+      agent: canonical,
+      sessions: sessions.map(({ path: _p, ...rest }) => rest),
+    });
+  }
+
+  // v2.9+ GET /api/v1/agents/:name/history/:sessionId —— 消息分页
+  //   ?limit=100（1..500）&before=<seq 往前翻页>&subagent=agent-xxx（读 subagent 会话）
+  const histSessMatch = path.match(/^\/agents\/([^/]+)\/history\/([^/]+)$/);
+  if (histSessMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(histSessMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const sid = decodeURIComponent(histSessMatch[2]);
+    if (!isValidSessionId(sid)) return apiJson(400, { ok: false, error: "invalid sessionId" });
+    const agent = await findApiAgent(agentParam);
+    const canonical = agent?.name ?? (agentParam.startsWith("agent-") ? agentParam : `agent-${agentParam}`);
+    const sessions = await listAgentSessions(canonical, {
+      cwd: agent?.cwd,
+      currentSessionId: agent?.sessionId,
+    });
+    const found = sessions.find((s) => s.sessionId === sid);
+    if (!found) return apiJson(404, { ok: false, error: `session "${sid}" not found for agent "${canonical}"` });
+
+    let file = found.path;
+    const subagent = url.searchParams.get("subagent");
+    if (subagent) {
+      if (!isValidSubagentId(subagent)) return apiJson(400, { ok: false, error: "invalid subagent id" });
+      file = `${found.path.replace(/\.jsonl$/, "")}/subagents/${subagent}.jsonl`;
+      if (!existsSync(file)) return apiJson(404, { ok: false, error: `subagent "${subagent}" not found in session` });
+    }
+    const limitRaw = Number(url.searchParams.get("limit") || 100);
+    const beforeRaw = url.searchParams.get("before");
+    const before = beforeRaw != null ? Number(beforeRaw) : undefined;
+    try {
+      const page = await readSessionHistory(file, {
+        limit: Number.isFinite(limitRaw) ? limitRaw : 100,
+        before: before != null && Number.isFinite(before) ? before : undefined,
+        formatToolFn: formatTool,
+      });
+      return apiJson(200, {
+        ok: true,
+        agent: canonical,
+        sessionId: sid,
+        source: found.source,
+        ...(subagent ? { subagent } : {}),
+        ...page,
+      });
+    } catch (e) {
+      return apiJson(500, { ok: false, error: (e as Error).message });
+    }
+  }
+
+  // POST /api/v1/agents/:name/messages —— 给 agent 发消息（同步 wait / 202+轮询）
+  const msgMatch = path.match(/^\/agents\/([^/]+)\/messages$/);
+  if (msgMatch && req.method === "POST") {
+    const agentParam = decodeURIComponent(msgMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const client = clients.get(agent.channelId);
+    if (!client) return apiJson(409, { ok: false, error: `agent "${agent.name}" is offline (no active session)` });
+
+    // body：JSON {text, wait} 或 multipart（text 字段 + files，R5 入站附件）
+    let text = "";
+    let waitSec = 0;
+    const attachments: string[] = [];
+    const contentType = req.headers.get("Content-Type") || "";
+    try {
+      if (contentType.includes("multipart/form-data")) {
+        const form = await req.formData();
+        text = String(form.get("text") || "");
+        waitSec = Number(form.get("wait") || 0);
+        const inboxDir = `${TMP_DIR}/inbox`;
+        await Bun.spawn(["mkdir", "-p", inboxDir]).exited;
+        const files = form.getAll("files").filter((f): f is File => f instanceof File).slice(0, 5);
+        for (const f of files) {
+          if (f.size > 10 * 1024 * 1024) return apiJson(413, { ok: false, error: `file "${f.name}" exceeds 10MB` });
+          const dest = `${inboxDir}/api_${Date.now()}_${f.name.replace(/[^\w.\-]/g, "_")}`;
+          await Bun.write(dest, f);
+          attachments.push(dest);
+        }
+      } else {
+        const body = (await req.json()) as { text?: string; wait?: number };
+        text = String(body.text || "");
+        waitSec = Number(body.wait || 0);
+      }
+    } catch {
+      return apiJson(400, { ok: false, error: "invalid body (JSON {text, wait?} or multipart with text/files)" });
+    }
+    if (!text.trim() && attachments.length === 0) {
+      return apiJson(400, { ok: false, error: "text is required" });
+    }
+    waitSec = Math.min(Math.max(waitSec, 0), 300);
+
+    const tokenName = principal.name || tokenId;
+    const threadId = newThreadId();
+    const env: RouterEnvelope = {
+      from: { kind: "api", tokenId, name: tokenName },
+      to: { kind: "local", agentName: agent.name, channelId: agent.channelId, ws: client.ws, cwd: client.cwd },
+      intent: "request",
+      content: text,
+      meta: {
+        messageId: `api_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        triggerKind: "system",
+        ts: new Date().toISOString(),
+        threadId,
+        attachments: attachments.length ? attachments : undefined,
+        // API 请求不需要 inter-agent watchdog（有自己的 wait/轮询语义）
+        skipInterAgentWatchdog: true,
+      },
+    };
+
+    // 挂 pending（无论是否 wait —— deliverToApi 靠它关联 threadId / R3 兜底靠它找 waiter）
+    const key = apiReqKey(tokenId, agent.channelId);
+    const entry: PendingApiRequest = {
+      tokenId,
+      tokenName,
+      agentChannelId: agent.channelId,
+      agentName: agent.name,
+      threadId,
+      ts: Date.now(),
+    };
+    const queue = pendingApiRequests.get(key) || [];
+    queue.push(entry);
+    pendingApiRequests.set(key, queue);
+
+    const delivery = await deliver(env);
+    if (delivery.outcome.kind !== "sent") {
+      const idx = queue.indexOf(entry);
+      if (idx >= 0) queue.splice(idx, 1);
+      const reason = delivery.outcome.kind === "dropped" ? delivery.outcome.reason : (delivery.outcome as any).error?.message;
+      return apiJson(502, { ok: false, error: `delivery failed: ${reason || "unknown"}` });
+    }
+
+    // R2 入站镜像
+    mirrorApiExchange({ kind: "api", tokenId, name: tokenName }, agent.channelId, `[🌐 API←${tokenName}] ${text}`).catch(() => {});
+    startTypingWithSafety(agent.channelId);
+    // API 触发的 turn 不发 Stop 完成通知 @ owner（回复走 API 回路 + R2 镜像已可见）
+    lastMessageSource.set(agent.channelId, "agent");
+
+    if (waitSec === 0) {
+      return apiJson(202, { ok: true, accepted: true, threadId, agent: agent.name, hint: `poll GET /api/v1/threads/${threadId} or subscribe /api/v1/events` });
+    }
+
+    const result = await new Promise<ApiReplyResult | null>((resolve) => {
+      entry.resolve = resolve;
+      setTimeout(() => resolve(null), waitSec * 1000);
+    });
+    if (!result) {
+      entry.resolve = undefined; // 超时后 deliverToApi/R3 仍会把结果写进 apiThreadResults
+      return apiJson(202, { ok: true, accepted: true, timedOut: true, threadId, agent: agent.name, hint: `poll GET /api/v1/threads/${threadId}` });
+    }
+    return apiJson(200, { ok: true, ...result });
+  }
+
+  return apiJson(404, { ok: false, error: "unknown endpoint" });
+}
+
 const server = Bun.serve({
   port: BRIDGE_PORT,
-  // Bun.serve 的 HTTP idleTimeout 默认 10s：SSE 响应超过 10s 没数据就被 Bun 关连接，
-  // 导致 /web/stream 上「思考 >10s 才回复」的消息丢失（reply/tool/done 都收不到）。
-  // 抬到 255（Bun 上限）+ /web/stream 每 15s 心跳，长思考也不断流。
-  idleTimeout: 255,
+  // v2.6.0+ 默认只绑回环 —— /hook /stats /skills/rescan 一直无鉴权，之前默认
+  // 0.0.0.0 等于把它们暴露在内网。跨机器场景（自定义 BRIDGE_URL 指向远程）用
+  // BRIDGE_BIND=0.0.0.0 显式放开，网络边界（反代/TLS/防火墙）由用户自己负责。
+  hostname: process.env.BRIDGE_BIND || "127.0.0.1",
   async fetch(req, server) {
     if (server.upgrade(req)) return undefined;
 
@@ -4351,6 +5044,21 @@ const server = Bun.serve({
     const url = new URL(req.url);
     if (url.pathname === "/hook" && req.method === "POST") {
       return handleHookRequest(req);
+    }
+
+    // v2.4.25+ 用量看板开放 JSON 接口（给 Web 端）
+    if (url.pathname === "/stats" && req.method === "GET") {
+      return handleStatsRequest();
+    }
+
+    // v2.6.0+ 结构化事件流（SSE，本机免鉴权版；token 版挂 /api/v1/events）
+    if (url.pathname === "/events" && req.method === "GET") {
+      return handleEventsRequest(req);
+    }
+
+    // v2.6.0+ token 鉴权的入站 API（多前端架构 Phase B）
+    if (url.pathname.startsWith("/api/v1/")) {
+      return handleApiRequest(req, url);
     }
 
     // Skills 重新扫描（manager 在 create/resume/kill 后调）
@@ -4495,298 +5203,6 @@ const server = Bun.serve({
       }
     }
 
-    // ── Web 前端网关（与 Discord 并行的接入面）─────────────────────────
-    // Next.js BFF（已鉴权后）server-to-server 调用；浏览器永不直连 3847。
-
-    // 注入一条用户消息给指定会话（channelId 由 BFF 从 registry 解析 agent 得到）。
-    if (url.pathname === "/web/inject" && req.method === "POST") {
-      try {
-        const body = (await req.json().catch(() => ({}))) as { channelId?: string; text?: string };
-        const channelId = body.channelId;
-        const text = (body.text || "").trim();
-        if (!channelId || !text) {
-          return new Response(JSON.stringify({ ok: false, error: "missing channelId/text" }), {
-            status: 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        const client = clients.get(channelId);
-        if (!client) {
-          return new Response(JSON.stringify({ ok: false, error: "session not connected" }), {
-            status: 404, headers: { "Content-Type": "application/json" },
-          });
-        }
-        // 直接走 deliver(user→local)：不经 messageCreate，故不发 Discord 的「💭思考中」UI。
-        await deliver({
-          from: { kind: "user", userId: "web", channelId, username: "web" },
-          to: { kind: "local", channelId: client.channelId, ws: client.ws, cwd: client.cwd },
-          intent: "request",
-          content: text,
-          meta: {
-            messageId: `web_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            triggerKind: "user_discord",
-            ts: new Date().toISOString(),
-            threadId: newThreadId(),
-          },
-        });
-        return new Response(JSON.stringify({ ok: true }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
-          status: 500, headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    // 某会话的持久输出流（SSE）。订阅 web-hub 的 channelId 通道。
-    if (url.pathname === "/web/stream" && req.method === "GET") {
-      const channelId = url.searchParams.get("channelId");
-      if (!channelId) return new Response("missing channelId", { status: 400 });
-      const encoder = new TextEncoder();
-      let unsub: (() => void) | null = null;
-      let hb: ReturnType<typeof setInterval> | null = null;
-      const body = new ReadableStream<Uint8Array>({
-        start(controller) {
-          const send = (payload: string) => {
-            try { controller.enqueue(encoder.encode(`data: ${payload}\n\n`)); } catch { /* closed */ }
-          };
-          send(JSON.stringify({ t: "status", status: "running" } satisfies WebStreamEvent));
-          unsub = subscribeWeb(channelId, (evt) => send(JSON.stringify(evt)));
-          // 若该会话此刻有待处理交互卡（权限 / AskUserQuestion），replay 给新订阅者。
-          // 交互卡是有状态的：SSE 可能在弹窗**之后**才连上（切会话/刷新/回前台重连），
-          // 不 replay 就永远看不到那张卡。
-          const pending = getPendingInteraction(channelId);
-          if (pending) send(JSON.stringify(pending));
-          // 15s 心跳（< Bun idleTimeout 255s，也留足余量应对中间代理的更短空闲超时），
-          // 保证长思考期间连接不被判空闲而关闭。
-          hb = setInterval(() => send("[DONE]"), 15000);
-          req.signal.addEventListener("abort", () => {
-            unsub?.(); if (hb) clearInterval(hb);
-            try { controller.close(); } catch { /* already closed */ }
-          });
-        },
-        cancel() { unsub?.(); if (hb) clearInterval(hb); },
-      });
-      return new Response(body, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache, no-transform",
-          Connection: "keep-alive",
-        },
-      });
-    }
-
-    // ── Web 会话管理（新建 / kill / restart）───────────────────────────
-    // 复用 runManager（Bun 进程内直接跑 manager.ts，bun 必在 PATH）。返回 manager
-    // 的 JSON 原样透传给 BFF。让 Web 前门真能开门，不用回终端。
-    if (url.pathname === "/web/agents" && req.method === "POST") {
-      try {
-        const body = (await req.json().catch(() => ({}))) as {
-          name?: string; dir?: string; purpose?: string;
-        };
-        const name = (body.name || "").trim();
-        const dir = (body.dir || "").trim();
-        if (!name || !dir) {
-          return new Response(JSON.stringify({ ok: false, error: "missing name/dir" }), {
-            status: 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        const args = ["create", name, dir];
-        if (body.purpose && body.purpose.trim()) args.push(body.purpose.trim());
-        const result = await runManager(...args);
-        // 新建/kill/restart 后触发 slash 重扫（与 Discord 侧一致，非关键失败可忽略）
-        return new Response(JSON.stringify(result), {
-          status: result?.ok === false ? 400 : 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
-          status: 500, headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    if (
-      (url.pathname === "/web/agents/kill" || url.pathname === "/web/agents/restart") &&
-      req.method === "POST"
-    ) {
-      try {
-        const body = (await req.json().catch(() => ({}))) as { name?: string };
-        const name = (body.name || "").trim();
-        if (!name) {
-          return new Response(JSON.stringify({ ok: false, error: "missing name" }), {
-            status: 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        const cmd = url.pathname.endsWith("/kill") ? "kill" : "restart";
-        const result = await runManager(cmd, name);
-        return new Response(JSON.stringify(result), {
-          status: result?.ok === false ? 400 : 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
-          status: 500, headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    // 大总管（master orchestrator）信息。Web 端据此置顶一个「大总管」入口，路由到
-    // CONTROL_CHANNEL_ID（与 Discord #control 同一角色）。master 不在 registry.json，
-    // 靠 CONTROL_CHANNEL_ID 识别；cwd 优先取已连接 master 的实际 cwd，否则 MASTER_DIR；
-    // sessionId 取该 cwd slug 目录下最新的 jsonl（launcher 重启会换 session，故每次现算）。
-    if (url.pathname === "/web/master" && req.method === "GET") {
-      const channelId = CONTROL_CHANNEL_ID;
-      if (!channelId) {
-        return new Response(JSON.stringify({ available: false }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      // 归一化路径（MASTER_DIR 含 import.meta.dir/../.. 的 ..，直接算 slug 会错）
-      const cwd = pathResolve(clients.get(channelId)?.cwd || MASTER_DIR);
-      // 找 cwd slug 目录下最新的 .jsonl → 当前 master session
-      let sessionId: string | null = null;
-      try {
-        const slug = "-" + cwd.replace(/^\//, "").replace(/\//g, "-");
-        const dir = `${process.env.HOME}/.claude/projects/${slug}`;
-        if (fsExistsSync(dir)) {
-          let newest = 0;
-          for (const f of fsReaddirSync(dir)) {
-            if (!f.endsWith(".jsonl")) continue;
-            const mt = fsStatSync(`${dir}/${f}`).mtimeMs;
-            if (mt > newest) { newest = mt; sessionId = f.replace(/\.jsonl$/, ""); }
-          }
-        }
-      } catch { /* sessionId 保持 null */ }
-      const connected = clients.has(channelId);
-      return new Response(JSON.stringify({
-        available: true,
-        channelId,
-        cwd,
-        sessionId,
-        connected,
-        displayName: "大总管",
-      }), { headers: { "Content-Type": "application/json" } });
-    }
-
-    // ── Web 富交互（Phase 2）：打断 / 权限卡 / AskUserQuestion 卡 ───────────
-    // 都复用 Discord 侧已有的 tmux keystroke 逻辑（resolveTmuxTarget /
-    // applyPermissionAction / submitAuqSelections），只换 Web 出入口。
-
-    // 一键中断：给目标会话的 tmux window 发 Ctrl+C（master / agent 均可）。
-    if (url.pathname === "/web/interrupt" && req.method === "POST") {
-      try {
-        const body = (await req.json().catch(() => ({}))) as { channelId?: string };
-        const channelId = (body.channelId || "").trim();
-        if (!channelId) {
-          return new Response(JSON.stringify({ ok: false, error: "missing channelId" }), {
-            status: 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        const resolved = await resolveTmuxTarget(channelId);
-        if (!resolved) {
-          return new Response(JSON.stringify({ ok: false, error: "session not found" }), {
-            status: 404, headers: { "Content-Type": "application/json" },
-          });
-        }
-        const proc = Bun.spawn(
-          ["tmux", "-S", TMUX_SOCK, "send-keys", "-t", resolved.targetWindow, "C-c"],
-          { stdout: "pipe", stderr: "pipe" }
-        );
-        const stderr = await new Response(proc.stderr).text();
-        await proc.exited;
-        if (proc.exitCode !== 0) {
-          return new Response(JSON.stringify({ ok: false, error: `tmux C-c 失败: ${stderr}` }), {
-            status: 500, headers: { "Content-Type": "application/json" },
-          });
-        }
-        recordMetric("agent_interrupt", { channelId, agent: resolved.agentLabel, meta: { trigger: "web" } });
-        // 打断后让 Web 端状态收敛（解锁输入框），与 Stop hook 的 done 一致
-        pushToWeb(channelId, { t: "done" });
-        return new Response(JSON.stringify({ ok: true, agent: resolved.agentLabel }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
-          status: 500, headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    // 权限 / session-idle 卡应答：把 action 翻译成 tmux 键序列（applyPermissionAction）。
-    if (url.pathname === "/web/permission" && req.method === "POST") {
-      try {
-        const body = (await req.json().catch(() => ({}))) as { channelId?: string; action?: string };
-        const channelId = (body.channelId || "").trim();
-        const action = (body.action || "").trim();
-        if (!channelId || !action) {
-          return new Response(JSON.stringify({ ok: false, error: "missing channelId/action" }), {
-            status: 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        const res = await applyPermissionAction(channelId, action);
-        // 仅在成功发键 / 弹窗已自动关时清 Web 卡；硬失败（找不到 agent）保留卡片可重试
-        if (res.ok || res.dialogClosed) {
-          pushToWeb(channelId, { t: "permission-cleared" });
-          setPendingInteraction(channelId, null);
-        }
-        if (res.dialogClosed) {
-          return new Response(JSON.stringify({ ok: true, dialogClosed: true }), {
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-        if (!res.ok) {
-          return new Response(JSON.stringify({ ok: false, error: res.error }), {
-            status: 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        return new Response(JSON.stringify({ ok: true, agent: res.agentName }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
-          status: 500, headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    // AskUserQuestion 卡应答：submit(selections[][]) 或 cancel。
-    if (url.pathname === "/web/auq" && req.method === "POST") {
-      try {
-        const body = (await req.json().catch(() => ({}))) as {
-          channelId?: string; action?: string; selections?: number[][];
-        };
-        const channelId = (body.channelId || "").trim();
-        const action = (body.action || "").trim();
-        if (!channelId || !action) {
-          return new Response(JSON.stringify({ ok: false, error: "missing channelId/action" }), {
-            status: 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        const { submitAuqSelections, cancelAuq } = await import("./bridge/ask-user-question.js");
-        if (action === "submit") {
-          const selections = Array.isArray(body.selections) ? body.selections : [];
-          const res = await submitAuqSelections(channelId, selections);
-          return new Response(JSON.stringify(res), {
-            status: res.ok ? 200 : 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        if (action === "cancel") {
-          const res = await cancelAuq(channelId);
-          return new Response(JSON.stringify(res), {
-            status: res.ok ? 200 : 400, headers: { "Content-Type": "application/json" },
-          });
-        }
-        return new Response(JSON.stringify({ ok: false, error: `unknown action ${action}` }), {
-          status: 400, headers: { "Content-Type": "application/json" },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
-          status: 500, headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
     return new Response("Claude Orchestrator Bridge", { status: 200 });
   },
   websocket: {
@@ -4814,15 +5230,9 @@ const server = Bun.serve({
 
 console.log(`🚀 Bridge WebSocket 启动: ws://localhost:${BRIDGE_PORT}`);
 
-if (!DISCORD_ENABLED) {
-  // Web-only 模式：不连 Discord，只跑 HTTP/WS 网关 + 本地会话。
-  // discord.once("ready") 回调、shard 看门狗、messageCreate 等都不会触发（未 login）。
-  console.warn(
-    "⚠️  未设置 DISCORD_BOT_TOKEN — 以 Web-only 模式启动（Discord 前端禁用；仅 Web 网关 + 本地会话编排）",
-  );
-  // Web-only 下 discord.once("ready") 永不 fire，故这里手动拉起权限弹窗 watcher，
-  // 让权限/session-idle 卡照样 tee 到 Web（watcher 内部按 DISCORD_ENABLED 跳过 Discord 推送）。
-  startPermissionWatcher(ALLOWED_USER_IDS, discord);
-} else {
-  discord.login(DISCORD_TOKEN);
+if (!DISCORD_TOKEN) {
+  console.error("❌ 请设置 DISCORD_BOT_TOKEN");
+  process.exit(1);
 }
+
+discord.login(DISCORD_TOKEN);
