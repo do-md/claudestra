@@ -3136,7 +3136,9 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { messageIds: ids } }));
 
         // v2.6.0+ 事件埋点：agent 的正式回复镜像（out）
-        {
+        // [fork] api: 目的地跳过——deliverToApi 已统一埋点（带 threadId/api 标记），
+        // 这里再发就是同一条回复的重复事件（web 前端会渲染两遍）。
+        if (parseChatId(msg.chatId).transport !== "api") {
           const evAgent = agentLabelForChannel(fromChannelId);
           emitEvent({ agent: evAgent, chatId: msg.chatId, type: "chat_message", data: { direction: "out", from: evAgent, text, threadId: env.meta.threadId } });
         }
@@ -4688,13 +4690,19 @@ function handleEventsRequest(req: Request, extraFilter?: EventFilter): Response 
           cleanup(); // controller 已关（客户端断开），停止推送
         }
       };
+      // [fork] 立即发首包注释：flush 响应头 + 重置 Bun 的连接空闲计时。
+      // Bun.serve 默认 HTTP idleTimeout ≈10s——不发任何字节的空闲 SSE 连接
+      // 会在 ~10s 被掐（实测 10.7s close），30s ping 根本活不到第一轮。
+      try { controller.enqueue(enc.encode(`: connected\n\n`)); } catch { cleanup(); }
       if (Number.isFinite(since)) {
         for (const evt of replayEventsSince(since, filter)) send(evt);
       }
       unsub = subscribeEvents(filter, send);
+      // [fork] ping 30s→5s：必须小于 Bun.serve 默认 idleTimeout（~10s），
+      // 否则事件间隙超过 10s 的订阅者会被静默断开（web 前端首当其冲）。
       ping = setInterval(() => {
         try { controller.enqueue(enc.encode(`: ping\n\n`)); } catch { cleanup(); }
-      }, 30_000);
+      }, 5_000);
     },
     cancel() { cleanup(); },
   });
@@ -4796,6 +4804,16 @@ async function handleApiRequest(req: Request, url: URL): Promise<Response> {
       const agents = ((listResult.agents || []) as any[])
         .filter((a) => agentInScope(principal, a.name))
         .map((a) => ({ name: a.name, status: a.status, idle: a.idle, purpose: a.purpose }));
+      // [fork] ?include=stopped：registry 里已停止的 agent 也入列（additive；
+      // web 侧栏保留 stopped 会话入口，其历史经归档仍可读——正是归档的意义）。
+      if (url.searchParams.get("include") === "stopped") {
+        const { readRegistryAgents } = await import("./lib/registry.js");
+        const listed = new Set(agents.map((a) => a.name));
+        for (const r of await readRegistryAgents()) {
+          if (listed.has(r.name) || !agentInScope(principal, r.name)) continue;
+          agents.push({ name: r.name, status: "stopped", idle: undefined, purpose: r.purpose });
+        }
+      }
       // [fork] master 入列（token scope 显式含 "master" 才可见，"*" 不含）。
       // web 前端的「大总管」置顶入口靠它。
       if (CONTROL_CHANNEL_ID && agentInScope(principal, "master")) {

@@ -98,9 +98,13 @@ export async function GET(request: Request) {
       signal: request.signal,
     });
   } catch (e) {
+    const cause = (e as { cause?: unknown }).cause;
+    console.error(`[stream] Bridge events fetch 失败 agent=${agent}:`, (e as Error).message, "| cause:", cause);
     return new Response(`Bridge 不可达: ${(e as Error).message}`, { status: 502 });
   }
   if (!upstream.ok || !upstream.body) {
+    const body = await upstream.text().catch(() => "");
+    console.error(`[stream] Bridge events 非 2xx agent=${agent}: status=${upstream.status} body=${body.slice(0, 200)}`);
     return new Response("Bridge events 不可用", { status: 502 });
   }
   const upstreamBody = upstream.body;

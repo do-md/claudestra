@@ -35,9 +35,11 @@ interface ApiAgent {
  * Bridge 不可达时抛错（由路由层转成 5xx；不再有 mock 回退）。
  */
 export async function loadAgents(): Promise<AgentSession[]> {
-  const json = await bridgeGet<{ ok: boolean; agents: ApiAgent[] }>("/agents", {
-    timeoutMs: 5000,
-  });
+  // include=stopped：已停止的 agent 也入列（保留入口，历史经归档 API 仍可读）
+  const json = await bridgeGet<{ ok: boolean; agents: ApiAgent[] }>(
+    "/agents?include=stopped",
+    { timeoutMs: 5000 }
+  );
   const list = (json.agents || []).map((a): AgentSession => {
     if (a.name === "master") {
       return {
