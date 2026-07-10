@@ -11,9 +11,9 @@ import { existsSync } from "fs";
 import { join } from "path";
 import type { Client } from "discord.js";
 import { TextChannel } from "discord.js";
-import { WATCHER_CONFIG, MCP_TOOL_PREFIX } from "./config.js";
+import { WATCHER_CONFIG, MCP_TOOL_PREFIX, DISCORD_ENABLED } from "./config.js";
 import { discordReply } from "./discord-api.js";
-import { pushToWeb } from "./web-hub.js";
+import { pushToWeb, setPendingInteraction } from "./web-hub.js";
 
 interface ToolEntry {
   id: string;
@@ -335,14 +335,31 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
           // 渲染完跳过本 assistant entry 的其他处理（不进 textQueue / tools），由
           // AUQ 自己的交互回路驱动。
           try {
-            const { detectAskUserQuestion, postAskUserQuestionMessage, auqStates } =
-              await import("./ask-user-question.js");
+            const {
+              detectAskUserQuestion,
+              registerAuqState,
+              buildAuqWebEvent,
+              postAskUserQuestionMessage,
+              auqStates,
+            } = await import("./ask-user-question.js");
             const questions = detectAskUserQuestion(content);
             if (questions && !auqStates.has(state.channelId)) {
               const tmuxTarget = `master:${state.agentName}`;
-              postAskUserQuestionMessage(discord, state.channelId, tmuxTarget, questions)
-                .catch((e) => console.error("AUQ post 失败:", e));
-              console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) → posted Discord components for ${state.agentName}`);
+              // 先登记 state（与 Discord 无关）→ 再各自 tee 到 Web / Discord
+              registerAuqState(state.channelId, tmuxTarget, questions);
+              // Web tee（附加输出，与 Discord 并行；web-only 也走这里）+ pending replay
+              const webEvt = buildAuqWebEvent(state.channelId);
+              if (webEvt) {
+                pushToWeb(state.channelId, webEvt);
+                setPendingInteraction(state.channelId, webEvt);
+              }
+              // Discord select menu + Submit/Cancel —— 仅 Discord 启用时
+              if (DISCORD_ENABLED) {
+                postAskUserQuestionMessage(discord, state.channelId, questions).catch(
+                  (e) => console.error("AUQ post 失败:", e),
+                );
+              }
+              console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) for ${state.agentName}`);
               continue; // 跳过本 entry 的 tool/text 处理
             }
           } catch (e) { /* non-critical */ }

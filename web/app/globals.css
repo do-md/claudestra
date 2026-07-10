@@ -45,8 +45,17 @@ body {
     height: 100%;
 }
 
-body {
-    /* 移动端安全区，PWA 独立窗口下生效（需配合 viewport-fit=cover） */
-    padding-top: env(safe-area-inset-top);
-    padding-bottom: env(safe-area-inset-bottom);
+/*
+ * 安全区不再放在 body 上：聊天根容器用 h-dvh（= 视口高度）铺满，若 body 再加
+ * padding 会撑出滚动条把 composer 顶到安全区外。改为在 TopBar(top) / Composer(bottom)
+ * / Sidebar 抽屉各自用 env(safe-area-inset-*) 内缩（需 viewport-fit=cover，见 layout.tsx）。
+ */
+
+/* iOS Safari：input/textarea 字号 <16px 会在聚焦时自动放大页面，移动端统一顶到 16px */
+@media (max-width: 767px) {
+    input,
+    textarea,
+    select {
+        font-size: 16px;
+    }
 }

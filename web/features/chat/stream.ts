@@ -1,4 +1,5 @@
 import type { WebStreamEvent } from "@/lib/chat/events";
+import type { PendingPermission, PendingAsk } from "./type";
 
 /**
  * 消费流式事件的最小接口。ChatStore 实现它。
@@ -13,6 +14,9 @@ export interface StreamSink {
   appendAssistantText(text: string): void;
   setStatus(status: "running" | "done"): void;
   endTurn(): void;
+  /** Phase 2：待处理交互卡（null=清卡）。 */
+  setPermission(p: PendingPermission | null): void;
+  setAsk(a: PendingAsk | null): void;
 }
 
 /** 处理一条已解析的 Web 流事件。初次发送与断线重连共用。 */
@@ -32,6 +36,24 @@ export function processStreamEvent(sink: StreamSink, evt: WebStreamEvent) {
       break;
     case "error":
       sink.appendAssistantText(`\n[Error: ${evt.error}]`);
+      break;
+    case "permission":
+      sink.setPermission({
+        id: evt.id,
+        kind: evt.kind,
+        title: evt.title,
+        desc: evt.desc,
+        actions: evt.actions,
+      });
+      break;
+    case "permission-cleared":
+      sink.setPermission(null);
+      break;
+    case "ask":
+      sink.setAsk({ id: evt.id, questions: evt.questions });
+      break;
+    case "ask-cleared":
+      sink.setAsk(null);
       break;
   }
 }

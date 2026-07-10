@@ -35,7 +35,7 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-base-200 px-4">
+    <div className="flex min-h-dvh items-center justify-center bg-base-200 px-4">
       <div className="card w-full max-w-sm bg-base-100 shadow-lg">
         <div className="card-body">
           <h1 className="text-xl font-bold text-center mb-1">Claudestra</h1>

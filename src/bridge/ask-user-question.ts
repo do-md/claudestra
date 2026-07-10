@@ -35,6 +35,8 @@
  */
 
 import type { Client, TextChannel } from "discord.js";
+import { tmuxRaw } from "../lib/tmux-helper.js";
+import { pushToWeb, setPendingInteraction, type WebStreamEvent } from "./web-hub.js";
 
 export interface AuqOption {
   label: string;
@@ -97,16 +99,102 @@ export function detectAskUserQuestion(content: any[]): AuqQuestion[] | null {
 }
 
 /**
+ * 登记一条待处理的 AskUserQuestion（**与 Discord 无关**，web-only 也调）。
+ * jsonl-watcher 检测到 AskUserQuestion 后先登记 state，再各自 tee 到 Web / Discord。
+ * messageId 先留空，Discord 发完消息后回填（Web 不需要）。
+ */
+export function registerAuqState(
+  channelId: string,
+  tmuxTarget: string,
+  questions: AuqQuestion[],
+): void {
+  auqStates.set(channelId, {
+    channelId,
+    questions,
+    selections: questions.map(() => []),
+    messageId: "",
+    tmuxTarget,
+    ts: Date.now(),
+  });
+}
+
+/** 把已登记的 AUQ 渲染成 Web 交互卡事件（供 pushToWeb + pending replay）。 */
+export function buildAuqWebEvent(
+  channelId: string,
+): Extract<WebStreamEvent, { t: "ask" }> | null {
+  const state = auqStates.get(channelId);
+  if (!state) return null;
+  return {
+    t: "ask",
+    id: `auq-${state.ts}`,
+    questions: state.questions.map((q) => ({
+      question: q.question,
+      header: q.header,
+      multiSelect: !!q.multiSelect,
+      options: q.options.map((o) => ({
+        label: o.label,
+        description: o.description,
+      })),
+    })),
+  };
+}
+
+/**
+ * 提交 Web/AUQ 选择：写入 selections，翻译成 tmux 键序列发给 agent 的 TUI，
+ * 清状态 + 清 Web 卡。selections[i] = 第 i 题选中的 option index 数组（0-based）。
+ */
+export async function submitAuqSelections(
+  channelId: string,
+  selections: number[][],
+): Promise<{ ok: boolean; summary?: string; error?: string }> {
+  const state = auqStates.get(channelId);
+  if (!state) return { ok: false, error: "AskUserQuestion 状态已过期" };
+  // 归一化到 questions 长度，过滤越界 index
+  state.selections = state.questions.map((q, i) =>
+    (selections[i] || []).filter((oi) => oi >= 0 && oi < q.options.length),
+  );
+  const keys = buildAuqKeystrokes(state);
+  if (keys.length > 0) {
+    await tmuxRaw(["send-keys", "-t", state.tmuxTarget, ...keys]);
+  }
+  const summary = state.selections
+    .map((sel, i) => {
+      if (sel.length === 0) return `Q${i + 1}: (none)`;
+      const labels = sel
+        .map((oi) => state.questions[i].options[oi]?.label || `?${oi}`)
+        .join(", ");
+      return `Q${i + 1}: ${labels}`;
+    })
+    .join("\n");
+  clearAuqState(channelId);
+  pushToWeb(channelId, { t: "ask-cleared" });
+  setPendingInteraction(channelId, null);
+  return { ok: true, summary };
+}
+
+/** 取消 AUQ：给 agent TUI 发 Esc，清状态 + 清 Web 卡。 */
+export async function cancelAuq(
+  channelId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const state = auqStates.get(channelId);
+  if (!state) return { ok: false, error: "AskUserQuestion 状态已过期" };
+  await tmuxRaw(["send-keys", "-t", state.tmuxTarget, "Escape"]);
+  clearAuqState(channelId);
+  pushToWeb(channelId, { t: "ask-cleared" });
+  setPendingInteraction(channelId, null);
+  return { ok: true };
+}
+
+/**
  * 把 AskUserQuestion 渲染成 Discord 消息 + components。
  * 1-4 个 question 每个一个 select menu（multiSelect 时 max_values=options.length）。
  * 最后一行是 Submit / Cancel 按钮。
  *
- * 返回新建的 message id 给调用方存进 auqStates；失败返回 null。
+ * 前置：state 已由 registerAuqState 登记。发完消息回填 messageId；失败返回 null。
  */
 export async function postAskUserQuestionMessage(
   discord: Client,
   channelId: string,
-  tmuxTarget: string,
   questions: AuqQuestion[],
 ): Promise<string | null> {
   try {
@@ -160,14 +248,12 @@ export async function postAskUserQuestionMessage(
 
     const msg = await textCh.send({ content: body, components: rows });
 
-    auqStates.set(channelId, {
-      channelId,
-      questions,
-      selections: questions.map(() => []),
-      messageId: msg.id,
-      tmuxTarget,
-      ts: Date.now(),
-    });
+    // 回填 messageId（state 已由 registerAuqState 登记）。极端情况下 state 缺失
+    // 就地补登记，tmuxTarget 从 channel 无从得知时留空（Discord 提交仍能发键，
+    // 因为按钮处理器用的是 state.tmuxTarget —— 缺失则按 master:<channel> 无效，
+    // 但正常路径 registerAuqState 一定先跑，不会走到这里）。
+    const st = auqStates.get(channelId);
+    if (st) st.messageId = msg.id;
 
     return msg.id;
   } catch (e) {

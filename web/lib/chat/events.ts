@@ -7,6 +7,24 @@
  * Bridge 侧 GET /web/stream 会以 SSE `data: <json>\n\n` 逐条下发这些事件；
  * mock 阶段由 lib/chat/mock-bridge.ts 产生同样形状的事件，前端消费代码保持一致。
  */
+/** 权限/AUQ 卡的一个操作按钮（回传时 action 让 bridge 打对应 tmux 键序列）。 */
+export interface WebPermAction {
+  action: string;
+  label: string;
+  style: "success" | "primary" | "danger" | "secondary";
+}
+/** AskUserQuestion 一个选项 / 一道题的 Web 形状（与 bridge/web-hub.ts 对齐）。 */
+export interface WebAuqOption {
+  label: string;
+  description?: string;
+}
+export interface WebAuqQuestion {
+  question: string;
+  header: string;
+  options: WebAuqOption[];
+  multiSelect: boolean;
+}
+
 export type WebStreamEvent =
   | { t: "status"; status: "running" | "done" }
   /** 一次工具调用的段级摘要（📖 Read xxx / ✏️ Edit xxx / ⚙️ Bash ...） */
@@ -15,6 +33,19 @@ export type WebStreamEvent =
   | { t: "text"; text: string }
   /** 本轮结束 */
   | { t: "done" }
-  | { t: "error"; error: string };
+  | { t: "error"; error: string }
+  // Phase 2 富交互：需要用户抉择的「待处理卡」。回传经 BFF → bridge → tmux 按键。
+  | {
+      t: "permission";
+      /** 稳定 dedup key（modal 语义） */
+      id: string;
+      kind: "permission" | "session-idle";
+      title: string;
+      desc: string;
+      actions: WebPermAction[];
+    }
+  | { t: "permission-cleared" }
+  | { t: "ask"; id: string; questions: WebAuqQuestion[] }
+  | { t: "ask-cleared" };
 
 export const SSE_DONE = "[DONE]";

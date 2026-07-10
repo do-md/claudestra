@@ -26,7 +26,10 @@ export function Composer() {
   };
 
   return (
-    <div className="border-t border-base-300 bg-base-100 px-4 py-3">
+    <div
+      className="border-t border-base-300 bg-base-100 px-3 pt-3 sm:px-4"
+      style={{ paddingBottom: "calc(env(safe-area-inset-bottom) + 0.75rem)" }}
+    >
       <div className="mx-auto flex max-w-3xl items-end gap-2">
         <textarea
           className="textarea textarea-bordered max-h-40 min-h-[2.75rem] flex-1 resize-none"
@@ -39,13 +42,23 @@ export function Composer() {
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
         />
-        <button
-          className="btn btn-primary"
-          disabled={disabled || streaming || !text.trim()}
-          onClick={submit}
-        >
-          {streaming ? <span className="loading loading-spinner loading-sm" /> : "发送"}
-        </button>
+        {streaming ? (
+          <button
+            className="btn btn-error"
+            title="停止 (Ctrl+C)"
+            onClick={() => store.interrupt()}
+          >
+            ■ 停止
+          </button>
+        ) : (
+          <button
+            className="btn btn-primary"
+            disabled={disabled || !text.trim()}
+            onClick={submit}
+          >
+            发送
+          </button>
+        )}
       </div>
     </div>
   );

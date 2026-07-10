@@ -26,7 +26,7 @@ import type { ServerWebSocket } from "bun";
 import { DISCORD_TOKEN, DISCORD_ENABLED, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK, MASTER_DIR } from "./bridge/config.js";
 import { existsSync as fsExistsSync, readdirSync as fsReaddirSync, statSync as fsStatSync } from "fs";
 import { resolve as pathResolve } from "path";
-import { subscribeWeb, pushToWeb, isLocalChannelId, type WebStreamEvent } from "./bridge/web-hub.js";
+import { subscribeWeb, pushToWeb, setPendingInteraction, getPendingInteraction, isLocalChannelId, type WebStreamEvent } from "./bridge/web-hub.js";
 import {
   startTyping,
   stopTyping,
@@ -52,7 +52,7 @@ import {
 } from "./bridge/management.js";
 import { tmuxScreenshot } from "./bridge/screenshot.js";
 import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup } from "./bridge/jsonl-watcher.js";
-import { startPermissionWatcher, permissionMessages, clearPermissionMessage } from "./bridge/permission-watcher.js";
+import { startPermissionWatcher, permissionMessages, clearPermissionMessage, PERM_KEY_SEQ, PERM_LABELS, applyPermissionAction } from "./bridge/permission-watcher.js";
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
 import { recordMetric } from "./lib/metrics.js";
 import {
@@ -144,6 +144,30 @@ async function getLocalAgentExchangeId(): Promise<string> {
     _cachedAgentExchangeId = p.localAgentExchangeId || "";
   } catch { /* non-critical */ }
   return _cachedAgentExchangeId;
+}
+
+/**
+ * 把一个 channelId 解析成它对应的 tmux window（打断 / 发键用）。
+ * master (CONTROL_CHANNEL_ID) 和 #agent-exchange 都路由到 master:0，且不在 registry.json，
+ * 直接认定为 master:0；否则查 registry 取 agent 名。找不到返回 null。
+ * Discord 打断按钮与 Web /web/interrupt 端点共用，避免主控识别逻辑两处漂移。
+ */
+async function resolveTmuxTarget(
+  targetChannelId: string
+): Promise<{ targetWindow: string; agentLabel: string } | null> {
+  const exchangeId = await getLocalAgentExchangeId();
+  const isMasterChannel =
+    targetChannelId === CONTROL_CHANNEL_ID ||
+    (!!exchangeId && targetChannelId === exchangeId);
+  if (isMasterChannel) {
+    return { targetWindow: `${MASTER_SESSION}:0`, agentLabel: "master" };
+  }
+  const listResult = await runManager("list");
+  const agent = (listResult.agents || []).find(
+    (a: any) => a.channelId === targetChannelId
+  );
+  if (!agent) return null;
+  return { targetWindow: `${MASTER_SESSION}:${agent.name}`, agentLabel: agent.name };
 }
 
 /**
@@ -2378,31 +2402,14 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
         console.log(`⚡ 打断按钮点击: channel=${targetChannelId}`);
         try {
           // master (CONTROL_CHANNEL_ID) 和 #agent-exchange 都 route 到 master:0，
-          // 但它们不在 registry.json 里 —— 直接认定目标是 master:0，不用查 registry
-          const controlId = process.env.CONTROL_CHANNEL_ID || "";
-          const { readPeers } = await import("./lib/peers.js");
-          const peers = await readPeers().catch(() => ({ localAgentExchangeId: "" } as any));
-          const exchangeId = (peers as any).localAgentExchangeId || "";
-          const isMasterChannel =
-            targetChannelId === controlId ||
-            (exchangeId && targetChannelId === exchangeId);
-
-          let targetWindow: string;
-          let agentLabel: string;
-          if (isMasterChannel) {
-            targetWindow = `${MASTER_SESSION}:0`;
-            agentLabel = "master";
-          } else {
-            const listResult = await runManager("list");
-            const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
-            if (!agent) {
-              console.error(`⚡ 打断失败：channel=${targetChannelId} 找不到对应 agent`);
-              await interaction.followUp({ content: "❌ 打断失败：找不到对应 agent", ephemeral: true }).catch(() => {});
-              return;
-            }
-            targetWindow = `master:${agent.name}`;
-            agentLabel = agent.name;
+          // 但它们不在 registry.json 里 —— resolveTmuxTarget 直接认定为 master:0。
+          const resolved = await resolveTmuxTarget(targetChannelId);
+          if (!resolved) {
+            console.error(`⚡ 打断失败：channel=${targetChannelId} 找不到对应 agent`);
+            await interaction.followUp({ content: "❌ 打断失败：找不到对应 agent", ephemeral: true }).catch(() => {});
+            return;
           }
+          const { targetWindow, agentLabel } = resolved;
 
           console.log(`⚡ 发送 C-c 到 tmux window: ${targetWindow}`);
           const proc = Bun.spawn(
@@ -2443,46 +2450,13 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       ];
       if (promptBtnPrefixes.some((p) => id.startsWith(p))) {
         const [action, targetChannelId] = id.split(":");
-        // 按钮对应的 Claude Code 按键**序列**。
-        // v2.0.22+: session-idle modal 不接受 digit 跳转（按 "2" 不会跳到 option 2，
-        // Enter 还是确认高亮的 option 1 = 从摘要恢复 = compact）。改用 arrow nav：
-        // 光标默认在 option 1，Down 一次到 2，两次到 3。perm 弹窗保留 digit（实测可用）。
-        const keySeqMap: Record<string, string[]> = {
-          perm_allow: ["1", "Enter"],
-          perm_allow_session: ["2", "Enter"],
-          perm_deny: ["3", "Enter"],
-          session_summary: ["Enter"],              // option 1（高亮默认）
-          session_full: ["Down", "Enter"],         // ↓ 到 option 2
-          session_noask: ["Down", "Down", "Enter"],// ↓↓ 到 option 3
-        };
-        const labelMap: Record<string, string> = {
-          perm_allow: "✅ 已允许",
-          perm_allow_session: "✅ 已允许（本会话不再问）",
-          perm_deny: "❌ 已拒绝",
-          session_summary: "✨ 从摘要恢复",
-          session_full: "📜 恢复完整会话",
-          session_noask: "🔕 不再询问",
-        };
-        const keySeq = keySeqMap[action] || ["Enter"];
-        const isPermBtn = action.startsWith("perm_");
-        const isIdleBtn = action.startsWith("session_");
-        console.log(`🔔 弹窗响应: channel=${targetChannelId} action=${action} keys=${keySeq.join(" ")}`);
+        console.log(`🔔 弹窗响应: channel=${targetChannelId} action=${action}`);
         try {
-          const listResult = await runManager("list");
-          const agent = (listResult.agents || []).find((a: any) => a.channelId === targetChannelId);
-          if (!agent) {
-            await interaction.followUp({ content: "❌ 找不到对应 agent", ephemeral: true }).catch(() => {});
-            return;
-          }
+          // 键序列 + 弹窗仍在校验 + 发键，全在 applyPermissionAction 内（Web 端点共用）
+          const res = await applyPermissionAction(targetChannelId, action);
 
-          // 发键前再确认弹窗还在，避免把 digit+Enter 当成普通消息提交给 Claude
-          const pane = await tmuxCapture(windowTarget(agent.name), 30);
-          const hasPerm = detectRuntimePermissionPrompt(pane) !== null;
-          const hasIdle = detectSessionIdlePrompt(pane) !== null;
-          const dialogStillActive = (isPermBtn && hasPerm) || (isIdleBtn && hasIdle);
-
-          if (!dialogStillActive) {
-            console.log(`🔔 弹窗已关闭，跳过发键: channel=${targetChannelId} hasPerm=${hasPerm} hasIdle=${hasIdle}`);
+          if (res.dialogClosed) {
+            console.log(`🔔 弹窗已关闭，跳过发键: channel=${targetChannelId}`);
             const msgId = permissionMessages.get(targetChannelId);
             if (msgId) {
               try {
@@ -2490,31 +2464,28 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
                 const sm = await ch.messages.fetch(msgId);
                 await sm.edit({ content: `🔕 弹窗已自动关闭，无需操作`, components: [] });
               } catch { /* non-critical */ }
-              clearPermissionMessage(targetChannelId);
             }
+            clearPermissionMessage(targetChannelId); // 内部会清 Web 卡
+            return;
+          }
+          if (!res.ok) {
+            await interaction.followUp({ content: `❌ ${res.error || "处理失败"}`, ephemeral: true }).catch(() => {});
             return;
           }
 
-          const proc = Bun.spawn(
-            ["tmux", "-S", TMUX_SOCK, "send-keys", "-t", `master:${agent.name}`, ...keySeq],
-            { stdout: "pipe", stderr: "pipe" }
-          );
-          await proc.exited;
-          if (proc.exitCode !== 0) {
-            const stderr = await new Response(proc.stderr).text();
-            console.error(`🔔 tmux send-keys 失败: ${stderr}`);
-          }
-
-          // 编辑原消息显示已处理（保留指纹让下次 poll 自然清理，避免竞争条件）
+          // 成功发键：编辑原消息显示已处理（保留指纹让下次 poll 自然清理，避免竞争条件）
           const msgId = permissionMessages.get(targetChannelId);
           if (msgId) {
             try {
               const ch = await discord.channels.fetch(targetChannelId) as TextChannel;
               const sm = await ch.messages.fetch(msgId);
-              await sm.edit({ content: `🔔 ${labelMap[action]}`, components: [] });
+              await sm.edit({ content: `🔔 ${PERM_LABELS[action] || "已处理"}`, components: [] });
             } catch { /* non-critical */ }
             permissionMessages.delete(targetChannelId);
           }
+          // Web：卡片清掉（应答完成）
+          pushToWeb(targetChannelId, { t: "permission-cleared" });
+          setPendingInteraction(targetChannelId, null);
         } catch (e) {
           console.error(`🔔 权限响应流程异常:`, e);
         }
@@ -2568,7 +2539,7 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
       // v2.0.19+: AskUserQuestion 的 Submit / Cancel 按钮
       if (id.startsWith("auq:")) {
         try {
-          const { auqStates, buildAuqKeystrokes, clearAuqState } =
+          const { auqStates, submitAuqSelections, cancelAuq } =
             await import("./bridge/ask-user-question.js");
           const parts = id.split(":");
           const auqChannel = parts[1];
@@ -2579,30 +2550,24 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
             return;
           }
           if (action === "submit") {
-            const keys = buildAuqKeystrokes(state);
-            // 一次 tmux send-keys 批量发，tmux 内部按顺序处理键序列；比一键一调用快得多
-            if (keys.length > 0) {
-              await tmuxRaw(["send-keys", "-t", state.tmuxTarget, ...keys]);
-            }
-            const summary = state.selections.map((sel, i) => {
-              if (sel.length === 0) return `Q${i + 1}: (none)`;
-              const labels = sel.map((oi) => state.questions[i].options[oi]?.label || `?${oi}`).join(", ");
-              return `Q${i + 1}: ${labels}`;
-            }).join("\n");
+            // Discord select 菜单已把用户选择写进 state.selections；直接提交它。
+            // submitAuqSelections 内部：发键 + 清状态 + 清 Web 卡（Web 端点共用）。
+            const numQ = state.questions.length;
+            const res = await submitAuqSelections(auqChannel, state.selections);
             await interaction.editReply({
-              content: `✅ 已提交 AskUserQuestion 选择：\n${summary}`,
+              content: res.ok
+                ? `✅ 已提交 AskUserQuestion 选择：\n${res.summary}`
+                : `⚠️ ${res.error || "提交失败"}`,
               components: [],
             }).catch(() => {});
-            recordMetric("auq_submit", { channelId: auqChannel, meta: { questions: String(state.questions.length) } });
-            clearAuqState(auqChannel);
+            recordMetric("auq_submit", { channelId: auqChannel, meta: { questions: String(numQ) } });
           } else if (action === "cancel") {
-            await tmuxRaw(["send-keys", "-t", state.tmuxTarget, "Escape"]);
+            await cancelAuq(auqChannel);
             await interaction.editReply({
               content: `❌ 已取消 AskUserQuestion（发了 Esc 给 agent）`,
               components: [],
             }).catch(() => {});
             recordMetric("auq_cancel", { channelId: auqChannel });
-            clearAuqState(auqChannel);
           }
         } catch (e) {
           console.error("AUQ button 处理异常:", e);
@@ -4587,6 +4552,11 @@ const server = Bun.serve({
           };
           send(JSON.stringify({ t: "status", status: "running" } satisfies WebStreamEvent));
           unsub = subscribeWeb(channelId, (evt) => send(JSON.stringify(evt)));
+          // 若该会话此刻有待处理交互卡（权限 / AskUserQuestion），replay 给新订阅者。
+          // 交互卡是有状态的：SSE 可能在弹窗**之后**才连上（切会话/刷新/回前台重连），
+          // 不 replay 就永远看不到那张卡。
+          const pending = getPendingInteraction(channelId);
+          if (pending) send(JSON.stringify(pending));
           // 15s 心跳（< Bun idleTimeout 255s，也留足余量应对中间代理的更短空闲超时），
           // 保证长思考期间连接不被判空闲而关闭。
           hb = setInterval(() => send("[DONE]"), 15000);
@@ -4699,6 +4669,124 @@ const server = Bun.serve({
       }), { headers: { "Content-Type": "application/json" } });
     }
 
+    // ── Web 富交互（Phase 2）：打断 / 权限卡 / AskUserQuestion 卡 ───────────
+    // 都复用 Discord 侧已有的 tmux keystroke 逻辑（resolveTmuxTarget /
+    // applyPermissionAction / submitAuqSelections），只换 Web 出入口。
+
+    // 一键中断：给目标会话的 tmux window 发 Ctrl+C（master / agent 均可）。
+    if (url.pathname === "/web/interrupt" && req.method === "POST") {
+      try {
+        const body = (await req.json().catch(() => ({}))) as { channelId?: string };
+        const channelId = (body.channelId || "").trim();
+        if (!channelId) {
+          return new Response(JSON.stringify({ ok: false, error: "missing channelId" }), {
+            status: 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        const resolved = await resolveTmuxTarget(channelId);
+        if (!resolved) {
+          return new Response(JSON.stringify({ ok: false, error: "session not found" }), {
+            status: 404, headers: { "Content-Type": "application/json" },
+          });
+        }
+        const proc = Bun.spawn(
+          ["tmux", "-S", TMUX_SOCK, "send-keys", "-t", resolved.targetWindow, "C-c"],
+          { stdout: "pipe", stderr: "pipe" }
+        );
+        const stderr = await new Response(proc.stderr).text();
+        await proc.exited;
+        if (proc.exitCode !== 0) {
+          return new Response(JSON.stringify({ ok: false, error: `tmux C-c 失败: ${stderr}` }), {
+            status: 500, headers: { "Content-Type": "application/json" },
+          });
+        }
+        recordMetric("agent_interrupt", { channelId, agent: resolved.agentLabel, meta: { trigger: "web" } });
+        // 打断后让 Web 端状态收敛（解锁输入框），与 Stop hook 的 done 一致
+        pushToWeb(channelId, { t: "done" });
+        return new Response(JSON.stringify({ ok: true, agent: resolved.agentLabel }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // 权限 / session-idle 卡应答：把 action 翻译成 tmux 键序列（applyPermissionAction）。
+    if (url.pathname === "/web/permission" && req.method === "POST") {
+      try {
+        const body = (await req.json().catch(() => ({}))) as { channelId?: string; action?: string };
+        const channelId = (body.channelId || "").trim();
+        const action = (body.action || "").trim();
+        if (!channelId || !action) {
+          return new Response(JSON.stringify({ ok: false, error: "missing channelId/action" }), {
+            status: 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        const res = await applyPermissionAction(channelId, action);
+        // 仅在成功发键 / 弹窗已自动关时清 Web 卡；硬失败（找不到 agent）保留卡片可重试
+        if (res.ok || res.dialogClosed) {
+          pushToWeb(channelId, { t: "permission-cleared" });
+          setPendingInteraction(channelId, null);
+        }
+        if (res.dialogClosed) {
+          return new Response(JSON.stringify({ ok: true, dialogClosed: true }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (!res.ok) {
+          return new Response(JSON.stringify({ ok: false, error: res.error }), {
+            status: 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true, agent: res.agentName }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    // AskUserQuestion 卡应答：submit(selections[][]) 或 cancel。
+    if (url.pathname === "/web/auq" && req.method === "POST") {
+      try {
+        const body = (await req.json().catch(() => ({}))) as {
+          channelId?: string; action?: string; selections?: number[][];
+        };
+        const channelId = (body.channelId || "").trim();
+        const action = (body.action || "").trim();
+        if (!channelId || !action) {
+          return new Response(JSON.stringify({ ok: false, error: "missing channelId/action" }), {
+            status: 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        const { submitAuqSelections, cancelAuq } = await import("./bridge/ask-user-question.js");
+        if (action === "submit") {
+          const selections = Array.isArray(body.selections) ? body.selections : [];
+          const res = await submitAuqSelections(channelId, selections);
+          return new Response(JSON.stringify(res), {
+            status: res.ok ? 200 : 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (action === "cancel") {
+          const res = await cancelAuq(channelId);
+          return new Response(JSON.stringify(res), {
+            status: res.ok ? 200 : 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ ok: false, error: `unknown action ${action}` }), {
+          status: 400, headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: (e as Error).message }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
     return new Response("Claude Orchestrator Bridge", { status: 200 });
   },
   websocket: {
@@ -4732,6 +4820,9 @@ if (!DISCORD_ENABLED) {
   console.warn(
     "⚠️  未设置 DISCORD_BOT_TOKEN — 以 Web-only 模式启动（Discord 前端禁用；仅 Web 网关 + 本地会话编排）",
   );
+  // Web-only 下 discord.once("ready") 永不 fire，故这里手动拉起权限弹窗 watcher，
+  // 让权限/session-idle 卡照样 tee 到 Web（watcher 内部按 DISCORD_ENABLED 跳过 Discord 推送）。
+  startPermissionWatcher(ALLOWED_USER_IDS, discord);
 } else {
   discord.login(DISCORD_TOKEN);
 }

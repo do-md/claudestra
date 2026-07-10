@@ -1,6 +1,11 @@
 "use client";
 import { createReactStore, ZenithStore } from "@do-md/zenith";
-import type { AgentSession, ChatMessage } from "./type";
+import type {
+  AgentSession,
+  ChatMessage,
+  PendingPermission,
+  PendingAsk,
+} from "./type";
 import { consumeSSEStream, processStreamEvent, type StreamSink } from "./stream";
 import type { WebStreamEvent } from "@/lib/chat/events";
 
@@ -16,6 +21,10 @@ interface ChatState {
   streaming: boolean;
   /** 本轮已起、还没有任何输出 → 显示「思考中」 */
   awaitingChunk: boolean;
+  /** Phase 2：当前会话待处理的权限 / session-idle 卡（null=无） */
+  pendingPermission: PendingPermission | null;
+  /** Phase 2：当前会话待处理的 AskUserQuestion 卡（null=无） */
+  pendingAsk: PendingAsk | null;
 }
 
 /**
@@ -40,6 +49,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       loadingHistory: false,
       streaming: false,
       awaitingChunk: false,
+      pendingPermission: null,
+      pendingAsk: null,
     });
   }
 
@@ -158,6 +169,9 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       s.loadingHistory = true;
       s.streaming = false;
       s.awaitingChunk = false;
+      // 交互卡是 per-session 的：切走先清空，新流连上后 bridge 会 replay 当前 pending。
+      s.pendingPermission = null;
+      s.pendingAsk = null;
     });
     // 先拉历史（刷新/切换不丢），再连持久流承接新输出
     await this.loadMessages(name, gen);
@@ -312,6 +326,103 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       s.streaming = false;
       s.awaitingChunk = false;
     });
+  }
+
+  // ─── Phase 2 交互卡：sink 写入 + 用户回传 ─────────────────────
+
+  public setPermission(p: PendingPermission | null) {
+    this.produce((s) => {
+      s.pendingPermission = p;
+      // 有卡 = 在等用户抉择而非等 agent 输出 → 关掉「思考中」dots
+      if (p) s.awaitingChunk = false;
+    });
+  }
+
+  public setAsk(a: PendingAsk | null) {
+    this.produce((s) => {
+      s.pendingAsk = a;
+      if (a) s.awaitingChunk = false;
+    });
+  }
+
+  /** POST 一个交互回传（interrupt/permission/auq）到 BFF，统一处理 401/错误。 */
+  private async postAction(
+    path: string,
+    payload: Record<string, unknown>
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (res.status === 401) {
+        this.gotoLogin();
+        return { ok: false, error: "未登录" };
+      }
+      const json = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+      };
+      if (!res.ok || json.ok === false)
+        return { ok: false, error: json.error || "操作失败" };
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  }
+
+  /** 一键中断：给当前会话的 tmux window 发 Ctrl+C。 */
+  public async interrupt(): Promise<{ ok: boolean; error?: string }> {
+    const agent = this.state.activeAgent;
+    if (!agent) return { ok: false, error: "无活动会话" };
+    const res = await this.postAction("/api/chat/interrupt", { agent });
+    // done 会经 SSE 回来解锁；这里乐观收敛
+    if (res.ok)
+      this.produce((s) => {
+        s.streaming = false;
+        s.awaitingChunk = false;
+      });
+    return res;
+  }
+
+  /** 应答权限 / session-idle 卡（action 见 bridge PERM_KEY_SEQ）。 */
+  public async resolvePermission(
+    action: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    const agent = this.state.activeAgent;
+    if (!agent) return { ok: false, error: "无活动会话" };
+    // 乐观清卡（bridge 也会经 SSE 推 permission-cleared）
+    this.produce((s) => {
+      s.pendingPermission = null;
+    });
+    return this.postAction("/api/chat/permission", { agent, action });
+  }
+
+  /** 提交 AskUserQuestion 选择。selections[i]=第 i 题选中的 option index 数组。 */
+  public async submitAsk(
+    selections: number[][]
+  ): Promise<{ ok: boolean; error?: string }> {
+    const agent = this.state.activeAgent;
+    if (!agent) return { ok: false, error: "无活动会话" };
+    this.produce((s) => {
+      s.pendingAsk = null;
+    });
+    return this.postAction("/api/chat/auq", {
+      agent,
+      action: "submit",
+      selections,
+    });
+  }
+
+  /** 取消 AskUserQuestion（给 agent 发 Esc）。 */
+  public async cancelAsk(): Promise<{ ok: boolean; error?: string }> {
+    const agent = this.state.activeAgent;
+    if (!agent) return { ok: false, error: "无活动会话" };
+    this.produce((s) => {
+      s.pendingAsk = null;
+    });
+    return this.postAction("/api/chat/auq", { agent, action: "cancel" });
   }
 }
 

@@ -2,6 +2,8 @@
 import { useEffect, useRef } from "react";
 import { useChatStore } from "../chat-store";
 import type { ChatMessage, ToolCallView } from "../type";
+import { PermissionCard } from "./permission-card";
+import { AskQuestionCard } from "./ask-question-card";
 
 function ToolCard({ tool }: { tool: ToolCallView }) {
   const icon =
@@ -42,11 +44,13 @@ export function MessageList() {
   const awaiting = useChatStore((s) => s.state.awaitingChunk);
   const loadingHistory = useChatStore((s) => s.state.loadingHistory);
   const active = useChatStore((s) => s.state.activeAgent);
+  const pendingPermission = useChatStore((s) => s.state.pendingPermission);
+  const pendingAsk = useChatStore((s) => s.state.pendingAsk);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, awaiting]);
+  }, [messages, awaiting, pendingPermission, pendingAsk]);
 
   if (!active) {
     return (
@@ -74,6 +78,8 @@ export function MessageList() {
         {messages.map((m) => (
           <Bubble key={m.id} m={m} />
         ))}
+        {pendingPermission && <PermissionCard p={pendingPermission} />}
+        {pendingAsk && <AskQuestionCard a={pendingAsk} />}
         {awaiting && (
           <div className="chat chat-start">
             <div className="chat-bubble bg-base-200">
