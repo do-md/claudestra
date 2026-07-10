@@ -4,8 +4,9 @@
  * 对应架构文档 §3：v1 复用 jsonl-watcher 的「段级」摘要流，而非 claude-os 的 token 级
  * Anthropic stream_event。因此事件比 claude-os 精简：工具摘要、助手文本段、回复、收尾。
  *
- * Bridge 侧 GET /web/stream 会以 SSE `data: <json>\n\n` 逐条下发这些事件；
- * mock 阶段由 lib/chat/mock-bridge.ts 产生同样形状的事件，前端消费代码保持一致。
+ * 2026-07-10 迁移后：BFF 的 /api/chat/stream 订阅 Bridge /api/v1/events
+ * （upstream event-bus SSE），并把 BridgeEvent 翻译成这里的 WebStreamEvent
+ * 逐条下发（`data: <json>\n\n`）——前端协议 v1 不变，消费代码零改动。
  */
 /** 权限/AUQ 卡的一个操作按钮（回传时 action 让 bridge 打对应 tmux 键序列）。 */
 export interface WebPermAction {

@@ -29,7 +29,7 @@ interface ChatState {
 
 /**
  * Chat 中枢：agent 会话列表 + 当前会话消息 + 段级流式收发。
- * 数据源是 Bridge（v1 经 mock-bridge），前端消费模式沿用 claude-os：
+ * 数据源是 Bridge（/api/v1 + /events，BFF 翻译），前端消费模式沿用 claude-os：
  * 每个 agent 一条持久 SSE 流；send 只 fire-and-forget 注入，输出经该流回来。
  * streamGen 代际门控：切走 agent 时自增令旧流回调失效，不污染新视图。
  */

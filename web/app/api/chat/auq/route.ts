@@ -1,18 +1,13 @@
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
-import {
-  resolveChannelId,
-  getMasterInfo,
-  MASTER_AGENT_NAME,
-} from "@/lib/chat/agents";
+import { apiAgentName, bridgePost } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
 
-const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
-
 /**
- * 应答 AskUserQuestion 卡：submit(selections[][]) 或 cancel。转发给 Bridge，
- * Bridge 用 buildAuqKeystrokes 把选择翻译成 tmux 键序列（Down/Enter/Right/…）发给 agent TUI。
+ * 应答 AskUserQuestion 卡：submit(selections[][]) 或 cancel。
+ * 代理 Bridge POST /api/v1/agents/:name/answer {kind:"auq"}（fork additive 端点），
+ * Bridge 用 buildAuqKeystrokes 把选择翻译成 tmux 键序列发给 agent TUI。
  */
 export async function POST(request: Request) {
   if (!(await isAuthed(request))) {
@@ -22,36 +17,20 @@ export async function POST(request: Request) {
   if (!agent || (action !== "submit" && action !== "cancel")) {
     return NextResponse.json({ error: "agent/action 非法" }, { status: 400 });
   }
-
-  const channelId =
-    agent === MASTER_AGENT_NAME
-      ? (await getMasterInfo())?.channelId ?? null
-      : resolveChannelId(agent);
-  if (!channelId) {
-    return NextResponse.json({ ok: true, mock: true });
-  }
-
   try {
-    const res = await fetch(`${BRIDGE}/web/auq`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        channelId,
+    const result = await bridgePost<{ ok: boolean; keys?: number; cancelled?: boolean }>(
+      `/agents/${encodeURIComponent(apiAgentName(agent))}/answer`,
+      {
+        kind: "auq",
         action,
         selections: Array.isArray(selections) ? selections : [],
-      }),
-    });
-    const json = await res.json().catch(() => ({}));
-    if (!res.ok || json.ok === false) {
-      return NextResponse.json(
-        { ok: false, error: json.error || "AskUserQuestion 应答失败" },
-        { status: 502 }
-      );
-    }
-    return NextResponse.json({ ok: true, summary: json.summary });
+      },
+      { timeoutMs: 15_000 }
+    );
+    return NextResponse.json({ ...result, ok: true });
   } catch (e) {
     return NextResponse.json(
-      { ok: false, error: `Bridge 不可达: ${(e as Error).message}` },
+      { ok: false, error: `AskUserQuestion 应答失败: ${(e as Error).message}` },
       { status: 502 }
     );
   }

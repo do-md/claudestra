@@ -1,16 +1,13 @@
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
-import { mockBridge } from "@/lib/chat/mock-bridge";
-import { resolveChannelId, getMasterInfo, MASTER_AGENT_NAME } from "@/lib/chat/agents";
+import { apiAgentName, bridgePost } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
 
-const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
-
 /**
- * 把用户消息投给指定 agent（fire-and-forget）。
- * 真实 agent（registry 有 channelId）→ POST Bridge /web/inject。
- * mock agent（无 channelId）→ 触发 mock-bridge 模拟回复（后端未起时的开发体验）。
+ * 把用户消息投给指定 agent（fire-and-forget，wait=0）。
+ * 代理 Bridge POST /api/v1/agents/:name/messages；输出经 /api/chat/stream 的
+ * SSE（/api/v1/events 翻译）回来。agent 离线时 Bridge 返 409。
  */
 export async function POST(request: Request) {
   if (!(await isAuthed(request))) {
@@ -21,30 +18,17 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "agent 和 text 不能为空" }, { status: 400 });
   }
 
-  // 大总管：channelId 从 Bridge /web/master 取（不在 registry）
-  const channelId =
-    agent === MASTER_AGENT_NAME
-      ? (await getMasterInfo())?.channelId ?? null
-      : resolveChannelId(agent);
-  if (channelId) {
-    // 真实 Bridge 路径
-    try {
-      const res = await fetch(`${BRIDGE}/web/inject`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channelId, text: text.trim() }),
-      });
-      if (!res.ok) {
-        const err = await res.text().catch(() => "");
-        return NextResponse.json({ error: `Bridge inject 失败: ${err}` }, { status: 502 });
-      }
-      return NextResponse.json({ data: { ok: true } });
-    } catch (e) {
-      return NextResponse.json({ error: `Bridge 不可达: ${(e as Error).message}` }, { status: 502 });
-    }
+  try {
+    await bridgePost(
+      `/agents/${encodeURIComponent(apiAgentName(agent))}/messages`,
+      { text: text.trim(), wait: 0 },
+      { timeoutMs: 15_000 }
+    );
+    return NextResponse.json({ data: { ok: true } });
+  } catch (e) {
+    return NextResponse.json(
+      { error: `发送失败: ${(e as Error).message}` },
+      { status: 502 }
+    );
   }
-
-  // mock 回退（无真实会话时）
-  mockBridge.simulateAgentReply(agent, text.trim());
-  return NextResponse.json({ data: { ok: true } });
 }

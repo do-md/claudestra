@@ -1,11 +1,8 @@
 export const runtime = "nodejs";
 
-import { mockBridge } from "@/lib/chat/mock-bridge";
-import { SSE_DONE, type WebStreamEvent } from "@/lib/chat/events";
-import { resolveChannelId, getMasterInfo, MASTER_AGENT_NAME } from "@/lib/chat/agents";
+import { SSE_DONE, type WebStreamEvent, type WebAuqQuestion } from "@/lib/chat/events";
+import { apiAgentName, bridgeGet, bridgeAuthHeaders, BRIDGE } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
-
-const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -15,9 +12,74 @@ const SSE_HEADERS = {
 
 /**
  * 某 agent 的持久输出流（SSE）。
- * 真实 agent（有 channelId）→ 代理 Bridge /web/stream。
- * mock agent → 订阅 mock-bridge（后端未起时的开发体验）。
+ *
+ * 2026-07-10 迁移：旧 /web/stream（web-hub tee）→ upstream 的 /api/v1/events
+ * （event-bus SSE）。BFF 在 server 端带 Bearer 订阅（绕开 EventSource 不能带
+ * header 的坑），按 agent 过滤 + 把 BridgeEvent 翻译成前端的 WebStreamEvent
+ * （协议 v1 不变，前端 stream.ts / chat-store 零改动）。
+ *
+ * 事件映射：
+ *   agent_status thinking → {t:"status",status:"running"}；done → {t:"done"}
+ *   tool_start            → {t:"tool", state:"running"}（tool_done 不重复推卡）
+ *   assistant_text        → {t:"text"}
+ *   chat_message(out)     → {t:"text"}（reply() 的最终回复，watcher 不重复流它）
+ *   question              → {t:"ask"}；question_cleared → {t:"ask-cleared"}（fork 事件）
+ *   auto_deny             → {t:"text", "🚫 …"}
+ *   其余（turn_duration / bg_task_* / session_anomaly）v1 暂不消费
+ *
+ * 连流后先补拉 GET /api/v1/agents/:name/pending —— question 事件可能发生在
+ * 订阅之前（切会话/刷新/回前台），对应旧 web-hub 的 pendingInteraction replay。
  */
+
+interface BridgeEvent {
+  seq: number;
+  ts: string;
+  agent: string;
+  chatId: string;
+  type: string;
+  data: Record<string, unknown>;
+}
+
+function mapAuqQuestions(raw: unknown): WebAuqQuestion[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((q) => ({
+    question: String(q?.question ?? ""),
+    header: String(q?.header ?? ""),
+    multiSelect: !!q?.multiSelect,
+    options: Array.isArray(q?.options)
+      ? q.options.map((o: { label?: string; description?: string }) => ({
+          label: String(o?.label ?? ""),
+          description: o?.description ? String(o.description) : undefined,
+        }))
+      : [],
+  }));
+}
+
+/** BridgeEvent → WebStreamEvent（null = 该事件 v1 不消费）。 */
+function translate(evt: BridgeEvent): WebStreamEvent | null {
+  const d = evt.data || {};
+  switch (evt.type) {
+    case "agent_status":
+      return d.status === "done" ? { t: "done" } : { t: "status", status: "running" };
+    case "tool_start":
+      return { t: "tool", name: String(d.name ?? "?"), summary: String(d.summary ?? ""), state: "running" };
+    case "assistant_text":
+      return { t: "text", text: String(d.text ?? "") };
+    case "chat_message":
+      // direction=in 是自己发出去的消息回声；out 才是 agent 的回复
+      if (d.direction !== "out") return null;
+      return { t: "text", text: String(d.text ?? "") };
+    case "question":
+      return { t: "ask", id: `auq-${evt.seq}`, questions: mapAuqQuestions(d.questions) };
+    case "question_cleared":
+      return { t: "ask-cleared" };
+    case "auto_deny":
+      return { t: "text", text: `🚫 一个操作被 auto 模式拦下${d.reason ? `：${String(d.reason)}` : ""}` };
+    default:
+      return null;
+  }
+}
+
 export async function GET(request: Request) {
   if (!(await isAuthed(request))) {
     return new Response("未登录", { status: 401 });
@@ -25,56 +87,95 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const agent = url.searchParams.get("agent");
   if (!agent) return new Response("missing agent", { status: 400 });
+  const apiName = apiAgentName(agent);
+  // 事件里的 agent 字段是 registry 名（agent-xxx）或 "master"
+  const nameVariants = new Set([apiName, `agent-${apiName}`]);
 
-  const channelId =
-    agent === MASTER_AGENT_NAME
-      ? (await getMasterInfo())?.channelId ?? null
-      : resolveChannelId(agent);
-  if (channelId) {
-    // 真实 Bridge：透传其 SSE 流（事件格式一致）
-    try {
-      const upstream = await fetch(
-        `${BRIDGE}/web/stream?channelId=${encodeURIComponent(channelId)}`,
-        { signal: request.signal }
-      );
-      if (!upstream.ok || !upstream.body) {
-        return new Response("Bridge stream 不可用", { status: 502 });
-      }
-      return new Response(upstream.body, { headers: SSE_HEADERS });
-    } catch (e) {
-      return new Response(`Bridge 不可达: ${(e as Error).message}`, { status: 502 });
-    }
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${BRIDGE}/api/v1/events`, {
+      headers: { ...bridgeAuthHeaders(), Accept: "text/event-stream" },
+      signal: request.signal,
+    });
+  } catch (e) {
+    return new Response(`Bridge 不可达: ${(e as Error).message}`, { status: 502 });
   }
+  if (!upstream.ok || !upstream.body) {
+    return new Response("Bridge events 不可用", { status: 502 });
+  }
+  const upstreamBody = upstream.body;
 
-  // mock 回退
   const encoder = new TextEncoder();
-  let unsubscribe: (() => void) | null = null;
+  const decoder = new TextDecoder();
   let heartbeat: ReturnType<typeof setInterval> | null = null;
 
   const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const send = (payload: string) => {
+    async start(controller) {
+      const send = (evt: WebStreamEvent | typeof SSE_DONE) => {
         try {
+          const payload = evt === SSE_DONE ? SSE_DONE : JSON.stringify(evt);
           controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
         } catch {
           /* 已关闭 */
         }
       };
-      send(JSON.stringify({ t: "status", status: "running" } satisfies WebStreamEvent));
-      unsubscribe = mockBridge.subscribe(agent, (event) => send(JSON.stringify(event)));
-      heartbeat = setInterval(() => send(SSE_DONE), 30000);
-      request.signal.addEventListener("abort", () => {
-        unsubscribe?.();
+      heartbeat = setInterval(() => send(SSE_DONE), 30_000);
+
+      // 挂起交互补拉（question 事件可能早于本次订阅）
+      try {
+        const pending = await bridgeGet<{
+          ok: boolean;
+          question: { questions: unknown; ts: number } | null;
+        }>(`/agents/${encodeURIComponent(apiName)}/pending`, { timeoutMs: 5000 });
+        if (pending.question) {
+          send({
+            t: "ask",
+            id: `auq-pending-${pending.question.ts}`,
+            questions: mapAuqQuestions(pending.question.questions),
+          });
+        }
+      } catch {
+        /* pending 补拉失败不阻塞流 */
+      }
+
+      const reader = upstreamBody.getReader();
+      let buffer = "";
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
+          for (const frame of frames) {
+            const dataLines = frame
+              .split("\n")
+              .filter((l) => l.startsWith("data:"))
+              .map((l) => l.slice(5).trimStart());
+            if (dataLines.length === 0) continue;
+            let evt: BridgeEvent;
+            try {
+              evt = JSON.parse(dataLines.join("\n")) as BridgeEvent;
+            } catch {
+              continue; // 心跳/坏帧
+            }
+            if (!nameVariants.has(evt.agent)) continue;
+            const mapped = translate(evt);
+            if (mapped) send(mapped);
+          }
+        }
+      } catch {
+        /* 上游断开（bridge 重启等）→ 结束本流，前端重连 */
+      } finally {
         if (heartbeat) clearInterval(heartbeat);
         try {
           controller.close();
         } catch {
           /* already closed */
         }
-      });
+      }
     },
     cancel() {
-      unsubscribe?.();
       if (heartbeat) clearInterval(heartbeat);
     },
   });

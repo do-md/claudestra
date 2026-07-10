@@ -2415,6 +2415,18 @@ async function cmdTokenAdd(name: string, agentsCsv: string, force: boolean, noMi
       warnings.push(`"*" scope：所有普通 agent 都对此 token 可见`);
       continue;
     }
+    // [fork] "master" 是特殊 scope 值（大总管不在 registry）：显式列出 + --force 才放行
+    if (a === "master") {
+      if (!force) {
+        output({
+          ok: false,
+          error: `--agents 含 "master" 会把大总管开放给这个 token（上下文最敏感，R1）。确认请加 --force。`,
+        });
+        return;
+      }
+      warnings.push(`"master" scope：大总管对此 token 可见`);
+      continue;
+    }
     const info = reg.agents[a] || reg.agents[`agent-${a}`];
     if (!info) {
       output({ ok: false, error: `agent "${a}" 不存在（registry 里没有 ${a} / agent-${a}）` });

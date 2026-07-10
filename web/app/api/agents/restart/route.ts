@@ -1,11 +1,10 @@
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
+import { bridgePost } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
 
-const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
-
-/** restart agent：代理 Bridge POST /web/agents/restart（内部 runManager restart）。 */
+/** restart agent：代理 Bridge POST /api/v1/agents/:name/restart（fork additive 端点）。 */
 export async function POST(request: Request) {
   if (!(await isAuthed(request))) {
     return NextResponse.json({ error: "未登录" }, { status: 401 });
@@ -15,16 +14,15 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "name 不能为空" }, { status: 400 });
   }
   try {
-    const res = await fetch(`${BRIDGE}/web/agents/restart`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name.trim() }),
-    });
-    const result = await res.json().catch(() => ({ ok: false, error: "Bridge 返回非 JSON" }));
-    return NextResponse.json(result, { status: res.ok ? 200 : res.status });
+    const result = await bridgePost(
+      `/agents/${encodeURIComponent(name.trim())}/restart`,
+      {},
+      { timeoutMs: 90_000 }
+    );
+    return NextResponse.json(result);
   } catch (e) {
     return NextResponse.json(
-      { ok: false, error: `Bridge 不可达: ${(e as Error).message}` },
+      { ok: false, error: (e as Error).message },
       { status: 502 }
     );
   }

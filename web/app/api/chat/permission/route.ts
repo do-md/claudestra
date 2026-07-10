@@ -1,16 +1,27 @@
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
-import { resolveChannelId } from "@/lib/chat/agents";
+import { apiAgentName, bridgePost } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
 
-const BRIDGE = process.env.BRIDGE_HTTP_URL || "http://localhost:3847";
-
 /**
- * 应答权限 / session-idle 卡：把 action（perm_allow / session_full / …）转发给 Bridge，
- * Bridge 翻译成 tmux 键序列打给 agent 的 Claude Code TUI。
- * 权限弹窗只出现在真实 agent 上（大总管不被 permission-watcher 轮询），故不特判 master。
+ * 应答权限卡：代理 Bridge POST /api/v1/agents/:name/answer {kind:"permission"}
+ * （fork additive 端点；发键前 Bridge 会 tmuxCapture 重验弹窗在场）。
+ *
+ * 注意：迁移到 upstream 架构后，权限弹窗的「事件下行」暂缺（upstream 的
+ * permission-watcher 只面向 Discord，web-only 模式未启用）——权限卡不会自动
+ * 弹出。本路由保留上行能力；agent 默认 bypassPermissions，此卡本就罕见。
+ * session-idle 弹窗应答暂不支持（旧 /web/permission 能力，upstream 无对应）。
  */
+const ACTION_MAP: Record<string, string> = {
+  perm_allow: "allow",
+  perm_allow_session: "allow_session",
+  perm_deny: "deny",
+  allow: "allow",
+  allow_session: "allow_session",
+  deny: "deny",
+};
+
 export async function POST(request: Request) {
   if (!(await isAuthed(request))) {
     return NextResponse.json({ error: "未登录" }, { status: 401 });
@@ -19,29 +30,23 @@ export async function POST(request: Request) {
   if (!agent || !action) {
     return NextResponse.json({ error: "agent 和 action 不能为空" }, { status: 400 });
   }
-
-  const channelId = resolveChannelId(agent);
-  if (!channelId) {
-    return NextResponse.json({ ok: true, mock: true });
+  const mapped = ACTION_MAP[String(action)];
+  if (!mapped) {
+    return NextResponse.json(
+      { ok: false, error: `不支持的 action: ${action}（session-idle 应答已随迁移移除）` },
+      { status: 501 }
+    );
   }
-
   try {
-    const res = await fetch(`${BRIDGE}/web/permission`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channelId, action }),
-    });
-    const json = await res.json().catch(() => ({}));
-    if (!res.ok || json.ok === false) {
-      return NextResponse.json(
-        { ok: false, error: json.error || "应答失败" },
-        { status: 502 }
-      );
-    }
-    return NextResponse.json({ ok: true, dialogClosed: json.dialogClosed });
+    const result = await bridgePost<{ ok: boolean }>(
+      `/agents/${encodeURIComponent(apiAgentName(agent))}/answer`,
+      { kind: "permission", action: mapped },
+      { timeoutMs: 15_000 }
+    );
+    return NextResponse.json({ ...result, ok: true });
   } catch (e) {
     return NextResponse.json(
-      { ok: false, error: `Bridge 不可达: ${(e as Error).message}` },
+      { ok: false, error: `应答失败: ${(e as Error).message}` },
       { status: 502 }
     );
   }
