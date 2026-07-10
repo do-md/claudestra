@@ -26,6 +26,7 @@ import { existsSync } from "fs";
 import { readdir, stat } from "fs/promises";
 import { join, basename } from "path";
 import { projectsSlug, projectJsonlPath } from "../lib/jsonl-cost.js";
+import { readActiveAgents } from "../lib/registry.js";
 import { adapterFor, type ChatAdapter } from "./adapters.js";
 import { parseChatId } from "./router.js";
 import { emitEvent } from "./event-bus.js";
@@ -43,6 +44,9 @@ export type BgActivityKind = "subagent" | "shell";
 
 interface Activity {
   key: string; // 全局唯一（文件路径）
+  /** 对外稳定 id（文件 basename 去后缀：subagent = "agent-xxx"，shell = taskId）——
+   *  SSE 事件用它做关联键，不外泄服务器绝对路径 */
+  id: string;
   kind: BgActivityKind;
   agentName: string;
   ownerChatId: string;
@@ -116,22 +120,10 @@ async function isRealBgTask(agent: AgentLite, taskId: string): Promise<boolean> 
   }
 }
 
-async function readRegistryAgents(): Promise<AgentLite[]> {
-  const p = `${process.env.HOME}/.claude-orchestrator/registry.json`;
-  if (!existsSync(p)) return [];
-  try {
-    const reg = (await Bun.file(p).json()) as { agents?: Record<string, any> };
-    return Object.entries(reg.agents || {})
-      .filter(([, a]) => a?.status === "active" && a?.channelId && a?.sessionId && (a?.cwd || a?.dir))
-      .map(([name, a]) => ({
-        name,
-        channelId: String(a.channelId),
-        cwd: String(a.cwd || a.dir),
-        sessionId: String(a.sessionId),
-      }));
-  } catch {
-    return [];
-  }
+async function watchableAgents(): Promise<AgentLite[]> {
+  return (await readActiveAgents())
+    .filter((a) => a.channelId && a.sessionId && a.cwd)
+    .map((a) => ({ name: a.name, channelId: a.channelId!, cwd: a.cwd!, sessionId: a.sessionId! }));
 }
 
 // ── 活动生命周期 ───────────────────────────────────────────────────────
@@ -169,6 +161,7 @@ async function startActivity(
 
   const act: Activity = {
     key: filePath,
+    id: basename(filePath).replace(/\.(jsonl|output)$/, ""),
     kind,
     agentName: agent.name,
     ownerChatId: agent.channelId,
@@ -190,7 +183,7 @@ async function startActivity(
     agent: agent.name,
     chatId: agent.channelId,
     type: "bg_task_started",
-    data: { kind, file: filePath, threadId, title },
+    data: { kind, id: act.id, threadId, title },
   });
 }
 
@@ -253,7 +246,7 @@ async function flush(act: Activity): Promise<void> {
     agent: act.agentName,
     chatId: act.ownerChatId,
     type: "bg_task_update",
-    data: { kind: act.kind, file: act.filePath, lines: lines.length, threadId: act.threadId },
+    data: { kind: act.kind, id: act.id, lines: lines.length, threadId: act.threadId },
   });
   if (!act.threadId || !act.adapter) return;
 
@@ -283,7 +276,7 @@ async function finalize(act: Activity, reason = "结束"): Promise<void> {
     agent: act.agentName,
     chatId: act.ownerChatId,
     type: "bg_task_completed",
-    data: { kind: act.kind, file: act.filePath, threadId: act.threadId, durationMs: Date.now() - act.startedAt },
+    data: { kind: act.kind, id: act.id, threadId: act.threadId, durationMs: Date.now() - act.startedAt },
   });
   if (act.threadId && act.adapter) {
     try {
@@ -308,7 +301,7 @@ async function tick(): Promise<void> {
 }
 
 async function tickInner(): Promise<void> {
-  const agents = await readRegistryAgents();
+  const agents = await watchableAgents();
   const first = !baselined;
   baselined = true;
 

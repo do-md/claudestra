@@ -20,6 +20,7 @@ import { existsSync } from "fs";
 import { readFile, readdir } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
+import { readRegistryAgents } from "../lib/registry.js";
 
 // ============================================================
 // 类型
@@ -227,26 +228,11 @@ export async function readJobStates(jobsDir = DEFAULT_JOBS_DIR): Promise<Map<str
   return map;
 }
 
-/** registry.json → RegistryAgentLite[]（读失败返回空数组） */
+/** registry.json → RegistryAgentLite[]（读失败返回空数组）。v2.9+ 委托 lib/registry 单点解析。 */
 export async function readRegistryLite(registryPath = DEFAULT_REGISTRY): Promise<RegistryAgentLite[]> {
-  try {
-    const data = JSON.parse(await readFile(registryPath, "utf-8"));
-    const agents = data?.agents;
-    if (!agents || typeof agents !== "object") return [];
-    return Object.entries(agents).map(([name, v]) => {
-      const a = v as Record<string, unknown>;
-      return {
-        name,
-        sessionId: typeof a.sessionId === "string" ? a.sessionId : undefined,
-        cwd: typeof a.cwd === "string" ? a.cwd : undefined,
-        status: typeof a.status === "string" ? a.status : undefined,
-        channelId: typeof a.channelId === "string" ? a.channelId : undefined,
-        displayName: typeof a.displayName === "string" ? a.displayName : undefined,
-      };
-    });
-  } catch {
-    return [];
-  }
+  return (await readRegistryAgents(registryPath)).map(({ name, sessionId, cwd, status, channelId, displayName }) => ({
+    name, sessionId, cwd, status, channelId, displayName,
+  }));
 }
 
 /**

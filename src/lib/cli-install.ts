@@ -35,6 +35,7 @@ import { existsSync } from "fs";
 import { homedir } from "os";
 import { spawnSync } from "child_process";
 import { join, resolve, dirname } from "path";
+import { readActiveAgents } from "./registry.js";
 
 const TMUX_SOCK = "/tmp/claude-orchestrator/master.sock";
 
@@ -443,18 +444,15 @@ async function ensureMcpToolsAllowed(repoRoot: string): Promise<{ added: string[
 
   // 3) project-level：扫所有 Claudestra registry 里 active agent 的 cwd
   //    下的 .mcp.json —— project-level MCP server 都列在那里
-  try {
-    const reg = JSON.parse(await readFile(`${homedir()}/.claude-orchestrator/registry.json`, "utf-8"));
-    for (const info of Object.values(reg?.agents || {}) as any[]) {
-      if (info?.status !== "active" || !info?.cwd) continue;
-      const mcpPath = `${info.cwd}/.mcp.json`;
-      if (!existsSync(mcpPath)) continue;
-      try {
-        const projMcp = JSON.parse(await readFile(mcpPath, "utf-8"));
-        Object.keys(projMcp?.mcpServers || {}).forEach((s) => serverNames.add(s));
-      } catch { /* skip bad json */ }
-    }
-  } catch { /* registry missing */ }
+  for (const info of await readActiveAgents()) {
+    if (!info.cwd) continue;
+    const mcpPath = `${info.cwd}/.mcp.json`;
+    if (!existsSync(mcpPath)) continue;
+    try {
+      const projMcp = JSON.parse(await readFile(mcpPath, "utf-8"));
+      Object.keys(projMcp?.mcpServers || {}).forEach((s) => serverNames.add(s));
+    } catch { /* skip bad json */ }
+  }
 
   // 4) 最起码确保 claudestra 本身在（即使上面都没找到，比如全新装机）
   let mcpName = process.env.MCP_NAME || "";

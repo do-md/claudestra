@@ -58,6 +58,7 @@ import { collectSessions } from "./bridge/sessions-inventory.js";
 import { cleanupBgJob } from "./lib/bg-jobs.js";
 import { startSessionReconciler } from "./bridge/session-reconciler.js";
 import { startBgActivityWatcher } from "./bridge/bg-activity-watcher.js";
+import { startArchiveSweeper } from "./bridge/archive-sweeper.js";
 // v2.6.0+ HTTP API 身份与授权（设计 §3.4 / §5）
 import {
   readPrincipals,
@@ -1053,6 +1054,9 @@ discord.once("ready", async () => {
 
   // v2.8+ bg 活动追踪 — subagent / 后台 shell 任务 → 子区流式呈现 + bg_task_* 事件
   startBgActivityWatcher();
+
+  // v2.9+ 归档每日兜底 — 退役归档之外，每 24h 对 active agent 补快照（幂等）
+  startArchiveSweeper();
   recordMetric("bridge_start", { meta: { channels: clients.size } });
 
   // 每 30 分钟自动重扫 skill（新装 plugin / 新建 user skill 不需要 restart bridge 就能出现在 /）

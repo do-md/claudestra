@@ -23,6 +23,7 @@ import {
 import { existsSync } from "fs";
 import { tmuxRaw, MASTER_SESSION } from "../lib/tmux-helper.js";
 import { readConfig, setStatsDashboard } from "../lib/config-store.js";
+import { readRegistryAgents } from "../lib/registry.js";
 import { discordCreateChannel } from "./discord-api.js";
 import {
   computeAgentStats,
@@ -213,14 +214,7 @@ async function getAccountUsage(): Promise<AccountUsage | null> {
 // ── 快照组装 ───────────────────────────────────────────────────────────
 
 async function listAgents(): Promise<AgentLike[]> {
-  const p = `${process.env.HOME}/.claude-orchestrator/registry.json`;
-  if (!existsSync(p)) return [];
-  try {
-    const reg = (await Bun.file(p).json()) as { agents?: Record<string, any> };
-    return Object.entries(reg.agents || {}).map(([name, v]) => ({ name, ...(v as object) }));
-  } catch {
-    return [];
-  }
+  return readRegistryAgents(); // RegistryAgent 是 AgentLike 超集（cwd 已归一含 dir 兼容）
 }
 
 export async function buildSnapshot(): Promise<StatsSnapshot> {
