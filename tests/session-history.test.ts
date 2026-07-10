@@ -12,6 +12,7 @@ import {
   listSubagentFiles,
   isValidSessionId,
   isValidSubagentId,
+  unwrapChannelMessage,
 } from "../src/lib/session-history.js";
 
 const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -43,6 +44,55 @@ const SAMPLE = [
   { type: "user", isCompactSummary: true, timestamp: "2026-07-01T00:04:01Z", message: { content: [{ type: "text", text: "压缩摘要全文" }] } },
   { type: "user", timestamp: "2026-07-01T00:05:00Z", message: { content: "第二条用户消息" } },
 ];
+
+// [fork] channel 入站消息解包（web/API/Discord 用户消息在 jsonl 里是 isMeta + <channel> 包装）
+describe("unwrapChannelMessage", () => {
+  const wrap = (attrs: string, body: string) => `<channel ${attrs}>\n${body}\n</channel>`;
+
+  test("API 用户消息：剥 wrapper + [🌐 …] header，提取 user 属性", () => {
+    const raw = wrap(
+      'source="claudestra" chat_id="api:tok_x" user="web-ui" user_id="api:tok_x" api="true"',
+      "[🌐 来自 API 用户「web-ui」（外部 token 接入，非 Discord）。\n直接用 reply() 回答到本 chat_id 即可；对方看不到本频道历史。]\n\n帮我修一下渲染"
+    );
+    expect(unwrapChannelMessage(raw)).toEqual({ text: "帮我修一下渲染", from: "web-ui" });
+  });
+
+  test("agent↔agent：剥 [🤖 …] header（header 内含 ] 不截断正文）", () => {
+    const raw = wrap(
+      'source="claudestra" chat_id="local-x" user="cstra-dev"',
+      "[🤖 来自 master 的 inbound 消息（非 FYI）。\n判断一下：[DIRECT] 标记的要处理。]\n\n请检查 [这个] 模块"
+    );
+    expect(unwrapChannelMessage(raw)).toEqual({ text: "请检查 [这个] 模块", from: "cstra-dev" });
+  });
+
+  test("无 header 的 channel 消息原样保留（以 [ 开头的真实输入不误伤）", () => {
+    const raw = wrap('chat_id="discord:123" user="tao"', "[临时] 看下这个报错");
+    expect(unwrapChannelMessage(raw)).toEqual({ text: "[临时] 看下这个报错", from: "tao" });
+  });
+
+  test("非 channel 包装（caveat 等真 meta）返回 null", () => {
+    expect(unwrapChannelMessage("Caveat: the messages below were generated…")).toBeNull();
+    expect(unwrapChannelMessage("<local-command-stdout>ok</local-command-stdout>")).toBeNull();
+  });
+
+  test("readSessionHistory：channel 包装的 isMeta user 进历史，caveat meta 照旧过滤", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hist-"));
+    const p = writeJsonl(dir, `${SID}.jsonl`, [
+      { type: "user", isMeta: true, timestamp: "2026-07-01T00:00:00Z", message: { content: "caveat 元信息" } },
+      {
+        type: "user",
+        isMeta: true,
+        timestamp: "2026-07-01T00:01:00Z",
+        message: { content: '<channel source="claudestra" chat_id="api:tok_x" user="web-ui">\n[🌐 来自 API 用户「web-ui」（外部 token 接入，非 Discord）。\n直接 reply() 即可。]\n\n你好呀\n</channel>' },
+      },
+      { type: "assistant", timestamp: "2026-07-01T00:02:00Z", message: { content: [{ type: "text", text: "你好" }] } },
+    ]);
+    const page = await readSessionHistory(p);
+    expect(page.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(page.messages[0].text).toBe("你好呀");
+    expect(page.messages[0].from).toBe("web-ui");
+  });
+});
 
 describe("readSessionHistory", () => {
   test("解析：过滤 meta/tool_result，保留 user/assistant/compact 边界与摘要", async () => {

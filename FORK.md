@@ -43,6 +43,14 @@
   （web-only / post 失败时 answer 端点仍有状态可用）；jsonl-watcher 调用点先注册后渲染
 
 ### 修复（应上报 upstream）
+- **历史 API 丢所有 channel 用户消息**（lib/session-history.ts）：channel 送达的
+  入站消息（web/API/Discord/agent↔agent）在 CC jsonl 里是 `isMeta:true` +
+  `<channel …>` 包装的 user 记录，被 `isMeta` 一刀切过滤 → 任何 web 前端的历史
+  里都没有用户消息，回合结构随之丢失（连续 assistant 粘连）。修复：新增
+  `unwrapChannelMessage`（剥 wrapper + `[🌐/🤖 …]` framing header、提取 `user`
+  属性为 `from` 字段），isMeta 分支先尝试解包再过滤；`HistoryMessage` 增
+  `from?: string`（additive）。测试：tests/session-history.test.ts
+  `unwrapChannelMessage` describe 块。
 - **/events SSE 空闲断流**（bridge.ts handleEventsRequest）：Bun.serve 默认 HTTP
   idleTimeout≈10s，upstream 的 30s ping 活不到第一轮，事件间隙 >10s 的订阅者被静默
   掐掉（实测 10.7s close）。修复：连接即发 `: connected` + ping 5s。
