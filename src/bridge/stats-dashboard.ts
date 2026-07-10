@@ -233,31 +233,22 @@ function fmtResets(s: string): string {
 }
 
 /**
- * session（5h 窗口）reset 时间的合理性修正：reset 必落在抓取时刻的 (t, t+5h]。
- * Claude Code 2.1.204 的 /status 面板偶发 am/pm 反转（2026-07-10 实测：JST 下午
- * 14:38 抓到 "Resets 5am"，真实 reset 是 17:00 = 5pm）。原值不合理而 am/pm 翻转
- * 值恰好落进窗口 → 采信翻转值；解析不了或翻转也不合理 → 原样返回，不瞎猜。
- * 假设：本机时区 = 面板时区（Claude Code 用的就是本机时区，恒成立）。
- * 只用于 5h session；周 reset 带日期无窗口约束，无从校验。
+ * 5h reset 时间是否可疑：reset 必落在抓取时刻的 5h 内，超出 = 上游 /status
+ * 面板显示有误（Claude Code 2.1.204 实测过把 5pm 印成 5am）。只标记、不纠正 ——
+ * 单一观测样本推不出错误形态，自动"翻转 am/pm"这类猜测可能把错值改成另一个
+ * 错值还让用户无从发现；显示原文至少和用户自己跑 /status 看到的一致。
+ * 周 reset 带日期无窗口约束，无从校验。
  */
-export function fixSessionAmPm(s: string, scrapedAt: number): string {
+export function sessionResetSuspect(s: string, scrapedAt: number): boolean {
   const m = s.match(/^(\d{1,2})(?::(\d{2}))?(am|pm)\b/i);
-  if (!m) return s;
-  const h12 = parseInt(m[1], 10) % 12; // 12am→0 点、12pm→12 点
-  const min = m[2] ? parseInt(m[2], 10) : 0;
-  const nextOccurrence = (hour24: number): number => {
-    const d = new Date(scrapedAt);
-    d.setHours(hour24, min, 0, 0);
-    if (d.getTime() <= scrapedAt) d.setDate(d.getDate() + 1);
-    return d.getTime();
-  };
-  const within5h = (t: number) => t - scrapedAt <= 5 * 3_600_000;
-  const isPm = m[3].toLowerCase() === "pm";
-  if (within5h(nextOccurrence(isPm ? h12 + 12 : h12))) return s;
-  if (within5h(nextOccurrence(isPm ? h12 : h12 + 12))) {
-    return s.replace(/am|pm/i, isPm ? "am" : "pm");
-  }
-  return s;
+  if (!m) return false;
+  const d = new Date(scrapedAt);
+  d.setHours(
+    (parseInt(m[1], 10) % 12) + (m[3].toLowerCase() === "pm" ? 12 : 0), // 12am→0、12pm→12
+    m[2] ? parseInt(m[2], 10) : 0, 0, 0,
+  );
+  if (d.getTime() <= scrapedAt) d.setDate(d.getDate() + 1);
+  return d.getTime() - scrapedAt > 5 * 3_600_000;
 }
 
 /** 抓取时间 → "刚刚 / N 分钟前 / N 小时前"（用户要能看出 gauge 数据多旧） */
@@ -304,7 +295,7 @@ function renderEmbed(snap: StatsSnapshot): EmbedBuilder {
   let worstLimit: number | null = null;
   if (g && (g.sessionPct != null || g.weekPct != null)) {
     worstLimit = Math.max(g.sessionPct ?? 0, g.weekPct ?? 0);
-    desc.push(`⏱ 5h　${limitDot(g.sessionPct)} ${bar(g.sessionPct, 8)}${g.sessionResets ? "　⟳ " + fmtResets(fixSessionAmPm(g.sessionResets, g.scrapedAt)) : ""}`);
+    desc.push(`⏱ 5h　${limitDot(g.sessionPct)} ${bar(g.sessionPct, 8)}${g.sessionResets ? "　⟳ " + fmtResets(g.sessionResets) + (sessionResetSuspect(g.sessionResets, g.scrapedAt) ? "⚠️" : "") : ""}`);
     desc.push(`📆 周　${limitDot(g.weekPct)} ${bar(g.weekPct, 8)}${g.weekResets ? "　⟳ " + fmtResets(g.weekResets) : ""}`);
     // gauge 数据年龄：embed 的 timestamp 是重渲染时间，账号 % 可能是旧缓存 ——
     // 不标年龄用户会以为一切都是最新的（owner 2026-07-10 报告"刷新不及时"的根源）
