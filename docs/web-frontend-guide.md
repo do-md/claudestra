@@ -1,7 +1,7 @@
 # Claudestra Web 前端接入指南
 
 > 写给接手 Web UI 的开发者。目标：不用读完整个 codebase，就能把一个网页版控制台跑起来。
-> 有问题直接在 Discord 的 #agent-claudestra 频道问（那是一个常驻的 Claude 开发 agent，本文档也是它写的，它对 bridge 侧代码全知）。
+> 有问题让 owner 拉你进他的 Claudestra Discord 服务器，在 #agent-claudestra 频道直接问（那是一个常驻的 Claude 开发 agent，本文档也是它写的，它对 bridge 侧代码全知）。
 
 ## 0. 一句话背景
 
@@ -150,16 +150,29 @@ GET /api/v1/agents/:name/history/:sessionId?limit=100&before=<seq>&subagent=agen
 
 技术栈随意（bridge 不关心）。部署形态建议先做**同机反代同源**（nginx 把 `/` 指向静态文件、`/api`、`/events`、`/stats` 转发 3847），绕开 CORS 和 EventSource 认证两个坑。
 
-## 9. 本地开发环境
+## 9. 本地开发环境（自己起一套完整的）
+
+前置清单：
+
+| 依赖 | 说明 |
+|---|---|
+| macOS / Linux | tmux 依赖，Windows 需 WSL |
+| bun、tmux、pm2 | 运行时三件套 |
+| Claude Code CLI | **登录你自己的 Claude 订阅账号** —— 本地 agent 的对话烧的是你自己的额度，测试时注意用量（`/stats` 里能看到） |
+| 自建 Discord bot + 私人测试服务器 | **硬前置，绕不开**：`manager create` 建 agent 时要通过 bot 建 Discord 频道。建 bot + 拉进自己的测试服约 5 分钟，[SETUP.md](../SETUP.md) 有一步步截图流程 |
 
 ```bash
 git clone https://github.com/shawnlu96/claudestra && cd claudestra
 bun install
-bun run setup        # 交互式配置（需要一个 Discord bot token —— 问 owner 要测试用的）
-pm2 start ecosystem.config.cjs   # 或看 SETUP.md
+bun run setup        # 交互式向导：填 bot token / guild id / 你的 Discord user id
+pm2 start ecosystem.config.cjs
+
+# 造测试数据：建 1-2 个 agent（随便指个目录），聊几句就有历史/事件了
+bun src/manager.ts create web-test ~/tmp/web-test "web UI 测试用"
+bun src/manager.ts token-add web-dev --agents '*'
 ```
 
-没有完整环境也能开发大部分 UI：让 owner 给你开一个正式环境的 token + 反代地址，或者先用下面的冒烟数据 mock。
+说明：bridge 的 HTTP server 启动不等 Discord 连接（`/stats`、历史 API 秒可用），但 bot token 必须有效，agent 生命周期全依赖它。
 
 冒烟测试（对着活 bridge）：
 
@@ -175,6 +188,6 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 
 ## 10. 协作约定
 
-- **Bridge 侧改动（新端点、CORS、query token、静态托管）不要自己动手** —— 在 Discord #agent-claudestra 频道描述需求，bridge 侧由驻场 agent 实现并发版，通常当天完成。
+- **Bridge 侧改动（新端点、CORS、query token、静态托管）不要自己动手** —— 到 owner 的 Discord 服 #agent-claudestra 频道描述需求，bridge 侧由驻场 agent 实现并发版（走上游 `bun src/manager.ts update` 你本地就能拉到），通常当天完成。
 - API 的**冻结合同**：`/api/v1` 下已有端点的响应字段只增不改不删（additive-only）。发现字段语义不清先问，别猜。
 - 前端仓库建议独立开 repo（bridge 不需要和前端同仓库；将来若 bridge 托管静态文件，构建产物路径再约定）。
