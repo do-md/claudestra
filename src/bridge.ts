@@ -48,7 +48,9 @@ import {
   handleMgmtSelect,
 } from "./bridge/management.js";
 import { tmuxScreenshot } from "./bridge/screenshot.js";
-import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel } from "./bridge/jsonl-watcher.js";
+import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel, formatTool } from "./bridge/jsonl-watcher.js";
+import { listAgentSessions, readSessionHistory, isValidSessionId, isValidSubagentId } from "./lib/session-history.js";
+import { existsSync } from "fs";
 // v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
 import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from "./bridge/event-bus.js";
 // v2.7+ Claude Code agents 模式适配：中性会话清单 + bg job 清理 + 分身对账
@@ -4706,7 +4708,7 @@ async function authApi(req: Request): Promise<Principal | Response> {
 }
 
 /** registry 名双向兼容（"worker" ↔ "agent-worker"），返回 manager list 里的条目 */
-async function findApiAgent(name: string): Promise<{ name: string; channelId: string; idle?: boolean; status?: string; purpose?: string } | null> {
+async function findApiAgent(name: string): Promise<{ name: string; channelId: string; idle?: boolean; status?: string; purpose?: string; cwd?: string; sessionId?: string } | null> {
   try {
     const listResult = await runManager("list");
     const agents = (listResult.agents || []) as any[];
@@ -4842,6 +4844,79 @@ async function handleApiRequest(req: Request, url: URL): Promise<Response> {
     return new Response(f, {
       headers: { "Content-Disposition": `attachment; filename="${encodeURIComponent(entry.name)}"` },
     });
+  }
+
+  // v2.9+ GET /api/v1/agents/:name/history —— session 清单（live + 归档快照）。
+  // agent 已被 kill 时归档仍可读（这正是归档存在的意义），所以 registry 查不到
+  // 不算 404，降级为只列归档。响应不含服务器路径（path 字段剥掉）。
+  const histListMatch = path.match(/^\/agents\/([^/]+)\/history$/);
+  if (histListMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(histListMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    const canonical = agent?.name ?? (agentParam.startsWith("agent-") ? agentParam : `agent-${agentParam}`);
+    const sessions = await listAgentSessions(canonical, {
+      cwd: agent?.cwd,
+      currentSessionId: agent?.sessionId,
+    });
+    if (!agent && !sessions.length) {
+      return apiJson(404, { ok: false, error: `agent "${agentParam}" not found (no registry entry, no archives)` });
+    }
+    return apiJson(200, {
+      ok: true,
+      agent: canonical,
+      sessions: sessions.map(({ path: _p, ...rest }) => rest),
+    });
+  }
+
+  // v2.9+ GET /api/v1/agents/:name/history/:sessionId —— 消息分页
+  //   ?limit=100（1..500）&before=<seq 往前翻页>&subagent=agent-xxx（读 subagent 会话）
+  const histSessMatch = path.match(/^\/agents\/([^/]+)\/history\/([^/]+)$/);
+  if (histSessMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(histSessMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const sid = decodeURIComponent(histSessMatch[2]);
+    if (!isValidSessionId(sid)) return apiJson(400, { ok: false, error: "invalid sessionId" });
+    const agent = await findApiAgent(agentParam);
+    const canonical = agent?.name ?? (agentParam.startsWith("agent-") ? agentParam : `agent-${agentParam}`);
+    const sessions = await listAgentSessions(canonical, {
+      cwd: agent?.cwd,
+      currentSessionId: agent?.sessionId,
+    });
+    const found = sessions.find((s) => s.sessionId === sid);
+    if (!found) return apiJson(404, { ok: false, error: `session "${sid}" not found for agent "${canonical}"` });
+
+    let file = found.path;
+    const subagent = url.searchParams.get("subagent");
+    if (subagent) {
+      if (!isValidSubagentId(subagent)) return apiJson(400, { ok: false, error: "invalid subagent id" });
+      file = `${found.path.replace(/\.jsonl$/, "")}/subagents/${subagent}.jsonl`;
+      if (!existsSync(file)) return apiJson(404, { ok: false, error: `subagent "${subagent}" not found in session` });
+    }
+    const limitRaw = Number(url.searchParams.get("limit") || 100);
+    const beforeRaw = url.searchParams.get("before");
+    const before = beforeRaw != null ? Number(beforeRaw) : undefined;
+    try {
+      const page = await readSessionHistory(file, {
+        limit: Number.isFinite(limitRaw) ? limitRaw : 100,
+        before: before != null && Number.isFinite(before) ? before : undefined,
+        formatToolFn: formatTool,
+      });
+      return apiJson(200, {
+        ok: true,
+        agent: canonical,
+        sessionId: sid,
+        source: found.source,
+        ...(subagent ? { subagent } : {}),
+        ...page,
+      });
+    } catch (e) {
+      return apiJson(500, { ok: false, error: (e as Error).message });
+    }
   }
 
   // POST /api/v1/agents/:name/messages —— 给 agent 发消息（同步 wait / 202+轮询）
