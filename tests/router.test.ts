@@ -324,6 +324,13 @@ describe("parseChatId", () => {
     expect(parseChatId("thr_123:x")).toEqual({ transport: "discord", id: "thr_123:x" });
   });
 
+  // [fork:web-only] local-* 合成会话地址 → transport "local"，id 保留完整原串
+  test("[fork] local-* 前缀 → transport local，id 保留完整原串", () => {
+    expect(parseChatId("local-91597c77-47f0")).toEqual({ transport: "local", id: "local-91597c77-47f0" });
+    expect(parseChatId("local-master-control")).toEqual({ transport: "local", id: "local-master-control" });
+    expect(formatChatId(parseChatId("local-master-control"))).toBe("local-master-control");
+  });
+
   test("formatChatId 往返：discord 保持裸 id，其余带前缀", () => {
     expect(formatChatId({ transport: "discord", id: "123" })).toBe("123");
     expect(formatChatId({ transport: "api", id: "tok_1" })).toBe("api:tok_1");

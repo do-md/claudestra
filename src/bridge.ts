@@ -23,7 +23,9 @@ import {
 } from "discord.js";
 import type { ServerWebSocket } from "bun";
 
-import { DISCORD_TOKEN, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK } from "./bridge/config.js";
+import { DISCORD_TOKEN, WEB_ONLY, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK, MASTER_DIR } from "./bridge/config.js";
+// [fork:web-only] 无 Discord 模式的会话地址供给 + 出站落空 adapter
+import { createLocalChatAdapter } from "./bridge/local-adapter.js";
 import {
   startTyping,
   stopTyping,
@@ -50,7 +52,9 @@ import {
 import { tmuxScreenshot } from "./bridge/screenshot.js";
 import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel, formatTool } from "./bridge/jsonl-watcher.js";
 import { listAgentSessions, readSessionHistory, isValidSessionId, isValidSubagentId } from "./lib/session-history.js";
-import { existsSync } from "fs";
+import { existsSync, readdirSync, statSync } from "fs";
+// [fork] master 历史 probe 用（master 不在 registry，sessionId 从 projects slug 目录取最新）
+import { projectsSlug } from "./lib/jsonl-cost.js";
 // v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
 import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from "./bridge/event-bus.js";
 // v2.7+ Claude Code agents 模式适配：中性会话清单 + bg job 清理 + 分身对账
@@ -1011,6 +1015,9 @@ const discord = new Client({
 // 里，本来就是 Discord 专属职责。send 时 discord client 已 ready（消息只会在
 // ready 后流动）。
 registerAdapter(createDiscordChatAdapter(discord));
+// [fork:web-only] local adapter 常驻注册：Discord 模式下没有 local-* 地址流通，
+// 不会被命中；Web-only 模式下承接会话地址供给（create_channel）与出站落空。
+registerAdapter(createLocalChatAdapter());
 
 discord.once("ready", async () => {
   setBotUserId(discord.user?.id || "");
@@ -2821,6 +2828,8 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
             }).catch(() => {});
             recordMetric("auq_submit", { channelId: auqChannel, meta: { questions: String(state.questions.length) } });
             clearAuqState(auqChannel);
+            // [fork] 同步收掉 web 端的交互卡
+            emitEvent({ agent: agentNameForChannel(auqChannel) || "master", chatId: auqChannel, type: "question_cleared", data: { reason: "submit", via: "discord" } });
           } else if (action === "cancel") {
             await tmuxRaw(["send-keys", "-t", state.tmuxTarget, "Escape"]);
             await interaction.editReply({
@@ -2829,6 +2838,8 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
             }).catch(() => {});
             recordMetric("auq_cancel", { channelId: auqChannel });
             clearAuqState(auqChannel);
+            // [fork] 同步收掉 web 端的交互卡
+            emitEvent({ agent: agentNameForChannel(auqChannel) || "master", chatId: auqChannel, type: "question_cleared", data: { reason: "cancel", via: "discord" } });
           }
         } catch (e) {
           console.error("AUQ button 处理异常:", e);
@@ -3248,8 +3259,9 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
       try {
         // v2.6.0+ C2-5：会话地址供给走 adapter（ws 消息类型保留老名字做协议兼容）。
         // 将来纯 API agent = 换一个 provisioner，manager create 流程零改动。
-        const adapter = adapterFor("discord");
-        if (!adapter?.provisionConversation) throw new Error("discord adapter 不支持 provisionConversation");
+        // [fork:web-only] 无 Discord 时由 local adapter 供给 local-* 合成地址
+        const adapter = adapterFor(WEB_ONLY ? "local" : "discord");
+        if (!adapter?.provisionConversation) throw new Error("adapter 不支持 provisionConversation");
         const { chatId: channelId } = await adapter.provisionConversation(msg.name, { category: msg.category });
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { channelId } }));
       } catch (err) {
@@ -3260,7 +3272,10 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "delete_channel": {
       try {
-        await discordDeleteChannel(discord, msg.channelId);
+        // [fork:web-only] local-* 合成地址没有平台面，删除是 no-op
+        if (!String(msg.channelId || "").startsWith("local-")) {
+          await discordDeleteChannel(discord, msg.channelId);
+        }
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3270,6 +3285,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "rename_channel": {
       try {
+        // [fork:web-only] local-* 合成地址没有平台面，重命名是 no-op
+        if (String(msg.channelId || "").startsWith("local-")) {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
+          break;
+        }
         const ch = await discord.channels.fetch(msg.channelId);
         if (!ch || !("setName" in ch)) throw new Error("channel 不存在或不可重命名");
         await (ch as TextChannel).setName(msg.name);
@@ -3289,6 +3309,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
       try {
         const annChannelId = msg.channelId as string;
         const annAgentName = msg.agentName as string;
+        // [fork:web-only] local-* 地址没有 Discord 频道，公告是 no-op
+        if (annChannelId.startsWith("local-")) {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true, messageId: "" } }));
+          break;
+        }
         const ids = await discordReply(
           discord,
           annChannelId,
@@ -4711,8 +4736,43 @@ async function authApi(req: Request): Promise<Principal | Response> {
   return p;
 }
 
+/**
+ * [fork] master 的最新 session id：master 不在 registry，从其 cwd 的
+ * ~/.claude/projects/<slug>/ 目录里 probe mtime 最新的 jsonl。
+ */
+function latestSessionIdForCwd(cwd: string): string | undefined {
+  try {
+    const dir = `${process.env.HOME}/.claude/projects/${projectsSlug(cwd)}`;
+    let best: { sid: string; mtime: number } | null = null;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".jsonl")) continue;
+      const st = statSync(`${dir}/${f}`);
+      if (!best || st.mtimeMs > best.mtime) best = { sid: f.slice(0, -".jsonl".length), mtime: st.mtimeMs };
+    }
+    return best?.sid;
+  } catch {
+    return undefined;
+  }
+}
+
 /** registry 名双向兼容（"worker" ↔ "agent-worker"），返回 manager list 里的条目 */
 async function findApiAgent(name: string): Promise<{ name: string; channelId: string; idle?: boolean; status?: string; purpose?: string; cwd?: string; sessionId?: string } | null> {
+  // [fork] master 特判：master 不在 registry。channelId = CONTROL_CHANNEL_ID，
+  // cwd 优先取 channel-server 注册信息（在线时准确），离线回退 MASTER_DIR；
+  // sessionId probe 该 cwd 下最新 jsonl（历史 API 用）。scope 把关在各端点的
+  // agentInScope（master 必须显式列入 token scope，"*" 不含 master）。
+  if (name === "master" && CONTROL_CHANNEL_ID) {
+    const client = clients.get(CONTROL_CHANNEL_ID);
+    const cwd = client?.cwd || MASTER_DIR;
+    return {
+      name: "master",
+      channelId: CONTROL_CHANNEL_ID,
+      status: client ? "active" : "stopped",
+      purpose: "master orchestrator (大总管)",
+      cwd,
+      sessionId: latestSessionIdForCwd(cwd),
+    };
+  }
   try {
     const listResult = await runManager("list");
     const agents = (listResult.agents || []) as any[];
@@ -4736,6 +4796,16 @@ async function handleApiRequest(req: Request, url: URL): Promise<Response> {
       const agents = ((listResult.agents || []) as any[])
         .filter((a) => agentInScope(principal, a.name))
         .map((a) => ({ name: a.name, status: a.status, idle: a.idle, purpose: a.purpose }));
+      // [fork] master 入列（token scope 显式含 "master" 才可见，"*" 不含）。
+      // web 前端的「大总管」置顶入口靠它。
+      if (CONTROL_CHANNEL_ID && agentInScope(principal, "master")) {
+        agents.unshift({
+          name: "master",
+          status: clients.has(CONTROL_CHANNEL_ID) ? "active" : "stopped",
+          idle: undefined,
+          purpose: "master orchestrator (大总管)",
+        });
+      }
       return apiJson(200, { ok: true, agents });
     } catch (e) {
       return apiJson(500, { ok: false, error: (e as Error).message });
@@ -5028,6 +5098,170 @@ async function handleApiRequest(req: Request, url: URL): Promise<Response> {
     return apiJson(200, { ok: true, ...result });
   }
 
+  // ============================================================
+  // [fork] 以下为 fork 侧 additive 端点（upstream /api/v1 无对应能力）。
+  // 全部遵守 upstream 合同：Bearer + agentInScope、additive-only、复用
+  // Discord 按钮同款 tmux keystroke 逻辑。upstream 落地同类端点后应切换删除。
+  //   POST /agents/:name/interrupt       一键中断（tmux C-c）
+  //   POST /agents/:name/answer          AUQ / 权限弹窗回传（tmux 键序列）
+  //   GET  /agents/:name/pending         当前挂起交互（SSE 迟到订阅者补发）
+  //   POST /agents                       create（仅全权 token）
+  //   POST /agents/:name/kill|restart    生命周期（仅全权 token）
+  // ============================================================
+
+  // [fork] POST /api/v1/agents/:name/interrupt —— 复刻 Discord ⚡ 打断按钮
+  const interruptMatch = path.match(/^\/agents\/([^/]+)\/interrupt$/);
+  if (interruptMatch && req.method === "POST") {
+    const agentParam = decodeURIComponent(interruptMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const targetWindow = agent.name === "master" ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
+    try {
+      await tmuxRaw(["send-keys", "-t", targetWindow, "C-c"]);
+    } catch (e) {
+      return apiJson(500, { ok: false, error: `tmux send-keys 失败: ${(e as Error).message}` });
+    }
+    recordMetric("agent_interrupt", { channelId: agent.channelId, agent: agent.name, meta: { trigger: "api" } });
+    stopTyping(agent.channelId);
+    clearSafetyTimer(agent.channelId);
+    console.log(`⚡ [api] C-c 已发送给 ${agent.name} (token=${tokenId})`);
+    return apiJson(200, { ok: true, agent: agent.name });
+  }
+
+  // [fork] POST /api/v1/agents/:name/answer —— 交互卡回传。
+  // body {kind:"auq", action:"submit"|"cancel", selections?: number[][]}
+  //   或 {kind:"permission", action:"allow"|"allow_session"|"deny"}
+  const answerMatch = path.match(/^\/agents\/([^/]+)\/answer$/);
+  if (answerMatch && req.method === "POST") {
+    const agentParam = decodeURIComponent(answerMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return apiJson(400, { ok: false, error: "invalid JSON body" });
+    }
+    const kind = String(body?.kind || "");
+
+    if (kind === "auq") {
+      const { auqStates, buildAuqKeystrokes, clearAuqState } = await import("./bridge/ask-user-question.js");
+      const state = auqStates.get(agent.channelId);
+      if (!state) return apiJson(404, { ok: false, error: "no pending AskUserQuestion for this agent" });
+      const action = String(body?.action || "submit");
+      if (action === "cancel") {
+        try {
+          await tmuxRaw(["send-keys", "-t", state.tmuxTarget, "Escape"]);
+        } catch { /* non-critical：状态照清 */ }
+        clearAuqState(agent.channelId);
+        recordMetric("auq_cancel", { channelId: agent.channelId, meta: { trigger: "api" } });
+        emitEvent({ agent: agent.name, chatId: agent.channelId, type: "question_cleared", data: { reason: "cancel", via: "api" } });
+        return apiJson(200, { ok: true, cancelled: true });
+      }
+      // submit：body.selections 覆盖状态（web 前端一次性提交所有选择）
+      if (Array.isArray(body?.selections)) {
+        state.selections = state.questions.map((q, i) => {
+          const sel = Array.isArray(body.selections[i]) ? body.selections[i] : [];
+          return sel
+            .map((n: unknown) => Number(n))
+            .filter((n: number) => Number.isInteger(n) && n >= 0 && n < q.options.length);
+        });
+      }
+      const keys = buildAuqKeystrokes(state);
+      try {
+        if (keys.length > 0) await tmuxRaw(["send-keys", "-t", state.tmuxTarget, ...keys]);
+      } catch (e) {
+        return apiJson(500, { ok: false, error: `tmux send-keys 失败: ${(e as Error).message}` });
+      }
+      clearAuqState(agent.channelId);
+      recordMetric("auq_submit", { channelId: agent.channelId, meta: { trigger: "api", questions: String(state.questions.length) } });
+      emitEvent({ agent: agent.name, chatId: agent.channelId, type: "question_cleared", data: { reason: "submit", via: "api" } });
+      return apiJson(200, { ok: true, keys: keys.length });
+    }
+
+    if (kind === "permission") {
+      const action = String(body?.action || "");
+      const keySeqMap: Record<string, string[]> = {
+        allow: ["1", "Enter"],
+        allow_session: ["2", "Enter"],
+        deny: ["3", "Enter"],
+      };
+      const keySeq = keySeqMap[action];
+      if (!keySeq) return apiJson(400, { ok: false, error: 'action must be "allow" | "allow_session" | "deny"' });
+      const targetWindow = agent.name === "master" ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
+      // 发键前确认弹窗还在（与 Discord 按钮同款防误击：digit+Enter 别当普通输入提交）
+      const pane = await tmuxCapture(targetWindow, 30);
+      if (detectRuntimePermissionPrompt(pane) === null) {
+        return apiJson(409, { ok: false, error: "permission dialog no longer active" });
+      }
+      try {
+        await tmuxRaw(["send-keys", "-t", targetWindow, ...keySeq]);
+      } catch (e) {
+        return apiJson(500, { ok: false, error: `tmux send-keys 失败: ${(e as Error).message}` });
+      }
+      return apiJson(200, { ok: true });
+    }
+
+    return apiJson(400, { ok: false, error: 'kind must be "auq" or "permission"' });
+  }
+
+  // [fork] GET /api/v1/agents/:name/pending —— 当前挂起的交互卡。
+  // SSE 的 question 事件可能在前端连流之前发出（切会话/刷新/回前台），
+  // 前端连流后调这里补拉（对应旧 web-hub 的 pendingInteraction replay）。
+  const pendingMatch = path.match(/^\/agents\/([^/]+)\/pending$/);
+  if (pendingMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(pendingMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const { auqStates } = await import("./bridge/ask-user-question.js");
+    const auq = auqStates.get(agent.channelId);
+    return apiJson(200, {
+      ok: true,
+      agent: agent.name,
+      question: auq ? { questions: auq.questions, ts: auq.ts } : null,
+    });
+  }
+
+  // [fork] POST /api/v1/agents —— create（仅全权 token；复用 manager CLI）
+  if (path === "/agents" && req.method === "POST") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: "create requires a full-scope token" });
+    }
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return apiJson(400, { ok: false, error: "invalid JSON body" });
+    }
+    const name = String(body?.name || "").trim();
+    const dir = String(body?.dir || "").trim();
+    const purpose = String(body?.purpose || "").trim();
+    if (!name || !dir) return apiJson(400, { ok: false, error: 'body must be {"name", "dir", "purpose"?}' });
+    const r = await runManager(...(purpose ? ["create", name, dir, purpose] : ["create", name, dir]));
+    return apiJson(r?.ok ? 200 : 500, r ?? { ok: false, error: "manager create failed" });
+  }
+
+  // [fork] POST /api/v1/agents/:name/kill | /restart —— 生命周期（仅全权 token）
+  const lifecycleMatch = path.match(/^\/agents\/([^/]+)\/(kill|restart)$/);
+  if (lifecycleMatch && req.method === "POST") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: `${lifecycleMatch[2]} requires a full-scope token` });
+    }
+    const agentParam = decodeURIComponent(lifecycleMatch[1]);
+    if (agentParam === "master") return apiJson(400, { ok: false, error: "master lifecycle is managed by the launcher" });
+    const r = await runManager(lifecycleMatch[2], agentParam);
+    return apiJson(r?.ok ? 200 : 500, r ?? { ok: false, error: `manager ${lifecycleMatch[2]} failed` });
+  }
+
   return apiJson(404, { ok: false, error: "unknown endpoint" });
 }
 
@@ -5230,9 +5464,22 @@ const server = Bun.serve({
 
 console.log(`🚀 Bridge WebSocket 启动: ws://localhost:${BRIDGE_PORT}`);
 
-if (!DISCORD_TOKEN) {
-  console.error("❌ 请设置 DISCORD_BOT_TOKEN");
-  process.exit(1);
+// [fork:web-only] 无 DISCORD_BOT_TOKEN → Web-only 模式：不连 Discord，只跑与
+// 平台无关的初始化子集。HTTP/ws/api/事件流在上面 Bun.serve 时已就绪。
+// 跳过的 Discord 专属项：cleanupStaleThinkingMessages / initStatsDashboard /
+// registerSlashCommands / startPermissionWatcher / startWedgeWatcher /
+// startSessionReconciler / gateway 看门狗（它们的告警面/交互面都是 Discord）。
+if (WEB_ONLY) {
+  console.log("🕸️ Web-only 模式：未设 DISCORD_BOT_TOKEN，跳过 Discord 登录");
+  // v2.8+ bg 活动追踪 — provisionThread 走 local adapter（落空），bg_task_* 事件照发
+  startBgActivityWatcher();
+  // v2.9+ 归档每日兜底 — 纯文件系统操作，历史 API 依赖它
+  startArchiveSweeper();
+  recordMetric("bridge_start", { meta: { channels: clients.size, webOnly: true } });
+} else {
+  if (!DISCORD_TOKEN) {
+    console.error("❌ 请设置 DISCORD_BOT_TOKEN");
+    process.exit(1);
+  }
+  discord.login(DISCORD_TOKEN);
 }
-
-discord.login(DISCORD_TOKEN);

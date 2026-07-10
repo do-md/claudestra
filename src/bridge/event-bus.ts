@@ -19,6 +19,9 @@ export type BridgeEventType =
   | "agent_status"
   | "auto_deny"
   | "question"
+  // [fork] AUQ 已应答/取消（Discord 按钮或 /api/v1 answer 端点触发），web 前端
+  // 收到后收起交互卡。additive-only 合同允许加类型；upstream 落地同类事件后切换。
+  | "question_cleared"
   | "chat_message"
   // v2.7+ 会话对账异常：bg 分身出现 / 链路掉线 / 收编与清理结果（agents 模式适配）
   | "session_anomaly"

@@ -301,6 +301,12 @@ export interface ParsedChatId {
 const KNOWN_TRANSPORTS = new Set(["discord", "api", "telegram", "web"]);
 
 export function parseChatId(s: string): ParsedChatId {
+  // [fork:web-only] local-* 合成会话地址（无 Discord 模式下 local adapter 供给，
+  // registry 存量数据用 `local-<uuid>` 连字符形态）→ transport "local"。id 保留
+  // 完整原串，registry / clients / pending 的 key 不变。
+  if (s.startsWith("local-")) {
+    return { transport: "local", id: s };
+  }
   const idx = s.indexOf(":");
   if (idx > 0) {
     const prefix = s.slice(0, idx);
@@ -314,6 +320,8 @@ export function parseChatId(s: string): ParsedChatId {
 
 /** 格式化回统一 keyspace 字符串。discord 保持裸 id（历史兼容 + registry 主键不变） */
 export function formatChatId(p: ParsedChatId): string {
+  // [fork:web-only] local 的 id 本身就是完整地址（连字符形态），原样返回
+  if (p.transport === "local") return p.id;
   return p.transport === "discord" ? p.id : `${p.transport}:${p.id}`;
 }
 
