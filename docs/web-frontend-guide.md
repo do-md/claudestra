@@ -89,7 +89,7 @@ Base URL：`http://127.0.0.1:3847`（`BRIDGE_PORT` 可改）。
   - `session_anomaly` — 分身出现/链路掉线/清理收编结果
   - `bg_task_started` / `bg_task_update` / `bg_task_completed` — 后台活动（subagent / bg shell）生命周期，data：`{kind: "subagent"|"shell", id, threadId, title?, lines?, durationMs?}`。`id` 是稳定标识（subagent id / shell taskId），用它做前端任务行的 key
 
-**⚠️ EventSource 陷阱**：浏览器原生 `EventSource` 不能带 Authorization header。方案：(a) 同源部署 + 反代注入 header；(b) 用 fetch-based SSE 客户端（`fetch` + ReadableStream，可带 header）；(c) 提需求给 bridge 加 `?token=` query 参数支持。**目前 bridge 未实现 query token —— 需要就提**。
+**EventSource 认证（v2.10+ 已解决）**：浏览器原生 `EventSource` 不能带 Authorization header —— 用 `GET /api/v1/events?token=<secret>` 的 query 参数形式（所有 `/api/v1` 端点都接受 `?token=`，header 优先；非 SSE 调用仍建议走 header）。
 
 ## 5. /stats 数据结构要点
 
@@ -132,14 +132,19 @@ GET /api/v1/agents/:name/history/:sessionId?limit=100&before=<seq>&subagent=agen
 - `subagents` 数组里的 id 传 `?subagent=` 可看子代理的完整对话（格式与主会话相同）。
 - 实时 + 历史的衔接：进入对话视图先拉最后一页历史，再订阅 SSE 增量（`assistant_text` / `tool_*` / `chat_message` 按 `agent` 字段过滤）。两边没有统一的消息 id —— 简单做法是以历史为准、SSE 只做"活动指示"，或按 `ts` 去重。
 
-## 7. 已知缺口（你会撞的墙，按需向 bridge 提需求）
+## 7. 部署开关与已知边界
 
-1. **CORS 未配置** — bridge 响应无 `Access-Control-*` 头，跨源浏览器请求会被拦。短期用 dev proxy（vite/webpack devServer proxy）或同源反代；要 bridge 加 CORS 支持就提。
-2. **EventSource 认证**（见 §4.3）。
-3. **无静态托管** — bridge 目前不 serve 静态文件。独立部署（nginx/caddy 反代 `/api` 到 3847）或提需求让 bridge 挂一个静态目录。
+原「三堵墙」（CORS / EventSource 认证 / 静态托管）v2.10 起已全部拆掉，都是环境变量开关、默认关闭：
+
+1. **CORS** — `BRIDGE_CORS_ORIGIN` 设逗号分隔的 origin 白名单（如 `http://localhost:5173`）或 `*`；不设 = 不发 CORS 头。开发期配你的 dev server origin 即可跨源直连。
+2. **EventSource 认证** — `?token=` query 参数（见 §4.3）。
+3. **静态托管** — `BRIDGE_STATIC_DIR` 指向前端构建产物目录，bridge 直接 serve（缺失的无扩展名路径回 `index.html`，SPA 路由可用；缺失的资源文件正常 404）。同源部署 = CORS 和 token query 都不再需要。
+
+仍然存在的边界：
+
 4. **Token 管理无 UI** — 签发/吊销只有 CLI。
 5. **`BRIDGE_BIND` 默认 127.0.0.1** — 要从别的设备访问，设 `BRIDGE_BIND=0.0.0.0` 并自备反代 + TLS + 鉴权（顶层免鉴权端点会一起暴露，务必只在反代后开）。
-6. SSE 无跨重启持久化 — `Last-Event-ID` 只在 bridge 存活期内有效。
+6. SSE 无跨重启持久化 — `Last-Event-ID` 只在 bridge 存活期内有效，bridge 重启后 seq 归零，前端要能容忍。
 
 ## 8. 建议的 MVP 范围（owner 已认可的方向）
 
@@ -148,7 +153,7 @@ GET /api/v1/agents/:name/history/:sessionId?limit=100&before=<seq>&subagent=agen
 3. **后台任务进度线** — `bg_task_*` 事件按 `id` 聚合，渲染每个 subagent / bg shell 的活动行（开始/滚动更新/完成+耗时）。
 4. **用量面板** — `/stats` 的 web 版（参考 Discord 看板的呈现：`src/bridge/stats-dashboard.ts` 的 renderEmbed）。
 
-技术栈随意（bridge 不关心）。部署形态建议先做**同机反代同源**（nginx 把 `/` 指向静态文件、`/api`、`/events`、`/stats` 转发 3847），绕开 CORS 和 EventSource 认证两个坑。
+技术栈随意（bridge 不关心）。部署形态最简路径：构建产物指给 `BRIDGE_STATIC_DIR`，bridge 同源直接 serve（零反代零 CORS）；开发期设 `BRIDGE_CORS_ORIGIN=http://localhost:5173` 之类即可跨源连线上 bridge。
 
 ## 9. 本地开发环境（自己起一套完整的）
 

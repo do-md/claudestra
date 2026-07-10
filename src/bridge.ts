@@ -70,6 +70,7 @@ import {
   type PendingApiRequest,
   type ApiReplyResult,
 } from "./bridge/api-routes.js";
+import { corsHeadersFor, resolveStaticPath } from "./bridge/web-gateway.js";
 // v2.6.0+ HTTP API 身份与授权（设计 §3.4 / §5）
 import {
   readPrincipals,
@@ -4644,17 +4645,10 @@ initApiRoutes({
   handleEventsRequest,
 });
 
-const server = Bun.serve({
-  port: BRIDGE_PORT,
-  // v2.6.0+ 默认只绑回环 —— /hook /stats /skills/rescan 一直无鉴权，之前默认
-  // 0.0.0.0 等于把它们暴露在内网。跨机器场景（自定义 BRIDGE_URL 指向远程）用
-  // BRIDGE_BIND=0.0.0.0 显式放开，网络边界（反代/TLS/防火墙）由用户自己负责。
-  hostname: process.env.BRIDGE_BIND || "127.0.0.1",
-  async fetch(req, server) {
-    if (server.upgrade(req)) return undefined;
+const CORS_ORIGIN_SETTING = process.env.BRIDGE_CORS_ORIGIN || "";
+const STATIC_DIR = process.env.BRIDGE_STATIC_DIR || "";
 
-    // Hook HTTP endpoint
-    const url = new URL(req.url);
+async function handleHttpRoutes(req: Request, url: URL): Promise<Response> {
     if (url.pathname === "/hook" && req.method === "POST") {
       return handleHookRequest(req);
     }
@@ -4816,7 +4810,33 @@ const server = Bun.serve({
       }
     }
 
+    // v2.10+ 静态托管（BRIDGE_STATIC_DIR）：以上路由都没接住的 GET 落到这里，
+    // web 前端构建产物可由 bridge 直接 serve（含 SPA fallback），免配反代。
+    if (STATIC_DIR && req.method === "GET") {
+      const staticPath = resolveStaticPath(STATIC_DIR, url.pathname);
+      if (staticPath) return new Response(Bun.file(staticPath));
+    }
+
     return new Response("Claude Orchestrator Bridge", { status: 200 });
+}
+
+const server = Bun.serve({
+  port: BRIDGE_PORT,
+  // v2.6.0+ 默认只绑回环 —— /hook /stats /skills/rescan 一直无鉴权，之前默认
+  // 0.0.0.0 等于把它们暴露在内网。跨机器场景（自定义 BRIDGE_URL 指向远程）用
+  // BRIDGE_BIND=0.0.0.0 显式放开，网络边界（反代/TLS/防火墙）由用户自己负责。
+  hostname: process.env.BRIDGE_BIND || "127.0.0.1",
+  async fetch(req, server) {
+    if (server.upgrade(req)) return undefined;
+    const url = new URL(req.url);
+    // v2.10+ CORS（BRIDGE_CORS_ORIGIN 未设 = 不发头，行为同旧版）
+    const cors = corsHeadersFor(req.headers.get("Origin"), CORS_ORIGIN_SETTING);
+    if (req.method === "OPTIONS" && cors) {
+      return new Response(null, { status: 204, headers: cors });
+    }
+    const resp = await handleHttpRoutes(req, url);
+    if (cors) for (const [k, v] of Object.entries(cors)) resp.headers.set(k, v);
+    return resp;
   },
   websocket: {
     // v2.2.0+: 抬高 idleTimeout（Bun 默认 120s）。配合 channel-server 每 25s 的

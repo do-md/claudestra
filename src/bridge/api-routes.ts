@@ -119,13 +119,19 @@ function apiJson(status: number, body: unknown): Response {
   });
 }
 
-/** Bearer 鉴权 + 限流。失败直接返回 Response，成功返回 principal。 */
-async function authApi(req: Request): Promise<Principal | Response> {
+/**
+ * Bearer 鉴权 + 限流。失败直接返回 Response，成功返回 principal。
+ * v2.10+ 也接受 ?token=<secret>（header 优先）：浏览器 EventSource 不能带
+ * Authorization header，SSE 场景的标准折衷。secret 进 URL 的暴露面由「bridge
+ * 默认只绑回环 + 对外自备反代/TLS」的既有边界兜住；非 SSE 调用仍应走 header。
+ */
+async function authApi(req: Request, url: URL): Promise<Principal | Response> {
   const auth = req.headers.get("Authorization") || "";
   const m = auth.match(/^Bearer\s+(.+)$/i);
-  if (!m) return apiJson(401, { ok: false, error: "missing Authorization: Bearer <secret>" });
+  const secret = m?.[1]?.trim() || url.searchParams.get("token") || "";
+  if (!secret) return apiJson(401, { ok: false, error: "missing Authorization: Bearer <secret> (SSE may use ?token=)" });
   const file = await readPrincipals();
-  const p = findByBearer(file, m[1].trim());
+  const p = findByBearer(file, secret);
   if (!p) return apiJson(401, { ok: false, error: "invalid or revoked token" });
   const tid = tokenIdOf(p);
   let limiter = apiLimiters.get(tid);
@@ -152,7 +158,7 @@ async function findApiAgent(name: string): Promise<{ name: string; channelId: st
 
 export async function handleApiRequest(req: Request, url: URL): Promise<Response> {
   if (!deps) return apiJson(503, { ok: false, error: "api routes not initialized" });
-  const auth = await authApi(req);
+  const auth = await authApi(req, url);
   if (auth instanceof Response) return auth;
   const principal = auth;
   const tokenId = tokenIdOf(principal);
