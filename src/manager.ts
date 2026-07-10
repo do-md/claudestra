@@ -569,9 +569,9 @@ async function cmdCreate(
     await clearShellInitPrompts(target);
     await tmuxSendLine(target, cmd);
 
-    // 4. 轮询等待就绪 — 60s budget，与 restart 的 startClaudeInWindow 对齐
+    // 4. 轮询等待就绪 — 与 restart 的 startClaudeInWindow 对齐（CLAUDE_READY_ROUNDS）
     let sessionIdlePicked = false;
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < CLAUDE_READY_ROUNDS; i++) {
       await Bun.sleep(500);
       const pane = await captureLast(tmuxName, 10);
       // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不卡着等用户点按钮
@@ -646,6 +646,11 @@ async function cmdCreate(
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Claude Code 就绪轮询预算：240 轮 × 500ms = 120s。曾是 60s，2026-07-10 实测
+// 大 session（数 MB jsonl）resume + MCP 连接可超 60s，导致实际启动成功却报
+// 「启动超时」（restart 还会误标 recreated）。
+const CLAUDE_READY_ROUNDS = 240;
 
 async function cmdResume(
   name: string,
@@ -764,9 +769,9 @@ async function cmdResume(
     if (forkSession) forkBefore = await listSessionJsonls(resolvedDir);
     await tmuxSendLine(target, cmd);
 
-    // 轮询等待 — 60s budget，与 restart 的 startClaudeInWindow 对齐
+    // 轮询等待 — 与 restart 的 startClaudeInWindow 对齐（CLAUDE_READY_ROUNDS）
     let sessionIdlePicked = false;
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < CLAUDE_READY_ROUNDS; i++) {
       await Bun.sleep(500);
       const pane = await captureLast(tmuxName, 10);
       // v2.0.22+: Session 闲置弹窗 → 自动选「恢复完整会话」，不卡着等用户点按钮
@@ -1251,9 +1256,9 @@ async function startClaudeInWindow(
   await clearShellInitPrompts(target);
   await tmuxSendLine(target, claudeCmd);
 
-  // 轮询处理各种确认提示，最多等 60 秒
+  // 轮询处理各种确认提示（预算见 CLAUDE_READY_ROUNDS）
   let sessionIdlePicked = false;
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < CLAUDE_READY_ROUNDS; i++) {
     await Bun.sleep(500);
     const pane = await captureLast(name, 10);
 
