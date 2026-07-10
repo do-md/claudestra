@@ -1,20 +1,75 @@
 "use client";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
+
+const MAX_FILES = 5;
+
+/** 待发送文件的预览 chip（图片缩略图 / 文件名），点 ✕ 移除。 */
+function PendingFiles({
+  files,
+  onRemove,
+}: {
+  files: File[];
+  onRemove: (i: number) => void;
+}) {
+  if (files.length === 0) return null;
+  return (
+    <div className="mx-auto flex max-w-3xl flex-wrap gap-2 pb-2">
+      {files.map((f, i) => {
+        const isImg = f.type.startsWith("image/");
+        return (
+          <div
+            key={i}
+            className="relative flex items-center gap-1.5 rounded-lg border border-base-300 bg-base-200 py-1 pl-1.5 pr-6 text-xs"
+          >
+            {isImg ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={URL.createObjectURL(f)}
+                alt={f.name}
+                className="size-8 rounded object-cover"
+              />
+            ) : (
+              <span className="text-base">📎</span>
+            )}
+            <span className="max-w-[8rem] truncate">{f.name}</span>
+            <button
+              type="button"
+              className="absolute right-1 top-1 flex size-4 items-center justify-center rounded-full bg-base-300 text-[10px] leading-none hover:bg-error hover:text-error-content"
+              onClick={() => onRemove(i)}
+              aria-label="移除"
+            >
+              ✕
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 export function Composer() {
   const [text, setText] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
+  const fileRef = useRef<HTMLInputElement>(null);
   const active = useChatStore((s) => s.state.activeAgent);
   const streaming = useChatStore((s) => s.state.streaming);
   const store = useChatStoreApi();
 
   const disabled = !active;
+  const canSend = !disabled && !streaming && (!!text.trim() || files.length > 0);
 
   const submit = () => {
-    const t = text.trim();
-    if (!t || disabled || streaming) return;
-    store.send(t);
+    if (!canSend) return;
+    store.send(text, files.length ? files : undefined);
     setText("");
+    setFiles([]);
+  };
+
+  const onPick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(e.target.files || []);
+    setFiles((prev) => [...prev, ...picked].slice(0, MAX_FILES));
+    e.target.value = ""; // 允许再次选择同一文件
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -30,7 +85,27 @@ export function Composer() {
       className="border-t border-base-300 bg-base-100 px-3 pt-3 sm:px-4"
       style={{ paddingBottom: "calc(env(safe-area-inset-bottom) + 0.75rem)" }}
     >
+      <PendingFiles
+        files={files}
+        onRemove={(i) => setFiles((prev) => prev.filter((_, idx) => idx !== i))}
+      />
       <div className="mx-auto flex max-w-3xl items-end gap-2">
+        <input
+          ref={fileRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={onPick}
+        />
+        <button
+          className="btn btn-ghost btn-square"
+          title="上传图片 / 文件"
+          disabled={disabled || files.length >= MAX_FILES}
+          onClick={() => fileRef.current?.click()}
+          aria-label="上传文件"
+        >
+          📎
+        </button>
         <textarea
           className="textarea textarea-bordered max-h-40 min-h-[2.75rem] flex-1 resize-none"
           rows={1}
@@ -51,11 +126,7 @@ export function Composer() {
             ■ 停止
           </button>
         ) : (
-          <button
-            className="btn btn-primary"
-            disabled={disabled || !text.trim()}
-            onClick={submit}
-          >
+          <button className="btn btn-primary" disabled={!canSend} onClick={submit}>
             发送
           </button>
         )}

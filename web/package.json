@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@do-md/core-react": "^0.2.10",
     "@microsoft/fetch-event-source": "^2.0.1",
     "better-sqlite3": "^12.8.0",
     "clsx": "^2.1.1",
@@ -16,6 +17,7 @@
     "immer": "^11.1.4",
     "nanoid": "^5.1.6",
     "next": "16.1.6",
+    "prismjs": "^1.30.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "ssh2": "^1.17.0",
@@ -25,6 +27,7 @@
     "@tailwindcss/postcss": "^4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
+    "@types/prismjs": "^1.26.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/ssh2": "^1.15.5",

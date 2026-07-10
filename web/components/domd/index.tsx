@@ -1,0 +1,54 @@
+"use client";
+/**
+ * DOMD（@do-md/core-react）只读封装——Chat 助手消息的 markdown 渲染统一走这里。
+ *
+ * owner 决策（2026-07-10）：Web 富文本渲染必须用 do-md，不用 react-markdown。
+ * 与 Claude OS 一致（features/chat 的 StaticAssistantBody 同款 <Domd editable=false/>），
+ * 复用 workspace 的 @do-md 生态。do-md 已发 NPM（@do-md/core-react），直接依赖，
+ * 不走 workspace 复制式 .packages/。
+ *
+ * Claude OS 的封装还挂了 CustomCursor（仅 editable 时用）——Chat 是只读渲染，
+ * 这里省掉，纯 Provider + DOMD。Prism 代码高亮（codeTokenizer=tokenize）必须挂，
+ * 否则 DOMD 把整块代码降级成纯文本 span、无从上色。token 配色见 ./prism-themes.css，
+ * markdown 元素排版见 globals.css 的 .chat-domd。
+ */
+import type { ComponentProps, ReactNode } from "react";
+import { DOMD, DOMDProvider } from "@do-md/core-react";
+import "@do-md/core-react/style.css";
+import { tokenize } from "./prism";
+import "./prism-themes.css";
+
+type ProviderProps = ComponentProps<typeof DOMDProvider>;
+
+export type DomdProps = Omit<ProviderProps, "children"> & {
+  /** 包裹 <DOMD/> 的容器类名（排版 scope，如 chat-domd）。 */
+  bodyClassName?: string;
+  /** 渲染在 Provider 内的附加桥接组件（流式喂字等）。Chat 只读暂不用。 */
+  children?: ReactNode;
+};
+
+/**
+ * 一站式只读 DOMD（Provider + 主体）。默认挂 Prism 高亮。
+ * initMd 是初始 markdown（挂载时读一次）——所以调用方对「流式进行中」的消息
+ * 先用纯文本渲染，定稿后再挂 Domd（一次性拿全量 content），见 message-list。
+ */
+export function Domd({ bodyClassName, children, ...provider }: DomdProps) {
+  return (
+    <DOMDProvider
+      editable={false}
+      codeTokenizer={tokenize as ProviderProps["codeTokenizer"]}
+      {...provider}
+    >
+      {bodyClassName ? (
+        <div className={bodyClassName}>
+          <DOMD />
+        </div>
+      ) : (
+        <DOMD />
+      )}
+      {children}
+    </DOMDProvider>
+  );
+}
+
+export { DOMDProvider as DomdProvider };
