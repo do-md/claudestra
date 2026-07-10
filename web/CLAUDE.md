@@ -1,7 +1,12 @@
 # Claudestra Web 客户端
 
 Claudestra 的 Next.js Web 前门（Discord 之外的第二入口）。可 PWA 安装、OneSignal 推送、多会话流式 Chat。
-架构方案见项目图 `claudestra` 的 Reference `web-client-architecture.md`（BFF 代理 → Bridge /web/* 网关）。
+
+**2026-07-10 起数据面全面迁移到 upstream 的多前端 API**（`docs/web-frontend-guide.md` +
+`docs/design-multi-frontend.md`）：BFF 消费 Bridge 的 `/api/v1/*`（Bearer token）与
+`/api/v1/events`（SSE），旧 fork 的 `/web/*` 网关与 web-hub 已删除。upstream 缺口
+（interrupt / AUQ 回传 / 生命周期 / Web-only 模式）由 fork 侧 additive 补齐——完整清单见
+仓库根 `FORK.md`。
 
 ## 技术栈 & 端口
 
@@ -18,30 +23,33 @@ app/
   login/page.tsx        SSH 账号登录
   api/
     auth/{login,logout,me}/  鉴权（公开，自处理）
-    agents/             GET agent 列表；POST 新建（代理 Bridge /web/agents）
-    agents/kill/        POST kill（代理 Bridge /web/agents/kill）
-    agents/restart/     POST restart（代理 Bridge /web/agents/restart）
-    chat/send/          POST 注入消息（isAuthed；真实→Bridge /web/inject，mock 回退）
-    chat/stream/        GET SSE 输出流（isAuthed；真实→Bridge /web/stream，mock 回退）
-    chat/history/       GET ?agent= 历史消息（BFF **直接读** CC session jsonl，见下）
-    chat/interrupt/     POST {agent} 一键中断（代理 Bridge /web/interrupt → tmux C-c）
-    chat/permission/    POST {agent,action} 权限/session-idle 卡应答（代理 Bridge /web/permission）
-    chat/auq/           POST {agent,action,selections} AskUserQuestion 卡应答（代理 Bridge /web/auq）
+    agents/             GET 列表（代理 /api/v1/agents?include=stopped，master 置顶）；
+                        POST 新建（代理 /api/v1/agents，fork 端点）
+    agents/kill/        POST（代理 /api/v1/agents/:name/kill，fork 端点）
+    agents/restart/     POST（代理 /api/v1/agents/:name/restart，fork 端点）
+    chat/send/          POST（代理 /api/v1/agents/:name/messages，wait=0）
+    chat/stream/        GET SSE（订阅 /api/v1/events → 按 agent 过滤 → 翻译成 WebStreamEvent）
+    chat/history/       GET ?agent=（代理 /api/v1/agents/:name/history[/:sid]，live+归档）
+    chat/interrupt/     POST（代理 /api/v1/agents/:name/interrupt，fork 端点）
+    chat/permission/    POST（代理 /api/v1/agents/:name/answer kind=permission）
+    chat/auq/           POST（代理 /api/v1/agents/:name/answer kind=auq）
 features/chat/
   type.ts               ChatMessage / AgentSession / ToolCallView / PendingPermission / PendingAsk
-  stream.ts             consumeSSEStream + processStreamEvent + StreamSink（含 setPermission/setAsk）
-  chat-store.ts         zenith 中枢（agents/messages/streaming/loadingHistory + pendingPermission/pendingAsk；
+  stream.ts             consumeSSEStream + processStreamEvent + StreamSink（协议 v1，迁移零改动）
+  chat-store.ts         zenith 中枢（agents/messages/streaming + pendingPermission/pendingAsk；
                         openGen 门控历史加载，streamGen 门控流；createAgent/killAgent/restartAgent；
                         interrupt/resolvePermission/submitAsk/cancelAsk）
-  components/           sidebar(AgentRow hover 出 重启/停止 + 新建按钮) / new-agent-modal
-                        / message-list（含 permission-card + ask-question-card 渲染）/ composer（streaming 时出「停止」）
-                        / permission-card / ask-question-card / chat(Provider)
+  components/           sidebar / new-agent-modal / message-list（permission-card + ask-question-card）
+                        / composer（streaming 时出「停止」）/ chat(Provider)
 lib/
   db/                   getDb + auth migration（数据根 ~/.claude-orchestrator/web/db）
   services/auth.service.ts  verifySSH(ssh2) + session CRUD
   api-auth.ts           isAuthed（cookie 或 x-api-key 双认证）
-  chat/                 events(段级流协议) / mock-bridge(pub/sub) / agents(读 registry.json,
-                        含 resolveSession 取 sessionId+cwd) / history(jsonl→ChatMessage[] 解析器)
+  chat/
+    bridge-api.ts       /api/v1 客户端中枢：BRIDGE、Bearer 头、bridgeGet/bridgePost、
+                        apiAgentName（__master__ ↔ master 映射）
+    agents.ts           loadAgents（GET /api/v1/agents?include=stopped → AgentSession[]）
+    events.ts           WebStreamEvent 前端协议 v1（tool/text/status/done/permission/ask…）
 proxy.ts                Next16 proxy：只拦页面 cookie；API 由 handler 自守
 ```
 
@@ -51,44 +59,61 @@ proxy.ts                Next16 proxy：只拦页面 cookie；API 由 handler 自
 - 双认证 `isAuthed()`：浏览器 cookie session，或外部脚本 `x-api-key === INTERNAL_API_KEY`。
 - **分层**：`proxy.ts` 只拦「页面」（无 cookie → /login）；API 路由各自在 handler 调 `isAuthed()`（遵 prin-475132；且 proxy 跑 edge 运行时读不到 `.env.local`）。
 - cookie 名用 `cstra_session`（不是 claude-os 的 `cos_session`）——localhost 下 cookie 按 host 不按端口隔离，必须避名。
+- **BFF → Bridge 的鉴权**：`CLAUDESTRA_API_TOKEN`（`.env.local`）。签发：
+  `bun src/manager.ts token-add web-ui --agents '*,master' --force`（master 必须显式列，`"*"` 不含）。
+  BFF 在 server 端带 `Authorization: Bearer`，浏览器永不直连 3847，也天然绕开
+  EventSource 不能带 header 的坑（guide §4.3）。
 
-## 数据流（BFF dual-mode：真实 Bridge / mock 回退）
+## 数据流（upstream /api/v1 + /events）
 
-会话 = 一个 claudestra agent。前端每打开一个 agent 建一条持久 SSE 流（`GET /api/chat/stream`）；`send` 只 fire-and-forget 注入（`POST /api/chat/send`），输出经该流回来。
+会话 = 一个 claudestra agent。前端每打开一个 agent：先拉历史（`GET /api/chat/history`），
+再建一条持久 SSE 流（`GET /api/chat/stream`）；`send` fire-and-forget（wait=0），输出经流回来。
 
-BFF（`app/api/chat/{send,stream}`）按 agent 是否有真实 channelId 分流（`lib/chat/agents.ts` 的 `resolveChannelId`，读 registry.json）：
-- **真实 agent**（registry 有 channelId）→ 服务端调 Bridge 的 `POST /web/inject` / 代理 `GET /web/stream?channelId=`（Bridge 侧 `bridge/web-hub.ts` + jsonl-watcher/reply tee）。浏览器永不直连 3847。
-- **mock agent**（registry 缺失/未起后端）→ `lib/chat/mock-bridge.ts` 的 globalThis pub/sub 模拟，保开发体验。
+- **列表**：`loadAgents` → Bridge `GET /api/v1/agents?include=stopped`。master 由 Bridge
+  置入（token scope 显式含 master），前端映射为 `__master__` 置顶（👑 大总管，不显 kill/restart）；
+  stopped agent 保留入口（历史经归档 API 仍可读——upstream 归档的意义）。
+- **发消息**：`POST /api/v1/agents/:name/messages {text, wait:0}` → 202。agent 离线 409。
+- **流式**：BFF 订阅 `GET /api/v1/events`（fetch-based SSE，带 Bearer），按
+  `agent ∈ {name, agent-name}` 过滤，把 BridgeEvent 翻译成前端 WebStreamEvent（协议 v1 不变）：
+  `agent_status(thinking/done)→status/done`、`tool_start→tool(running)`（tool_done 不重复推卡）、
+  `assistant_text→text`、`chat_message(out)→text`（reply() 的最终回复）、`question→ask`、
+  `question_cleared→ask-cleared`（fork 事件）、`auto_deny→text(🚫)`。连流后补拉
+  `GET /api/v1/agents/:name/pending` replay 挂起的 AUQ 卡（对应旧 web-hub 的 pendingInteraction）。
+- **历史**：`GET /api/v1/agents/:name/history` 取 session 清单（mtime 降序，live+归档合并，
+  对已 kill agent 有效）→ 最新 session 的尾部 300 条 → 映射 ChatMessage[]
+  （compactSummary 跳过；system compact 线渲染成轻提示）。**BFF 不再直读 jsonl / registry。**
+- **大总管**：Bridge 侧 `findApiAgent("master")` 特判（fork）——messages/history/interrupt/answer
+  对 master 透明可用。master 没有 jsonl-watcher，实时只有 reply 的 `chat_message(out)` + done；
+  历史从 jsonl 读所以带工具卡。
 
-两条路事件协议一致（`lib/chat/events.ts` 的 `WebStreamEvent`，与 Bridge 侧 `web-hub.ts` 对齐），前端零感知。
+## 富交互（中断 / 权限卡 / AskUserQuestion 卡）
 
-**历史消息（`chat/history`）例外：BFF 直接读盘，不经 Bridge。** 打开会话时 `chat-store.openAgent` 先 `loadMessages`（`GET /api/chat/history?agent=`）再连流。该路由用 `resolveSession` 从 registry 取 `sessionId+cwd`，由 `lib/chat/history.ts` 读 `~/.claude/projects/-<slug>/<sessionId>.jsonl` 解析成 `ChatMessage[]`。为什么直接读盘而非 Bridge `/web/history`：历史是纯只读磁盘操作、同机、**对已停止 agent 也有效**（Bridge 无 live `clients` 条目），且不碰 Discord 关键路径 `bridge.ts`。解析忠实复刻 `src/bridge/jsonl-watcher`：`hasReply` 时抑制 text 块、reply 工具(`mcp__<mcp>__reply`)的 `input.text` 作最终回复、非隐藏 `tool_use`→工具卡、按 human user 消息切 turn、剥 `<channel>` 包装、turn 内去重重复文本段。
+三者都「Bridge 事件下行 → 前端渲染卡片 → BFF 回传 fork 端点 → tmux 按键」，复用 Discord
+侧同款 keystroke 逻辑（buildAuqKeystrokes / 权限 keySeqMap + 发键前 tmuxCapture 重验）：
 
-**会话管理（`agents` POST / `agents/kill` / `agents/restart`）走 Bridge。** BFF 代理 Bridge 的 `/web/agents*`，Bridge 内部 `runManager("create"|"kill"|"restart")`（Bun 进程,bun 必在 PATH）。故 create/kill/restart 需 Bridge 在跑（与 send/stream 一致）。
-
-**大总管（master orchestrator）置顶入口 = 复刻 Discord #control。** sidebar 第一位是 👑 大总管（`MASTER_AGENT_NAME="__master__"`, `pinnedMaster`, 不显 kill/restart）。它**不在 registry**，靠 Bridge `GET /web/master` 拿 `{channelId:CONTROL_CHANNEL_ID, cwd:MASTER_DIR, sessionId:master slug 下最新 jsonl, connected}`；`/api/agents` 置顶它，send/stream/history 三个路由对 `__master__` 特判走 `getMasterInfo()`（`lib/chat/agents.ts`）而非 registry。行为对齐 Discord：大总管只把 `reply()` 结果 + `done` 流到 Web（它没 jsonl-watcher，内部 Bash/工具 churn 不流；但**历史**从 jsonl 读，会带上工具卡）。大总管由 launcher 常驻（见下）。
-
-## 富交互（Phase 2：中断 / 权限卡 / AskUserQuestion 卡）
-
-复刻 Discord Phase 2，三者都「Bridge tee 交互事件到 Web → 前端渲染卡片 → 回传打 tmux 按键」，**复用 Discord 侧已有的 keystroke 逻辑**（`resolveTmuxTarget` / `applyPermissionAction` / `buildAuqKeystrokes`），只换 Web 出入口。数据回路与聊天流同构：
-
-- **事件下行**：新增 4 个 `WebStreamEvent`（`permission` / `permission-cleared` / `ask` / `ask-cleared`），经 `/api/chat/stream`(SSE) → `processStreamEvent` → store `setPermission`/`setAsk` → `permission-card.tsx` / `ask-question-card.tsx` 渲染在 message-list 尾部。有卡时 `awaitingChunk` 置 false（在等用户不是等 agent，收起「思考中」dots）。
-- **回传上行**：卡片点按 → store `resolvePermission(action)` / `submitAsk(selections[][])` / `cancelAsk()` / `interrupt()` → BFF `/api/chat/{permission,auq,interrupt}` → Bridge `/web/{permission,auq,interrupt}` → tmux 按键。乐观清卡；Bridge 也会 SSE 推 `*-cleared` 兜底。
-- **迟到订阅补发**：交互卡有状态，SSE 可能在弹窗之后才连上（切会话/刷新/回前台）。Bridge `web-hub` 存 `pendingInteraction`，`/web/stream` 对新订阅者 replay 当前 pending 卡。故前端 `openAgent` 切会话时先清 `pendingPermission`/`pendingAsk`，连流后由 replay 补回。
-- **中断**：streaming 时 composer 出「■ 停止」按钮 → `interrupt()` → C-c，agent 回合被杀 + `done` 解锁输入。master / agent 均可（`resolveTmuxTarget` 认 `CONTROL_CHANNEL_ID`）。
-- **⚠ 权限卡测试坑**：agent 默认以 `bypassPermissions` 起（`src/lib/claude-launch.ts`），日常几乎不弹运行时权限 modal，所以权限卡**不易真机触发**（endpoint + keystroke 已 curl/单测验证，渲染路径与 AUQ 完全同构）。要真机复现权限卡，得起一个 `--permission-mode default/acceptEdits` 的 agent 再让它跑需授权的操作。AUQ 卡与中断都可正常真机触发（`AskUserQuestion` 工具与权限模式无关；中断任何 streaming 回合都行）。已真机验证（2026-07-04）：AUQ 卡渲染→单选→提交→键序列命中 TUI 精确选项（agent 回「你选了 火锅」）；中断在流式数数中途停在「4」并解锁输入。
+- **AUQ**：`question` 事件（jsonl-watcher 检测，data.questions）→ ask 卡 →
+  `POST /api/v1/agents/:name/answer {kind:"auq", action, selections[][]}`。应答后双侧
+  （API/Discord 按钮）发 `question_cleared` 收卡；迟到订阅用 `/pending` 补拉。
+- **中断**：streaming 时 composer 出「■ 停止」→ `POST .../interrupt` → C-c（master → master:0）。
+- **权限卡 ⚠ 已知缺口**：迁移后权限弹窗**事件下行暂缺**（upstream permission-watcher 只面向
+  Discord 且 web-only 模式未启动它）——卡片不会自动弹出；上行 `answer {kind:"permission"}` 保留
+  （发键前 Bridge 重验弹窗在场）。agent 默认 bypassPermissions，此卡本就罕见。session-idle
+  应答已随迁移移除。
 
 ## 运行 & 排障
 
-- **两个 launchd 常驻服务**（会话/终端无关，`RunAtLoad+KeepAlive`，plist 机器相关不入库、wrapper 入库；plist 务必含 `LANG/LC_ALL=en_US.UTF-8`）：
-  - `com.claudestra.web-bridge` → `scripts/web-only-bridge.sh`：确保 master tmux session（cwd=`master/`！）+ 带 `CONTROL_CHANNEL_ID=local-master-control` exec bridge。日志 `/tmp/claudestra-web-bridge.{out,err}`，端口 `lsof -iTCP:3847`。
-  - `com.claudestra.web-launcher` → `scripts/web-only-launcher.sh`：跑 `src/launcher.ts`（合成 `CONTROL_CHANNEL_ID`），确保 master:0 常驻大总管 Claude Code + 自动确认启动提示。日志 `/tmp/claudestra-web-launcher.{out,err}`。**⚠ 两个 wrapper 的 `CONTROL_CHANNEL_ID` 必须一致。**
-  - 装：写对应 plist → `launchctl bootstrap gui/$(id -u) <plist>`；查：`launchctl print gui/$(id -u)/<label>`；改代码后：`launchctl kickstart -k gui/$(id -u)/<label>`。
-  - 前置：`master/CLAUDE.md` 需已渲染（大总管 persona）——`USER_NAME=X python3 /tmp/render_master_claudemd.py` 或 `bun run setup`。渲染产物 git-ignored。
-  - 关掉 claudestra 自动更新（`bun src/manager.ts auto-update claudestra off`）：launcher 的自更新走 `git pull + pm2 restart`，launchd 下会坏。
-  - **别**用 `bun src/manager.ts install-cli`（那装官方 3-daemon 含 cron + 面向 Discord）。
-- 起 dev：`npm run dev`（若已在跑别重开，热更新会反映改动；探测用 `curl localhost:33333`）。
-- **⚠ 若本机 shell 全局设了 `NODE_ENV=production`**：`next dev` 会继承它 → 触发 non-standard 告警、且 `.env.local` 加载行为异常。用 `NODE_ENV=development npm run dev` 强制。
-- **⚠ `INTERNAL_API_KEY` 若在 shell 环境里已全局导出**（如与 claude-os 共用），会**盖过 `.env.local`**（Next.js 进程 env 优先级 > .env 文件）。x-api-key 认证「莫名失败」时先查 `echo $INTERNAL_API_KEY`。
-- Next 16 冷知识：`_` 开头的目录是私有的、**不路由**（`app/api/_x/` 不会注册）。
-- macOS 无 `timeout` 命令，测 SSE 长连接用 `curl --max-time N`。
+- **两个 launchd 常驻服务**（同前：`com.claudestra.web-bridge` / `com.claudestra.web-launcher`，
+  wrapper 在 `scripts/`，`CONTROL_CHANNEL_ID=local-master-control` 两边必须一致；改 bridge 代码后
+  `launchctl kickstart -k gui/$(id -u)/com.claudestra.web-bridge`）。Web-only 模式=不设
+  DISCORD_BOT_TOKEN（见 FORK.md）。
+- 起 dev：`npm run dev`（已在跑别重开；探测 `curl localhost:33333`）。
+- **⚠ 本机 shell 全局有 `NODE_ENV=production`**：用 `NODE_ENV=development npm run dev` 强制。
+- **⚠ `INTERNAL_API_KEY` 全局导出会盖过 `.env.local`**：`env -u INTERNAL_API_KEY` 起 dev。
+- **⚠ BRIDGE_HTTP_URL 必须用 `127.0.0.1` 不是 `localhost`**：Bridge 只绑 IPv4，localhost 的
+  ::1 歧义会让 Node fetch 偶发 connect 10s 超时（"fetch failed"）。
+- **⚠ /events SSE 空闲断流（已修）**：Bun.serve 默认 HTTP idleTimeout≈10s，upstream 原 30s ping
+  活不到第一轮——事件间隙 >10s 的订阅者被静默掐掉。fork 已改为连接即发 `: connected` + 5s ping
+  （bridge.ts handleEventsRequest）。merge upstream 后若流「偶尔收不到」先查这里有没有被冲掉。
+- **⚠ turbopack 冷启动**：dev 重启后的头几个 API 请求可能 401/502（env/编译未就绪），刷新即好。
+- cookie 7 天过期后页面自动跳 /login，重登即可。
+- Next 16 冷知识：`_` 开头目录不路由；macOS 无 `timeout`，测 SSE 用 `curl --max-time N`。
