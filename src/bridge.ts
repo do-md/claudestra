@@ -59,16 +59,22 @@ import { cleanupBgJob } from "./lib/bg-jobs.js";
 import { startSessionReconciler } from "./bridge/session-reconciler.js";
 import { startBgActivityWatcher } from "./bridge/bg-activity-watcher.js";
 import { startArchiveSweeper } from "./bridge/archive-sweeper.js";
+import {
+  initApiRoutes,
+  handleApiRequest,
+  sweepApiState,
+  pendingApiRequests,
+  apiThreadResults,
+  apiFiles,
+  apiReqKey,
+  type PendingApiRequest,
+  type ApiReplyResult,
+} from "./bridge/api-routes.js";
 // v2.6.0+ HTTP API 身份与授权（设计 §3.4 / §5）
 import {
   readPrincipals,
-  findByBearer,
-  agentInScope,
-  tokenIdOf,
-  SlidingWindowLimiter,
   syncDiscordOwnersFromEnv,
   listDiscordPrincipalIds,
-  type Principal,
 } from "./lib/principals.js";
 
 // ============================================================
@@ -172,47 +178,8 @@ interface PendingReply {
 }
 const pendingReplies = new Map<string, PendingReply>();
 
-// ============================================================
-// v2.6.0+ HTTP API 会话状态（多前端架构 Phase B，设计 §5）
-// ============================================================
-
-/**
- * 一次 POST /api/v1/agents/:name/messages 的追踪。key = `${tokenId}|${agentChannelId}`
- * （同 token 对同 agent 的并发请求按 FIFO 队列 resolve）。
- * agent 的 reply(chat_id="api:<tokenId>") 进 deliverToApi 时按 key 出队：
- * resolve 同步 waiter + emit chat_message(out)（带原请求 threadId）+ 存结果供轮询。
- */
-interface PendingApiRequest {
-  tokenId: string;
-  tokenName: string;
-  agentChannelId: string;
-  agentName: string;
-  threadId: string;
-  ts: number;
-  /** wait 模式挂的 resolver（无 wait 则为空） */
-  resolve?: (result: ApiReplyResult) => void;
-}
-interface ApiReplyResult {
-  reply: string | null;
-  components?: unknown[];
-  files?: { name: string; url: string }[];
-  threadId: string;
-  agent: string;
-  /** true = agent 没调 reply()，文本来自 Stop-hook drain 兜底（R3） */
-  viaFallback?: boolean;
-}
-const pendingApiRequests = new Map<string, PendingApiRequest[]>();
-/** threadId → 已完成结果（轮询兜底用，TTL 清理见 staleCleanup） */
-const apiThreadResults = new Map<string, { result: ApiReplyResult; ts: number }>();
-/** 出站附件登记：opaqueId → 本地路径 + 属主 token（防任意文件读取） */
-const apiFiles = new Map<string, { path: string; tokenId: string; name: string }>();
-/** per-token 限流器（30 req/min，内存态） */
-const apiLimiters = new Map<string, SlidingWindowLimiter>();
-const API_REQUEST_TTL_MS = 10 * 60_000;
-
-function apiReqKey(tokenId: string, agentChannelId: string): string {
-  return `${tokenId}|${agentChannelId}`;
-}
+// v2.6.0+ HTTP API 会话状态与 /api/v1 路由：v2.9.2 起拆到 bridge/api-routes.ts。
+// deliverToApi（出站回路）读写那边的状态 Map；staleCleanup 调 sweepApiState。
 
 /**
  * thread → 原始请求 envelope 的追踪。deliverToLocal 在 intent=request 时挂一条，
@@ -4241,23 +4208,7 @@ setInterval(() => {
     }
   }
   // v2.6.0+ API 会话状态 TTL（10min）：pending 请求、轮询结果、附件登记
-  for (const [key, queue] of pendingApiRequests.entries()) {
-    const fresh = queue.filter((p) => now - p.ts <= API_REQUEST_TTL_MS);
-    if (fresh.length === 0) pendingApiRequests.delete(key);
-    else if (fresh.length !== queue.length) pendingApiRequests.set(key, fresh);
-  }
-  for (const [tid, hit] of apiThreadResults.entries()) {
-    if (now - hit.ts > API_REQUEST_TTL_MS) apiThreadResults.delete(tid);
-  }
-  if (apiFiles.size > 200) {
-    // 附件登记只按容量截断（文件本身在 TMP_DIR，系统自己清）
-    const excess = apiFiles.size - 200;
-    let i = 0;
-    for (const k of apiFiles.keys()) {
-      if (i++ >= excess) break;
-      apiFiles.delete(k);
-    }
-  }
+  sweepApiState(now);
   for (const [channelId, pending] of pendingInterAgentMsg.entries()) {
     if (now - pending.ts > STALE_MS) {
       pendingInterAgentMsg.delete(channelId);
@@ -4682,354 +4633,16 @@ function handleEventsRequest(req: Request, extraFilter?: EventFilter): Response 
   });
 }
 
-// ============================================================
-// v2.6.0+ /api/v1/* —— token 鉴权的入站 HTTP API（设计 §5）
-// ============================================================
-
-function apiJson(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-/** Bearer 鉴权 + 限流。失败直接返回 Response，成功返回 principal。 */
-async function authApi(req: Request): Promise<Principal | Response> {
-  const auth = req.headers.get("Authorization") || "";
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  if (!m) return apiJson(401, { ok: false, error: "missing Authorization: Bearer <secret>" });
-  const file = await readPrincipals();
-  const p = findByBearer(file, m[1].trim());
-  if (!p) return apiJson(401, { ok: false, error: "invalid or revoked token" });
-  const tid = tokenIdOf(p);
-  let limiter = apiLimiters.get(tid);
-  if (!limiter) {
-    limiter = new SlidingWindowLimiter();
-    apiLimiters.set(tid, limiter);
-  }
-  if (!limiter.tryAcquire()) return apiJson(429, { ok: false, error: "rate limit exceeded (30 req/min)" });
-  return p;
-}
-
-/** registry 名双向兼容（"worker" ↔ "agent-worker"），返回 manager list 里的条目 */
-async function findApiAgent(name: string): Promise<{ name: string; channelId: string; idle?: boolean; status?: string; purpose?: string; cwd?: string; sessionId?: string } | null> {
-  try {
-    const listResult = await runManager("list");
-    const agents = (listResult.agents || []) as any[];
-    return agents.find((a) => a.name === name || a.name === `agent-${name}` || `agent-${a.name}` === name) ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function handleApiRequest(req: Request, url: URL): Promise<Response> {
-  const auth = await authApi(req);
-  if (auth instanceof Response) return auth;
-  const principal = auth;
-  const tokenId = tokenIdOf(principal);
-  const path = url.pathname.slice("/api/v1".length);
-
-  // GET /api/v1/agents —— scope 内的 agent 快照
-  if (path === "/agents" && req.method === "GET") {
-    try {
-      const listResult = await runManager("list");
-      const agents = ((listResult.agents || []) as any[])
-        .filter((a) => agentInScope(principal, a.name))
-        .map((a) => ({ name: a.name, status: a.status, idle: a.idle, purpose: a.purpose }));
-      return apiJson(200, { ok: true, agents });
-    } catch (e) {
-      return apiJson(500, { ok: false, error: (e as Error).message });
-    }
-  }
-
-  // v2.7+ GET /api/v1/sessions —— 全机器 Claude 会话清单（agents 模式适配，
-  // 中性 NeutralSessionInfo；Discord 面板与 web 前端共用同一数据源）。
-  // scope 规则：全权 token（"*"）看全部（含野生会话）；受限 token 只看 scope
-  // 内 agent 的正式会话及其分身。
-  if (path === "/sessions" && req.method === "GET") {
-    const list = await collectSessions();
-    if (list === null) return apiJson(503, { ok: false, error: "claude agents --json unavailable" });
-    const full = principal.agents.includes("*");
-    const visible = full
-      ? list
-      : list.filter((s) => {
-          const owner = s.registeredAgent ?? s.doppelgangerOf;
-          return owner ? agentInScope(principal, owner) : false;
-        });
-    return apiJson(200, { ok: true, sessions: visible });
-  }
-
-  // v2.7+ POST /api/v1/sessions/:bgId/cleanup —— 清理 bg job（死分身/残留）。
-  // 耗时操作（kill → 等 daemon 静默 → 隔离目录，最长 ~90s）→ 202 后台执行，
-  // 结果以 session_anomaly kind=cleanup_result 进事件流。仅全权 token。
-  const cleanupMatch = path.match(/^\/sessions\/([^/]+)\/cleanup$/);
-  if (cleanupMatch && req.method === "POST") {
-    if (!principal.agents.includes("*")) {
-      return apiJson(403, { ok: false, error: "cleanup requires a full-scope token" });
-    }
-    const bgId = decodeURIComponent(cleanupMatch[1]);
-    const list = await collectSessions();
-    const target = list?.find((s) => s.bgId === bgId && s.kind === "background");
-    if (!target) return apiJson(404, { ok: false, error: `bg session "${bgId}" not found` });
-    cleanupBgJob(bgId, { pid: target.pid })
-      .then((r) => {
-        emitEvent({
-          agent: target.doppelgangerOf ?? target.name ?? bgId,
-          chatId: "",
-          type: "session_anomaly",
-          data: { kind: "cleanup_result", bgId, ...r },
-        });
-      })
-      .catch(() => {});
-    return apiJson(202, {
-      ok: true,
-      accepted: true,
-      hint: "cleanup runs in background; watch /api/v1/events for session_anomaly kind=cleanup_result",
-    });
-  }
-
-  // v2.7+ POST /api/v1/sessions/:sessionId/adopt —— 收编：把该 session 立为
-  // 某正式 agent 的会话并重启拉起（body: {"agent": "<name>"}）。仅全权 token。
-  const adoptMatch = path.match(/^\/sessions\/([^/]+)\/adopt$/);
-  if (adoptMatch && req.method === "POST") {
-    if (!principal.agents.includes("*")) {
-      return apiJson(403, { ok: false, error: "adopt requires a full-scope token" });
-    }
-    const sid = decodeURIComponent(adoptMatch[1]);
-    let agentName = "";
-    try {
-      agentName = String(((await req.json()) as any)?.agent || "");
-    } catch {
-      /* fallthrough → 400 */
-    }
-    if (!agentName) return apiJson(400, { ok: false, error: 'body must be {"agent": "<name>"}' });
-    runManager("adopt", agentName, sid)
-      .then((r) => {
-        emitEvent({
-          agent: agentName,
-          chatId: "",
-          type: "session_anomaly",
-          data: { kind: "adopt_result", sessionId: sid, ok: !!r?.ok, ...r },
-        });
-      })
-      .catch(() => {});
-    return apiJson(202, {
-      ok: true,
-      accepted: true,
-      hint: "adoption runs in background (~1-2 min); watch /api/v1/events for session_anomaly kind=adopt_result",
-    });
-  }
-
-  // GET /api/v1/events —— token 版 SSE（按 scope 过滤事件）
-  if (path === "/events" && req.method === "GET") {
-    let scopeAgents: string[] | undefined;
-    if (!principal.agents.includes("*")) {
-      // 双向兼容前缀：scope 里存裸名时补 agent- 前缀的变体
-      scopeAgents = principal.agents.flatMap((a) => [a, `agent-${a}`]);
-    }
-    return handleEventsRequest(req, scopeAgents ? { agents: scopeAgents } : undefined);
-  }
-
-  // GET /api/v1/threads/:threadId —— wait 超时后的轮询兜底
-  const threadMatch = path.match(/^\/threads\/([^/]+)$/);
-  if (threadMatch && req.method === "GET") {
-    const hit = apiThreadResults.get(threadMatch[1]);
-    if (!hit) return apiJson(404, { ok: false, error: "thread not found (not answered yet, or expired)" });
-    return apiJson(200, { ok: true, ...hit.result });
-  }
-
-  // GET /api/v1/files/:id —— 出站附件下载（校验属主 token）
-  const fileMatch = path.match(/^\/files\/([^/]+)$/);
-  if (fileMatch && req.method === "GET") {
-    const entry = apiFiles.get(fileMatch[1]);
-    if (!entry || entry.tokenId !== tokenId) return apiJson(404, { ok: false, error: "file not found" });
-    const f = Bun.file(entry.path);
-    if (!(await f.exists())) return apiJson(410, { ok: false, error: "file no longer on disk" });
-    return new Response(f, {
-      headers: { "Content-Disposition": `attachment; filename="${encodeURIComponent(entry.name)}"` },
-    });
-  }
-
-  // v2.9+ GET /api/v1/agents/:name/history —— session 清单（live + 归档快照）。
-  // agent 已被 kill 时归档仍可读（这正是归档存在的意义），所以 registry 查不到
-  // 不算 404，降级为只列归档。响应不含服务器路径（path 字段剥掉）。
-  const histListMatch = path.match(/^\/agents\/([^/]+)\/history$/);
-  if (histListMatch && req.method === "GET") {
-    const agentParam = decodeURIComponent(histListMatch[1]);
-    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
-      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
-    }
-    const agent = await findApiAgent(agentParam);
-    const canonical = agent?.name ?? (agentParam.startsWith("agent-") ? agentParam : `agent-${agentParam}`);
-    const sessions = await listAgentSessions(canonical, {
-      cwd: agent?.cwd,
-      currentSessionId: agent?.sessionId,
-    });
-    if (!agent && !sessions.length) {
-      return apiJson(404, { ok: false, error: `agent "${agentParam}" not found (no registry entry, no archives)` });
-    }
-    return apiJson(200, {
-      ok: true,
-      agent: canonical,
-      sessions: sessions.map(({ path: _p, ...rest }) => rest),
-    });
-  }
-
-  // v2.9+ GET /api/v1/agents/:name/history/:sessionId —— 消息分页
-  //   ?limit=100（1..500）&before=<seq 往前翻页>&subagent=agent-xxx（读 subagent 会话）
-  const histSessMatch = path.match(/^\/agents\/([^/]+)\/history\/([^/]+)$/);
-  if (histSessMatch && req.method === "GET") {
-    const agentParam = decodeURIComponent(histSessMatch[1]);
-    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
-      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
-    }
-    const sid = decodeURIComponent(histSessMatch[2]);
-    if (!isValidSessionId(sid)) return apiJson(400, { ok: false, error: "invalid sessionId" });
-    const agent = await findApiAgent(agentParam);
-    const canonical = agent?.name ?? (agentParam.startsWith("agent-") ? agentParam : `agent-${agentParam}`);
-    const sessions = await listAgentSessions(canonical, {
-      cwd: agent?.cwd,
-      currentSessionId: agent?.sessionId,
-    });
-    const found = sessions.find((s) => s.sessionId === sid);
-    if (!found) return apiJson(404, { ok: false, error: `session "${sid}" not found for agent "${canonical}"` });
-
-    let file = found.path;
-    const subagent = url.searchParams.get("subagent");
-    if (subagent) {
-      if (!isValidSubagentId(subagent)) return apiJson(400, { ok: false, error: "invalid subagent id" });
-      file = `${found.path.replace(/\.jsonl$/, "")}/subagents/${subagent}.jsonl`;
-      if (!existsSync(file)) return apiJson(404, { ok: false, error: `subagent "${subagent}" not found in session` });
-    }
-    const limitRaw = Number(url.searchParams.get("limit") || 100);
-    const beforeRaw = url.searchParams.get("before");
-    const before = beforeRaw != null ? Number(beforeRaw) : undefined;
-    try {
-      const page = await readSessionHistory(file, {
-        limit: Number.isFinite(limitRaw) ? limitRaw : 100,
-        before: before != null && Number.isFinite(before) ? before : undefined,
-        formatToolFn: formatTool,
-      });
-      return apiJson(200, {
-        ok: true,
-        agent: canonical,
-        sessionId: sid,
-        source: found.source,
-        ...(subagent ? { subagent } : {}),
-        ...page,
-      });
-    } catch (e) {
-      return apiJson(500, { ok: false, error: (e as Error).message });
-    }
-  }
-
-  // POST /api/v1/agents/:name/messages —— 给 agent 发消息（同步 wait / 202+轮询）
-  const msgMatch = path.match(/^\/agents\/([^/]+)\/messages$/);
-  if (msgMatch && req.method === "POST") {
-    const agentParam = decodeURIComponent(msgMatch[1]);
-    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
-      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
-    }
-    const agent = await findApiAgent(agentParam);
-    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
-    const client = clients.get(agent.channelId);
-    if (!client) return apiJson(409, { ok: false, error: `agent "${agent.name}" is offline (no active session)` });
-
-    // body：JSON {text, wait} 或 multipart（text 字段 + files，R5 入站附件）
-    let text = "";
-    let waitSec = 0;
-    const attachments: string[] = [];
-    const contentType = req.headers.get("Content-Type") || "";
-    try {
-      if (contentType.includes("multipart/form-data")) {
-        const form = await req.formData();
-        text = String(form.get("text") || "");
-        waitSec = Number(form.get("wait") || 0);
-        const inboxDir = `${TMP_DIR}/inbox`;
-        await Bun.spawn(["mkdir", "-p", inboxDir]).exited;
-        const files = form.getAll("files").filter((f): f is File => f instanceof File).slice(0, 5);
-        for (const f of files) {
-          if (f.size > 10 * 1024 * 1024) return apiJson(413, { ok: false, error: `file "${f.name}" exceeds 10MB` });
-          const dest = `${inboxDir}/api_${Date.now()}_${f.name.replace(/[^\w.\-]/g, "_")}`;
-          await Bun.write(dest, f);
-          attachments.push(dest);
-        }
-      } else {
-        const body = (await req.json()) as { text?: string; wait?: number };
-        text = String(body.text || "");
-        waitSec = Number(body.wait || 0);
-      }
-    } catch {
-      return apiJson(400, { ok: false, error: "invalid body (JSON {text, wait?} or multipart with text/files)" });
-    }
-    if (!text.trim() && attachments.length === 0) {
-      return apiJson(400, { ok: false, error: "text is required" });
-    }
-    waitSec = Math.min(Math.max(waitSec, 0), 300);
-
-    const tokenName = principal.name || tokenId;
-    const threadId = newThreadId();
-    const env: RouterEnvelope = {
-      from: { kind: "api", tokenId, name: tokenName },
-      to: { kind: "local", agentName: agent.name, channelId: agent.channelId, ws: client.ws, cwd: client.cwd },
-      intent: "request",
-      content: text,
-      meta: {
-        messageId: `api_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        triggerKind: "system",
-        ts: new Date().toISOString(),
-        threadId,
-        attachments: attachments.length ? attachments : undefined,
-        // API 请求不需要 inter-agent watchdog（有自己的 wait/轮询语义）
-        skipInterAgentWatchdog: true,
-      },
-    };
-
-    // 挂 pending（无论是否 wait —— deliverToApi 靠它关联 threadId / R3 兜底靠它找 waiter）
-    const key = apiReqKey(tokenId, agent.channelId);
-    const entry: PendingApiRequest = {
-      tokenId,
-      tokenName,
-      agentChannelId: agent.channelId,
-      agentName: agent.name,
-      threadId,
-      ts: Date.now(),
-    };
-    const queue = pendingApiRequests.get(key) || [];
-    queue.push(entry);
-    pendingApiRequests.set(key, queue);
-
-    const delivery = await deliver(env);
-    if (delivery.outcome.kind !== "sent") {
-      const idx = queue.indexOf(entry);
-      if (idx >= 0) queue.splice(idx, 1);
-      const reason = delivery.outcome.kind === "dropped" ? delivery.outcome.reason : (delivery.outcome as any).error?.message;
-      return apiJson(502, { ok: false, error: `delivery failed: ${reason || "unknown"}` });
-    }
-
-    // R2 入站镜像
-    mirrorApiExchange({ kind: "api", tokenId, name: tokenName }, agent.channelId, `[🌐 API←${tokenName}] ${text}`).catch(() => {});
-    startTypingWithSafety(agent.channelId);
-    // API 触发的 turn 不发 Stop 完成通知 @ owner（回复走 API 回路 + R2 镜像已可见）
-    lastMessageSource.set(agent.channelId, "agent");
-
-    if (waitSec === 0) {
-      return apiJson(202, { ok: true, accepted: true, threadId, agent: agent.name, hint: `poll GET /api/v1/threads/${threadId} or subscribe /api/v1/events` });
-    }
-
-    const result = await new Promise<ApiReplyResult | null>((resolve) => {
-      entry.resolve = resolve;
-      setTimeout(() => resolve(null), waitSec * 1000);
-    });
-    if (!result) {
-      entry.resolve = undefined; // 超时后 deliverToApi/R3 仍会把结果写进 apiThreadResults
-      return apiJson(202, { ok: true, accepted: true, timedOut: true, threadId, agent: agent.name, hint: `poll GET /api/v1/threads/${threadId}` });
-    }
-    return apiJson(200, { ok: true, ...result });
-  }
-
-  return apiJson(404, { ok: false, error: "unknown endpoint" });
-}
+// /api/v1 路由与鉴权：v2.9.2 起整体在 bridge/api-routes.ts。这里注入它需要的
+// bridge 运行时依赖（ws 会话表 / 统一投递 / 镜像 / typing / SSE 处理器）。
+initApiRoutes({
+  clients,
+  deliver,
+  mirrorApiExchange,
+  startTypingWithSafety,
+  lastMessageSource,
+  handleEventsRequest,
+});
 
 const server = Bun.serve({
   port: BRIDGE_PORT,
