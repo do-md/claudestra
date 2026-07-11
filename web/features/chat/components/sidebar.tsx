@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
+import { ClearAgentModal } from "./clear-agent-modal";
 
 function StatusDot({ status }: { status: AgentSession["status"] }) {
   if (status === "active") {
@@ -37,6 +38,26 @@ function RestartIcon() {
   );
 }
 
+/** 清空：扫帚（远程 /clear，上下文清零 + 可选开机指令） */
+function BroomIcon() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M19 3l-8.5 8.5" />
+      <path d="M13.5 8.5L5 13c-1.5.8-2.5 2.3-3 4.5-.2 1 .5 2.5 1.5 2.5 3.5 0 6-1 8-3l4-4.5" />
+      <path d="M9 15l2.5 2.5" />
+    </svg>
+  );
+}
+
 /** 停止：电源符号（关闭该 agent，语义比「■」更贴切） */
 function PowerIcon() {
   return (
@@ -60,10 +81,12 @@ function AgentRow({
   a,
   active,
   onSelect,
+  onClear,
 }: {
   a: AgentSession;
   active: boolean;
   onSelect: () => void;
+  onClear: () => void;
 }) {
   const store = useChatStoreApi();
   const [busy, setBusy] = useState<"" | "kill" | "restart">("");
@@ -121,36 +144,54 @@ function AgentRow({
           </span>
         </button>
 
-        {!a.mock && !a.pinnedMaster && (
+        {!a.mock && (
           // 触控设备无 hover，<sm 强制常显（max-sm:opacity-100）+ 加大触控尺寸
           <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 max-sm:opacity-100">
-            <button
-              className="btn btn-ghost btn-sm px-1.5 text-base-content/60 hover:text-base-content sm:btn-xs"
-              title="重启"
-              aria-label="重启"
-              onClick={(e) => act(e, "restart")}
-              disabled={busy !== ""}
-            >
-              {busy === "restart" ? (
-                <span className="loading loading-spinner loading-xs" />
-              ) : (
-                <RestartIcon />
-              )}
-            </button>
             {a.status === "active" && (
               <button
-                className="btn btn-ghost btn-sm px-1.5 text-base-content/60 hover:text-error sm:btn-xs"
-                title="停止"
-                aria-label="停止"
-                onClick={(e) => act(e, "kill")}
+                className="btn btn-ghost btn-sm px-1.5 text-base-content/60 hover:text-warning sm:btn-xs"
+                title="清空会话（/clear + 开机指令）"
+                aria-label="清空会话"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onClear();
+                }}
                 disabled={busy !== ""}
               >
-                {busy === "kill" ? (
-                  <span className="loading loading-spinner loading-xs" />
-                ) : (
-                  <PowerIcon />
-                )}
+                <BroomIcon />
               </button>
+            )}
+            {!a.pinnedMaster && (
+              <>
+                <button
+                  className="btn btn-ghost btn-sm px-1.5 text-base-content/60 hover:text-base-content sm:btn-xs"
+                  title="重启"
+                  aria-label="重启"
+                  onClick={(e) => act(e, "restart")}
+                  disabled={busy !== ""}
+                >
+                  {busy === "restart" ? (
+                    <span className="loading loading-spinner loading-xs" />
+                  ) : (
+                    <RestartIcon />
+                  )}
+                </button>
+                {a.status === "active" && (
+                  <button
+                    className="btn btn-ghost btn-sm px-1.5 text-base-content/60 hover:text-error sm:btn-xs"
+                    title="停止"
+                    aria-label="停止"
+                    onClick={(e) => act(e, "kill")}
+                    disabled={busy !== ""}
+                  >
+                    {busy === "kill" ? (
+                      <span className="loading loading-spinner loading-xs" />
+                    ) : (
+                      <PowerIcon />
+                    )}
+                  </button>
+                )}
+              </>
             )}
           </span>
         )}
@@ -170,6 +211,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const agents = useChatStore((s) => s.state.agents);
   const loading = useChatStore((s) => s.state.loadingAgents);
   const active = useChatStore((s) => s.state.activeAgent);
+  const [clearTarget, setClearTarget] = useState<AgentSession | null>(null);
 
   return (
     <aside className="flex w-full shrink-0 flex-col border-r border-base-300 bg-base-200 sm:w-64">
@@ -197,6 +239,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
               a={a}
               active={active === a.name}
               onSelect={onSelect}
+              onClear={() => setClearTarget(a)}
             />
           ))}
         </ul>
@@ -209,6 +252,13 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
       >
         Claudestra Web
       </div>
+
+      {clearTarget && (
+        <ClearAgentModal
+          agent={clearTarget}
+          onClose={() => setClearTarget(null)}
+        />
+      )}
     </aside>
   );
 }

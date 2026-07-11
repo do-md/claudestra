@@ -226,16 +226,47 @@ export function MessageList() {
   const pendingPermission = useChatStore((s) => s.state.pendingPermission);
   const pendingAsk = useChatStore((s) => s.state.pendingAsk);
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const followRef = useRef(true);
 
-  // 滚到底部：直接设本滚动容器的 scrollTop，不用 scrollIntoView——后者会同时滚动
-  // 「所有可滚祖先、双轴」，包括 overflow:hidden 的应用壳根（视觉裁剪但可被程序滚动）。
-  // 移动端横滑动画进行中历史恰好落地时，scrollIntoView 会给根容器塞 scrollLeft 把
-  // 半途的锚点「拉进来」，残留量叠在 translate -100% 上 → 会话页越过目标位、渲染不满视窗
-  // （owner 真机截图 2026-07-11）。scrollTop 只动纵轴、只动本容器，无此副作用。
+  /* 滚动方案（抄 claude-os thread.tsx 的两层结构，坑都踩过了别改回去）：
+     ① 只在「消息条数/卡片」变化时 smooth 滚底——deps 用 messages.length 而非 messages：
+        流式 chunk 每次都替换数组但条数不变，若拿整个数组做 dep，effect 会以 ~百ms 级
+        频率重启 smooth 滚动，每次都在缓动起步段就被下一次打断 → 永远停在顶部。
+     ② 内容「长高」用 ResizeObserver 吸底跟随（instant，不可打断）——历史加载后 Domd
+        富文本是异步渲染的（实测点开 1.4s 时才 614px、2.4s 长到 18711px），流式增量同理；
+        follow 语义：用户上翻离底 >90px 就不打扰，回到底部附近恢复吸底。
+     ③ 一律 scrollTo/scrollTop 操作本容器，不用 scrollIntoView——它会滚动「所有可滚
+        祖先、双轴」，包括 overflow:hidden 的应用壳根：移动端横滑动画中历史恰好落地时，
+        根被塞进 scrollLeft，残留量叠在 translate -100% 上 → 会话页「弹过头」渲染不满
+        视窗（owner 真机截图 2026-07-11）。 */
+  useEffect(() => {
+    followRef.current = true; // 切会话恢复吸底
+  }, [active]);
+
   useEffect(() => {
     const el = scrollerRef.current;
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-  }, [messages, awaiting, pendingPermission, pendingAsk]);
+    followRef.current = true;
+  }, [messages.length, awaiting, pendingPermission, pendingAsk]);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    const inner = el?.firstElementChild;
+    if (!el || !inner) return;
+    const onScroll = () => {
+      followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+    };
+    el.addEventListener("scroll", onScroll);
+    const ro = new ResizeObserver(() => {
+      console.log(`[scrollfx] ro follow=${followRef.current} sh=${el.scrollHeight} st=${el.scrollTop}`);
+      if (followRef.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(inner);
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+    };
+  }, [active]);
 
   if (!active) {
     return (

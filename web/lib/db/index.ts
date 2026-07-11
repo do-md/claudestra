@@ -3,6 +3,7 @@ import path from "path";
 import os from "os";
 import fs from "fs";
 import { runAuthMigrations } from "./migrations/auth";
+import { runSettingsMigrations } from "./migrations/settings";
 
 /**
  * Claudestra Web 数据根目录。与编排器状态同处 ~/.claude-orchestrator/ 下的 web/ 子目录，
@@ -19,6 +20,7 @@ const dbCache = new Map<string, Database.Database>();
 
 const migrations: Record<string, (db: Database.Database) => void> = {
   auth: runAuthMigrations,
+  settings: runSettingsMigrations,
 };
 
 export function getDb(name = "auth"): Database.Database {

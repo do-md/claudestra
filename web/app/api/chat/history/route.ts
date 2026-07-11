@@ -63,6 +63,13 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
         out.push({ id: `h${m.seq}`, role: "assistant", content: "── 已被用户中断 ──", ts: m.ts });
         continue;
       }
+      // TUI 斜杠命令记录（如 clear 后新会话首条 <command-name>/clear</command-name>）
+      // 不是用户打的字 → 渲染成轻分隔线
+      const cmdMatch = (m.text || "").match(/^<command-name>(\/[\w-]+)<\/command-name>/);
+      if (cmdMatch) {
+        out.push({ id: `h${m.seq}`, role: "assistant", content: `── ${cmdMatch[1]} ──`, ts: m.ts });
+        continue;
+      }
       const from = m.from && !SELF_FROM.has(m.from) ? m.from : undefined;
       out.push({ id: `h${m.seq}`, role: "user", content: m.text || "", ts: m.ts, from });
       continue;

@@ -120,6 +120,7 @@ import {
   detectSessionIdlePrompt,
   tmuxSendLine,
   tmuxRaw,
+  paneLooksIdle,
   parseModalOptions,
   detectArrowNavModal,
   detectPermissionMode,
@@ -4763,6 +4764,47 @@ function latestSessionIdForCwd(cwd: string): string | undefined {
   }
 }
 
+/**
+ * [fork] clear 后的会话轮转收尾（后台异步）。
+ *
+ * TUI 里 /clear 会轮转 sessionId，但新 session 的 jsonl 往往要等**首条消息**
+ * 才落盘——所以 clear 端点先返回 202，这里每 1.5s poll cwd 的 projects slug
+ * 目录，见到「不属于任何其他 agent 的新 jsonl」就：
+ *   manager set-session（归档旧会话 + registry 切换，保持 manager 唯一写者）
+ *   → stopWatchingByChannel + startWatching 重绑 jsonl-watcher（否则盯死文件，
+ *     工具流断掉）。
+ * 超时（2min，比如该 CC 版本 /clear 不轮转 session）则放弃，watcher 维持原样。
+ * 同 cwd 可能有多个 agent —— probe 到的 sid 若是别的 agent 的官方 session 则跳过。
+ */
+function scheduleClearRotation(agentName: string, channelId: string, cwd: string, oldSid?: string) {
+  const deadline = Date.now() + 120_000;
+  const tick = async () => {
+    try {
+      const sid = latestSessionIdForCwd(cwd);
+      if (sid && sid !== oldSid) {
+        const listResult = await runManager("list");
+        const ownedByOther = ((listResult.agents || []) as any[]).some(
+          (a) => a.name !== agentName && a.sessionId === sid,
+        );
+        if (!ownedByOther) {
+          const r = await runManager("set-session", agentName, sid);
+          if (r?.ok) {
+            stopWatchingByChannel(channelId);
+            startWatching(agentName, cwd, sid, channelId, discord);
+            console.log(`🧹 clear 轮转完成 agent=${agentName} ${oldSid?.slice(0, 8) ?? "?"}→${sid.slice(0, 8)}`);
+          } else {
+            console.error(`🧹 clear 轮转 set-session 失败 agent=${agentName}:`, r?.error);
+          }
+          return;
+        }
+      }
+    } catch { /* 下一轮重试 */ }
+    if (Date.now() < deadline) setTimeout(tick, 1500);
+    else console.warn(`🧹 clear 轮转超时 agent=${agentName}（未见新 session jsonl，watcher 维持原 session）`);
+  };
+  setTimeout(tick, 1200);
+}
+
 /** registry 名双向兼容（"worker" ↔ "agent-worker"），返回 manager list 里的条目 */
 async function findApiAgent(name: string): Promise<{ name: string; channelId: string; idle?: boolean; status?: string; purpose?: string; cwd?: string; sessionId?: string } | null> {
   // [fork] master 特判：master 不在 registry。channelId = CONTROL_CHANNEL_ID，
@@ -5147,6 +5189,52 @@ async function handleApiRequest(req: Request, url: URL): Promise<Response> {
     clearSafetyTimer(agent.channelId);
     console.log(`⚡ [api] C-c 已发送给 ${agent.name} (token=${tokenId})`);
     return apiJson(200, { ok: true, agent: agent.name });
+  }
+
+  // [fork] POST /api/v1/agents/:name/clear —— 远程调用 CC 原生 /clear（清上下文）。
+  // 语义分层（owner 哲学对齐）：本端点只做「打 /clear + 会话轮转收尾」这件原生事；
+  // clear 后要不要发开机指令、发什么，是前端（用户层）的事，这里零感知。
+  // master：/clear 后 CLAUDE.md 人设自动重载，且不在 registry、无 watcher —— 只发键。
+  const clearMatch = path.match(/^\/agents\/([^/]+)\/clear$/);
+  if (clearMatch && req.method === "POST") {
+    const agentParam = decodeURIComponent(clearMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const isMasterClear = agent.name === "master";
+    const targetWindow = isMasterClear ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
+    // 回合进行中打 /clear 会插进对话流 → 先验 idle（与权限按钮同款防误击思路）
+    let pane = "";
+    try {
+      pane = await tmuxCapture(targetWindow, 40);
+    } catch (e) {
+      return apiJson(502, { ok: false, error: `tmux 不可达: ${(e as Error).message}` });
+    }
+    if (!paneLooksIdle(pane)) {
+      return apiJson(409, { ok: false, error: "agent 正在回合中，先停止（interrupt）再 clear" });
+    }
+    try {
+      await tmuxSendLine(targetWindow, "/clear");
+    } catch (e) {
+      return apiJson(500, { ok: false, error: `tmux 发送失败: ${(e as Error).message}` });
+    }
+    recordMetric("agent_clear", { channelId: agent.channelId, agent: agent.name, meta: { trigger: "api" } });
+    console.log(`🧹 [api] /clear 已发送给 ${agent.name} (token=${tokenId})`);
+    if (isMasterClear) {
+      return apiJson(200, { ok: true, agent: "master" });
+    }
+    // 会话轮转收尾在后台跑（新 jsonl 可能等首条消息才出现）
+    if (agent.cwd) {
+      scheduleClearRotation(agent.name, agent.channelId, agent.cwd, agent.sessionId);
+    }
+    return apiJson(202, {
+      ok: true,
+      accepted: true,
+      agent: agent.name,
+      hint: "session rotation completes in background; watcher rebinds when the new session jsonl appears",
+    });
   }
 
   // [fork] POST /api/v1/agents/:name/answer —— 交互卡回传。

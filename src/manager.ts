@@ -2955,6 +2955,37 @@ switch (cmd) {
     break;
   }
 
+  // [fork] set-session：把 agent 的官方 sessionId 切到新值（先归档旧会话）。
+  // 供 bridge 的 clear 端点用：TUI 里 /clear 会轮转 sessionId，registry 若不跟着
+  // 换，jsonl-watcher 会盯死文件。registry 写入必须经 manager（唯一写者不变式）。
+  case "set-session": {
+    const [name, newSid] = args;
+    if (!name || !newSid) {
+      output({ ok: false, error: "用法: set-session <name> <sessionId>" });
+      break;
+    }
+    if (!/^[0-9a-f-]{8,64}$/i.test(newSid)) {
+      output({ ok: false, error: `sessionId 形状非法: ${newSid}` });
+      break;
+    }
+    const tmuxName = normalizeName(name);
+    const reg = await loadRegistry();
+    const info = reg.agents[tmuxName];
+    if (!info) {
+      output({ ok: false, error: `${tmuxName} 不在 registry` });
+      break;
+    }
+    const oldSid = info.sessionId || null;
+    // 旧会话退役 → 归档快照（对齐 kill/fork 轮转的退役语义）
+    if (oldSid && oldSid !== newSid) {
+      await archiveSession(tmuxName, info.cwd, oldSid).catch(() => {});
+    }
+    info.sessionId = newSid;
+    await saveRegistry(reg);
+    output({ ok: true, name: tmuxName, sessionId: newSid, previousSessionId: oldSid });
+    break;
+  }
+
   case "kill": {
     const [name] = args;
     if (!name) {

@@ -30,7 +30,9 @@ app/
     chat/send/          POST（代理 /api/v1/agents/:name/messages，wait=0）
     chat/stream/        GET SSE（订阅 /api/v1/events → 按 agent 过滤 → 翻译成 WebStreamEvent）
     chat/history/       GET ?agent=（代理 /api/v1/agents/:name/history[/:sid]，live+归档）
+    chat/clear/         POST（代理 /api/v1/agents/:name/clear，fork 端点）
     chat/interrupt/     POST（代理 /api/v1/agents/:name/interrupt，fork 端点）
+    agents/settings/    GET/PUT per-agent 前端配置（init_message 开机指令，web SQLite）
     chat/permission/    POST（代理 /api/v1/agents/:name/answer kind=permission）
     chat/auq/           POST（代理 /api/v1/agents/:name/answer kind=auq）
 features/chat/
@@ -95,6 +97,11 @@ proxy.ts                Next16 proxy：只拦页面 cookie；API 由 handler 自
   `POST /api/v1/agents/:name/answer {kind:"auq", action, selections[][]}`。应答后双侧
   （API/Discord 按钮）发 `question_cleared` 收卡；迟到订阅用 `/pending` 补拉。
 - **中断**：streaming 时 composer 出「■ 停止」→ `POST .../interrupt` → C-c（master → master:0）。
+- **清空会话（🧹）**：侧栏列表项按钮 → 确认弹窗（可编辑「开机指令」，per-agent 持久化
+  在 settings 表）→ `POST .../clear`（Bridge 打原生 /clear + 后台轮转 sessionId/归档/
+  watcher 重绑）→ 本地视图清零 → 开机指令非空则自动作为第一条消息发出（可见可审计，
+  知识注入藏在指令文本里，产品层对图谱零感知）。master 可 clear 但无需开机指令
+  （CLAUDE.md 自动重载）。⚠ CC 原生 auto-memory 跨 /clear 存活（原生行为）。
 - **权限卡 ⚠ 已知缺口**：迁移后权限弹窗**事件下行暂缺**（upstream permission-watcher 只面向
   Discord 且 web-only 模式未启动它）——卡片不会自动弹出；上行 `answer {kind:"permission"}` 保留
   （发键前 Bridge 重验弹窗在场）。agent 默认 bypassPermissions，此卡本就罕见。session-idle

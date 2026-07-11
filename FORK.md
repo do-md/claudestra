@@ -33,6 +33,15 @@
   additive 加 `thinking: boolean`（该 agent 此刻是否在回合中，见「事件与状态」getAgentStatus），
   web composer 连流时读它同步「暂停」态
 - `POST /api/v1/agents` + `POST /api/v1/agents/:name/{kill,restart}` — 生命周期，仅全权 token
+- `POST /api/v1/agents/:name/clear` — 远程调用 CC 原生 /clear（tmuxSendLine 打
+  `/clear`，与 slash 转发同款通道；发键前 paneLooksIdle 验 idle，回合中 409）。
+  非 master 返回 202 后后台轮转收尾（scheduleClearRotation：poll 新 jsonl →
+  manager set-session 归档旧会话+切 registry → watcher 重绑；同 cwd 多 agent 时
+  跳过属于他人的 sid）。master 只发键（CLAUDE.md 人设自动重载，无 registry/watcher）。
+  clear 后发不发「开机指令」是 web 前端（用户层）的事，端点零感知——语义分层：
+  Shawn 看到的是原生 /clear，图谱注入藏在前端配置的消息文本里。
+  ⚠ 实测：CC 原生 auto-memory（projects/<slug>/memory/）会跨 /clear 存活——
+  上下文清零但 CC 自己的记忆层还在，这是 CC 原生行为不是 bug。
 - `GET /api/v1/agents` 增强：`?include=stopped` 入列已停止 agent；master 入列
   （scope 显式含 "master" 才可见）
 - `findApiAgent` master 特判：channelId=CONTROL_CHANNEL_ID、cwd 取 channel-server
@@ -68,3 +77,5 @@
 
 ### 其它
 - `manager.ts` token-add：允许显式 `master` scope 值（--force；大总管接入 web 用）
+- `manager.ts` set-session <name> <sessionId>：归档旧会话 + registry 切 sessionId
+  （clear 轮转收尾用；registry 写入保持 manager 唯一写者不变式）

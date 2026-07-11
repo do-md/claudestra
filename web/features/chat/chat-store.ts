@@ -518,6 +518,39 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     }
   }
 
+  /**
+   * 清空会话（远程 Claude Code 原生 /clear）+ 可选开机指令。
+   *
+   * 流程：确保会话已打开（clear 后要看到全新对话）→ POST /api/chat/clear
+   * （Bridge 打 /clear + 后台轮转 sessionId/watcher）→ 本地视图清零（消息、
+   * 缓存、交互卡）→ 若配置了开机指令，稍候作为普通消息发出（走 send，
+   * 用户气泡可见、回复流式回来——知识注入可见可审计）。
+   * 回合进行中 Bridge 返 409（先停止再 clear），错误原样返回给对话框展示。
+   */
+  public async clearAgent(
+    name: string,
+    initMessage?: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (this.state.activeAgent !== name) await this.openAgent(name);
+    const res = await this.postAction("/api/chat/clear", { agent: name });
+    if (!res.ok) return res;
+    this.messageCache.delete(name);
+    this.produce((s) => {
+      s.messages = [];
+      s.pendingPermission = null;
+      s.pendingAsk = null;
+      s.streaming = false;
+      s.awaitingChunk = false;
+    });
+    const boot = initMessage?.trim();
+    if (boot) {
+      // /clear 在 TUI 内瞬时完成；隔一拍再注入，避免与 slash 处理竞争
+      await new Promise((r) => setTimeout(r, 1500));
+      await this.send(boot);
+    }
+    return { ok: true };
+  }
+
   /** 一键中断：给当前会话的 tmux window 发 Ctrl+C。 */
   public async interrupt(): Promise<{ ok: boolean; error?: string }> {
     const agent = this.state.activeAgent;
