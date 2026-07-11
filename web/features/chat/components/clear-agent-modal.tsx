@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
 
@@ -66,7 +67,11 @@ export function ClearAgentModal({
     onClose();
   };
 
-  return (
+  // ⚠ 必须 portal 到 body：移动端会话页处于 transform 横滑容器内（chat.tsx
+  // translate-x），CSS 规定 transform 祖先会成为 position:fixed 的定位基准——
+  // 在容器里渲染 .modal（fixed）会整个定位到屏幕外一屏（点了没反应，返回列表
+  // 时容器滑回来弹窗才「突然出现」）。portal 出去后 fixed 重新贴视口。
+  return createPortal(
     <dialog className="modal modal-open">
       <div className="modal-box max-w-lg">
         <h3 className="text-base font-semibold">
@@ -112,6 +117,7 @@ export function ClearAgentModal({
         </div>
       </div>
       <div className="modal-backdrop" onClick={() => !busy && onClose()} />
-    </dialog>
+    </dialog>,
+    document.body
   );
 }
