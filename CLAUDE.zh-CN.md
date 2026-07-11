@@ -160,6 +160,8 @@ bun test
 | `BRIDGE_URL` | channel-server 的 WebSocket 目标地址（可选覆盖） |
 | `MASTER_DIR` | 大总管 tmux session 的工作目录（可选覆盖） |
 | `BRIDGE_BIND` | HTTP/ws 绑定地址（默认 `127.0.0.1`；`0.0.0.0` 对外开放，反代/TLS 自理） |
+| `BRIDGE_CORS_ORIGIN` | v2.10+ CORS 白名单：逗号分隔 origin 或 `*`（默认不设 = 不发 CORS 头） |
+| `BRIDGE_STATIC_DIR` | v2.10+ bridge 直接托管的静态目录（含 SPA fallback；默认不设 = 关闭） |
 
 ## tmux 拓扑
 
