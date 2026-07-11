@@ -110,6 +110,45 @@ describe("readSessionHistory", () => {
     expect(page.messages[4].text).toBe("第二条用户消息");
   });
 
+  test("[fork] reply() tool_use 提取成 replyText（不当工具卡），叙述与回复分开", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hist-"));
+    const p = writeJsonl(dir, `${SID}.jsonl`, [
+      { type: "user", timestamp: "2026-07-01T00:00:00Z", message: { content: "问题" } },
+      {
+        type: "assistant",
+        timestamp: "2026-07-01T00:01:00Z",
+        message: {
+          content: [
+            { type: "text", text: "让我看看" },
+            { type: "tool_use", name: "Read", input: { file_path: "/a.ts" } },
+            { type: "tool_use", name: "mcp__claudestra__reply", input: { chat_id: "api:x", text: "**结论**：好了" } },
+          ],
+        },
+      },
+    ]);
+    const page = await readSessionHistory(p, { formatToolFn: (n) => n });
+    const asst = page.messages.find((m) => m.role === "assistant")!;
+    expect(asst.text).toBe("让我看看"); // 过程叙述
+    expect(asst.replyText).toBe("**结论**：好了"); // reply 正文被提取（否则历史里蒸发）
+    expect(asst.tools?.map((t) => t.name)).toEqual(["Read"]); // reply 不再混进工具卡
+  });
+
+  test("[fork] 纯 reply（无叙述、无其它工具）也保留：text 空 + replyText 有值", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hist-"));
+    const p = writeJsonl(dir, `${SID}.jsonl`, [
+      {
+        type: "assistant",
+        timestamp: "2026-07-01T00:01:00Z",
+        message: { content: [{ type: "tool_use", name: "mcp__claudestra__reply", input: { text: "只有回复" } }] },
+      },
+    ]);
+    const page = await readSessionHistory(p);
+    expect(page.messages.length).toBe(1);
+    expect(page.messages[0].text).toBe("");
+    expect(page.messages[0].replyText).toBe("只有回复");
+    expect(page.messages[0].tools).toBeUndefined();
+  });
+
   test("分页：默认取尾部，before 往前翻，hasMore 正确", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hist-"));
     const p = writeJsonl(dir, `${SID}.jsonl`, SAMPLE);

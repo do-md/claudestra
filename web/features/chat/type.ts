@@ -32,7 +32,11 @@ export interface ChatAttachmentView {
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
+  /** assistant：过程叙述文本（流式 assistant_text）。user：消息正文。 */
   content: string;
+  /** [fork] assistant 的「最终回复」（reply() 正文）——与过程叙述 content 分区渲染，
+   *  中间用淡分隔线隔开。历史来自 jsonl 的 reply tool_use，直播来自 chat_message(out)。 */
+  replyText?: string;
   toolCalls?: ToolCallView[];
   /** 由本轮流式生成（区别于历史加载） */
   streamed?: boolean;

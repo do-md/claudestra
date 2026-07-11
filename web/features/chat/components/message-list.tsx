@@ -155,7 +155,22 @@ function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
   );
 }
 
-/** 助手正文：流式进行中用纯文本（DOMD 只读一次不适合增量喂字），定稿/历史走 DOMD 富文本。 */
+/** [fork] 过程叙述 ↔ 最终回复 之间的淡分隔线（仅两者都在时出现）。 */
+function ReplyDivider() {
+  return (
+    <div className="my-2.5 flex items-center gap-2" aria-hidden>
+      <span className="h-px flex-1 bg-base-content/10" />
+      <span className="text-[10px] font-medium tracking-wide text-base-content/30">回复</span>
+      <span className="h-px flex-1 bg-base-content/10" />
+    </div>
+  );
+}
+
+/**
+ * 助手正文：过程叙述（content）+ 最终回复（replyText）两段，中间淡分隔线。
+ * 流式进行中用纯文本（DOMD 只读一次不适合增量喂字），定稿/历史走 DOMD 富文本。
+ * reply 在回合 done 之后到达时气泡已定稿 → 直接走 Domd（不再停在纯文本）。
+ */
 function AssistantBody({
   m,
   liveEmpty,
@@ -163,16 +178,37 @@ function AssistantBody({
   m: ChatMessage;
   liveEmpty: boolean;
 }) {
+  const hasNarration = !!m.content;
+  const hasReply = !!m.replyText;
   if (m.streamed) {
-    if (liveEmpty) return <ThinkingDots />;
+    if (liveEmpty && !hasReply) return <ThinkingDots />;
     return (
-      <div className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]">
-        {m.content || <span className="opacity-40">…</span>}
+      <div className="text-[14.5px] leading-[1.7]">
+        {hasNarration && (
+          <div className="whitespace-pre-wrap break-words">{m.content}</div>
+        )}
+        {hasReply && (
+          <>
+            {hasNarration && <ReplyDivider />}
+            <div className="whitespace-pre-wrap break-words">{m.replyText}</div>
+          </>
+        )}
+        {!hasNarration && !hasReply && <span className="opacity-40">…</span>}
       </div>
     );
   }
-  if (!m.content) return null;
-  return <Domd initMd={m.content} bodyClassName="chat-domd" />;
+  if (!hasNarration && !hasReply) return null;
+  return (
+    <>
+      {hasNarration && <Domd initMd={m.content} bodyClassName="chat-domd" />}
+      {hasReply && (
+        <>
+          {hasNarration && <ReplyDivider />}
+          <Domd initMd={m.replyText!} bodyClassName="chat-domd" />
+        </>
+      )}
+    </>
+  );
 }
 
 function Message({

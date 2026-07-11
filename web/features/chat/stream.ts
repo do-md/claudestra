@@ -12,6 +12,8 @@ export interface StreamSink {
     state: "running" | "done" | "error"
   ): void;
   appendAssistantText(text: string): void;
+  /** [fork] reply() 的最终回复：挂到当前 assistant 气泡的 replyText（回合外到达也定稿）。 */
+  setReplyText(text: string): void;
   setStatus(status: "running" | "done"): void;
   endTurn(): void;
   /** Phase 2：待处理交互卡（null=清卡）。 */
@@ -27,6 +29,9 @@ export function processStreamEvent(sink: StreamSink, evt: WebStreamEvent) {
       break;
     case "text":
       sink.appendAssistantText(evt.text);
+      break;
+    case "reply":
+      sink.setReplyText(evt.text);
       break;
     case "status":
       sink.setStatus(evt.status);

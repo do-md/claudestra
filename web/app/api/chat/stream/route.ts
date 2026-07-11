@@ -22,7 +22,7 @@ const SSE_HEADERS = {
  *   agent_status thinking → {t:"status",status:"running"}；done → {t:"done"}
  *   tool_start            → {t:"tool", state:"running"}（tool_done 不重复推卡）
  *   assistant_text        → {t:"text"}
- *   chat_message(out)     → {t:"text"}（reply() 的最终回复，watcher 不重复流它）
+ *   chat_message(out)     → {t:"reply"}（reply() 的最终回复，挂 replyText 与叙述分区渲染）
  *   question              → {t:"ask"}；question_cleared → {t:"ask-cleared"}（fork 事件）
  *   auto_deny             → {t:"text", "🚫 …"}
  *   其余（turn_duration / bg_task_* / session_anomaly）v1 暂不消费
@@ -68,7 +68,9 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
     case "chat_message":
       // direction=in 是自己发出去的消息回声；out 才是 agent 的回复
       if (d.direction !== "out") return null;
-      return { t: "text", text: String(d.text ?? "") };
+      // [fork] reply() 的最终回复 → 独立 reply 事件（挂 replyText，与过程叙述分区、
+      // 走 Domd 富文本、且回合 done 之后到达也能定稿——修「回复完又冒一条纯文本」）
+      return { t: "reply", text: String(d.text ?? "") };
     case "question":
       return { t: "ask", id: `auq-${evt.seq}`, questions: mapAuqQuestions(d.questions) };
     case "question_cleared":

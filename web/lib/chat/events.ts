@@ -30,8 +30,10 @@ export type WebStreamEvent =
   | { t: "status"; status: "running" | "done" }
   /** 一次工具调用的段级摘要（📖 Read xxx / ✏️ Edit xxx / ⚙️ Bash ...） */
   | { t: "tool"; name: string; summary: string; state: "running" | "done" | "error" }
-  /** 助手文本段（追加到当前流式助手消息） */
+  /** 助手文本段（过程叙述，追加到当前流式助手消息的 content） */
   | { t: "text"; text: string }
+  /** [fork] reply() 的最终回复（挂到当前 assistant 气泡的 replyText，与叙述分区渲染） */
+  | { t: "reply"; text: string }
   /** 本轮结束 */
   | { t: "done" }
   | { t: "error"; error: string }

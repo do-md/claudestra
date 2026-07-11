@@ -29,11 +29,18 @@ export interface HistoryMessage {
   role: "user" | "assistant" | "system";
   text: string;
   tools?: HistoryToolCall[];
+  /** [fork] reply() 工具的正文——发给用户的「最终回复」，与过程叙述 text 分开渲染 */
+  replyText?: string;
   /** compact 产生的摘要条目（不是真实用户输入） */
   compactSummary?: boolean;
   model?: string;
   /** [fork] 入站消息的发送者标签（<channel> 的 user 属性：API token 名 / Discord 用户名 / 来源 agent） */
   from?: string;
+}
+
+/** [fork] MCP reply 工具名：mcp__<MCP_NAME>__reply（MCP_NAME 可配，按前后缀匹配）。 */
+function isReplyTool(name: string): boolean {
+  return name.startsWith("mcp__") && name.endsWith("__reply");
 }
 
 export interface HistoryPage {
@@ -250,13 +257,24 @@ export async function readSessionHistory(
       const content = rec.message?.content;
       if (!Array.isArray(content)) continue;
       const texts: string[] = [];
+      const replyTexts: string[] = [];
       const tools: HistoryToolCall[] = [];
       for (const b of content) {
         if (b?.type === "text" && b.text?.trim()) texts.push(b.text);
-        else if (b?.type === "tool_use" && b.name) tools.push({ name: b.name, summary: fmt(b.name, b.input) });
+        else if (b?.type === "tool_use" && b.name) {
+          // [fork] reply() 的正文是「发给用户的消息」，不是工具动作——提取成文本，别当
+          // 工具卡（否则 formatTool 只剩「🔧 <server>/reply」，回复内容在历史里蒸发，
+          // 直播能看到、进历史就没了）。这样历史与直播都渲染同一份 reply。
+          if (isReplyTool(b.name) && typeof b.input?.text === "string" && b.input.text.trim()) {
+            replyTexts.push(b.input.text);
+          } else {
+            tools.push({ name: b.name, summary: fmt(b.name, b.input) });
+          }
+        }
       }
-      if (!texts.length && !tools.length) continue;
+      if (!texts.length && !replyTexts.length && !tools.length) continue;
       const msg: HistoryMessage = { seq: i, ts, role: "assistant", text: texts.join("\n") };
+      if (replyTexts.length) msg.replyText = replyTexts.join("\n");
       if (tools.length) msg.tools = tools;
       if (typeof rec.message?.model === "string") msg.model = rec.message.model;
       all.push(msg);

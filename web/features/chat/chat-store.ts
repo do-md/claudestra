@@ -467,6 +467,40 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     });
   }
 
+  /**
+   * [fork] reply() 的最终回复：挂到当前/最后一条 assistant 气泡的 replyText
+   * （与过程叙述 content 分区渲染，中间淡分隔线）。
+   *
+   * 关键：**不走 ensureLiveAssistant**——reply 的 chat_message(out) 可能在回合结束
+   * done 之后才到（envelope 投递有延迟）。若那时新建流式气泡，就永远等不到下一个 done
+   * 定稿 → 停在纯文本、不渲染 markdown（正是「回复完又冒一条纯文本」的 bug）。这里
+   * 直接挂到最后一条 assistant 气泡上（无论是否已定稿），已定稿的保持定稿 → reply 走
+   * Domd 富文本。没有前置 assistant 气泡（纯 reply 无叙述）才新建，且回合外直接定稿。
+   */
+  public setReplyText(text: string) {
+    const last = this.state.messages[this.state.messages.length - 1];
+    if (last && last.role === "assistant") {
+      this.produce((s) => {
+        const m = s.messages[s.messages.length - 1];
+        m.replyText = m.replyText ? `${m.replyText}\n${text}` : text;
+        s.awaitingChunk = false;
+      });
+    } else {
+      const streamed = this.state.streaming;
+      this.produce((s) => {
+        s.messages.push({
+          id: this.nextId(),
+          role: "assistant",
+          content: "",
+          replyText: text,
+          streamed,
+          ts: new Date().toISOString(),
+        });
+        s.awaitingChunk = false;
+      });
+    }
+  }
+
   public setStatus(status: "running" | "done") {
     this.produce((s) => {
       if (status === "done") {

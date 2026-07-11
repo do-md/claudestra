@@ -19,6 +19,8 @@ interface NeutralMessage {
   role: "user" | "assistant" | "system";
   text?: string;
   tools?: { name: string; summary: string }[];
+  /** [fork] reply() 的最终回复正文（后端从 jsonl 的 reply tool_use 提取） */
+  replyText?: string;
   compactSummary?: boolean;
   /** 入站消息发送者标签（<channel> user 属性：API token 名 / Discord 用户名 / 来源 agent） */
   from?: string;
@@ -54,7 +56,7 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
     const toolCalls: ToolCallView[] | undefined = m.tools?.length
       ? m.tools.map((t) => ({ name: t.name, summary: t.summary, state: "done" as const }))
       : undefined;
-    if (!m.text && !toolCalls) continue;
+    if (!m.text && !toolCalls && !m.replyText) continue;
 
     if (m.role === "user") {
       group = null; // 用户消息断开 assistant 分组
@@ -78,10 +80,12 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
     // assistant：累积进当前回合气泡（首条建组并入 out，后续 mutate 同一引用）
     if (!group) {
       group = { id: `h${m.seq}`, role: "assistant", content: m.text || "", toolCalls, ts: m.ts };
+      if (m.replyText) group.replyText = m.replyText;
       out.push(group);
     } else {
       if (m.text) group.content = group.content ? `${group.content}\n\n${m.text}` : m.text;
       if (toolCalls) group.toolCalls = [...(group.toolCalls ?? []), ...toolCalls];
+      if (m.replyText) group.replyText = group.replyText ? `${group.replyText}\n${m.replyText}` : m.replyText;
     }
   }
   return out;
