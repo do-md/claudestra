@@ -6,6 +6,14 @@
 > upstream 没有的能力，全部以 `[fork]` 注释标记、遵守 additive-only 合同。
 > **merge upstream 时的原则：冲突全取 upstream，再按本清单核对 fork 增量是否需要重挂。**
 
+> **2026-07-11 更新**：已合并 upstream v2.10（`bridge/api-routes.ts` 路由拆分 +
+> `bridge/web-gateway.ts` 的 CORS / SSE query-token / 静态托管），并把**完整 fork（含 `web/`）**
+> 回并上游 —— PR [shawnlu96/claudestra#3](https://github.com/shawnlu96/claudestra/pull/3)（待审）。
+> ⚠ 随该 merge，fork 的 `/api/v1` 端点已从 `bridge.ts` **迁到 `src/bridge/api-routes.ts`**
+> （作者把 `/api/v1` 路由块整体拆成独立模块）。下方清单凡写「bridge.ts」的 `/api/v1` 补丁点，
+> 现落点均为 `api-routes.ts`；`latestSessionIdForCwd` 也迁入 `api-routes.ts`，
+> `scheduleClearRotation` 留 `bridge.ts` 经 `initApiRoutes` 注入。
+
 ## fork 独有目录（upstream 无，merge 不冲突）
 
 - `web/` — Next.js Web 客户端（BFF 消费 upstream /api/v1 + /events，见 `web/CLAUDE.md`）
@@ -25,7 +33,7 @@
 - `bridge.ts` ws case：create_channel 按 WEB_ONLY 选 adapter；delete/rename_channel、
   announce_focus 对 local-* no-op
 
-### additive /api/v1 端点（upstream 缺口，落地后应切换删除）
+### additive /api/v1 端点（upstream 缺口，落地后应切换删除；v2.10 merge 后落 `bridge/api-routes.ts`）
 - `POST /api/v1/agents/:name/interrupt` — tmux C-c（master → master:0）
 - `POST /api/v1/agents/:name/answer` — AUQ submit/cancel（buildAuqKeystrokes）+
   权限弹窗 allow/allow_session/deny（发键前 tmuxCapture 重验）
