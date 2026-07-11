@@ -125,12 +125,18 @@ export async function GET(request: Request) {
       };
       heartbeat = setInterval(() => send(SSE_DONE), 30_000);
 
-      // 挂起交互补拉（question 事件可能早于本次订阅）
+      // 连流即补拉当前挂起态（question 事件 + 回合进行态可能早于本次订阅：
+      // 切会话 / 刷新 / 回前台）。thinking 时先补一条 status:running，让 composer
+      // 立刻进入「停止」态（对应旧 web-hub 的 pendingInteraction replay）。
       try {
         const pending = await bridgeGet<{
           ok: boolean;
           question: { questions: unknown; ts: number } | null;
+          thinking?: boolean;
         }>(`/agents/${encodeURIComponent(apiName)}/pending`, { timeoutMs: 5000 });
+        if (pending.thinking) {
+          send({ t: "status", status: "running" });
+        }
         if (pending.question) {
           send({
             t: "ask",

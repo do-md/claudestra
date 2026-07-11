@@ -56,7 +56,7 @@ import { existsSync, readdirSync, statSync } from "fs";
 // [fork] master 历史 probe 用（master 不在 registry，sessionId 从 projects slug 目录取最新）
 import { projectsSlug } from "./lib/jsonl-cost.js";
 // v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
-import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from "./bridge/event-bus.js";
+import { emitEvent, subscribeEvents, replayEventsSince, getAgentStatus, type EventFilter } from "./bridge/event-bus.js";
 // v2.7+ Claude Code agents 模式适配：中性会话清单 + bg job 清理 + 分身对账
 import { collectSessions } from "./bridge/sessions-inventory.js";
 import { cleanupBgJob } from "./lib/bg-jobs.js";
@@ -5242,10 +5242,17 @@ async function handleApiRequest(req: Request, url: URL): Promise<Response> {
     if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
     const { auqStates } = await import("./bridge/ask-user-question.js");
     const auq = auqStates.get(agent.channelId);
+    // [fork] thinking：该 agent 此刻是否在回合中（最近一次 agent_status=thinking）。
+    // web 前端刷新/切回/回前台后连流时读它，同步 composer 的「暂停」态——否则进行中的
+    // 会话在本端不是发起方（他端触发 / 页面刚加载）时，composer 一直显示「发送」而非「停止」。
+    // 同键：done 事件在 Stop hook 用 agentLabelForChannel(channelId) 落键，这里对齐。
+    const evAgent = agentLabelForChannel(agent.channelId);
+    const status = getAgentStatus(evAgent) ?? getAgentStatus(agent.name);
     return apiJson(200, {
       ok: true,
       agent: agent.name,
       question: auq ? { questions: auq.questions, ts: auq.ts } : null,
+      thinking: status === "thinking",
     });
   }
 

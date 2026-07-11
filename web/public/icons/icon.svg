@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="40%" r="75%">
+      <stop offset="0%" stop-color="#26282b"/>
+      <stop offset="100%" stop-color="#141517"/>
+    </radialGradient>
+    <linearGradient id="coral" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FF7A90"/>
+      <stop offset="100%" stop-color="#E8506A"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="34"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <g transform="translate(512 512) scale(1) translate(-512 -512)">
+    <circle cx="512" cy="512" r="150" fill="#EC5A72" opacity="0.28" filter="url(#glow)"/>
+    <path d="M 512.0 264.0 A 248 248 0 0 0 512.0 760.0" fill="none" stroke="url(#coral)" stroke-width="18" stroke-linecap="round" opacity="0.32"/>
+    <line x1="512" y1="512" x2="512.0" y2="264.0" stroke="url(#coral)" stroke-width="17" stroke-linecap="round" opacity="0.5"/>
+      <line x1="512" y1="512" x2="297.2" y2="388.0" stroke="url(#coral)" stroke-width="17" stroke-linecap="round" opacity="0.5"/>
+      <line x1="512" y1="512" x2="264.0" y2="512.0" stroke="url(#coral)" stroke-width="17" stroke-linecap="round" opacity="0.5"/>
+      <line x1="512" y1="512" x2="297.2" y2="636.0" stroke="url(#coral)" stroke-width="17" stroke-linecap="round" opacity="0.5"/>
+      <line x1="512" y1="512" x2="512.0" y2="760.0" stroke="url(#coral)" stroke-width="17" stroke-linecap="round" opacity="0.5"/>
+    <circle cx="512.0" cy="264.0" r="40" fill="url(#coral)"/>
+      <circle cx="297.2" cy="388.0" r="40" fill="url(#coral)"/>
+      <circle cx="264.0" cy="512.0" r="40" fill="url(#coral)"/>
+      <circle cx="297.2" cy="636.0" r="40" fill="url(#coral)"/>
+      <circle cx="512.0" cy="760.0" r="40" fill="url(#coral)"/>
+    <circle cx="512" cy="512" r="66" fill="url(#coral)"/>
+    <circle cx="512" cy="512" r="28" fill="#171819"/>
+    <path d="M 712 304 L 721.6 342.4 L 760 352 L 721.6 361.6 L 712 400 L 702.4 361.6 L 664 352 L 702.4 342.4 Z" fill="#FFD7DE"/>
+    <path d="M 360 664 L 365.2 684.8 L 386 690 L 365.2 695.2 L 360 716 L 354.8 695.2 L 334 690 L 354.8 684.8 Z" fill="#FFD7DE" opacity="0.85"/>
+  </g>
+</svg>

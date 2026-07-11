@@ -100,6 +100,33 @@ proxy.ts                Next16 proxy：只拦页面 cookie；API 由 handler 自
   （发键前 Bridge 重验弹窗在场）。agent 默认 bypassPermissions，此卡本就罕见。session-idle
   应答已随迁移移除。
 
+## PWA 容器方案（真机踩坑收敛的不变式，勿单点改动）
+
+> 完整通用版沉淀在用户知识库 `iOS-PWA-standalone-全屏容器与安全区避坑.md`。以下为本项目落点。
+
+iOS standalone 的「铺满屏底 + 纹丝不动 + 安全区无缝」由这几件事共同构成（2026-07-10 六轮真机迭代收敛）：
+
+0. **【真凶·最隐蔽】globals.css 里 html 千万别锁死高度**——`html,body{height:100%}` 会让
+   iOS standalone 把 `position:fixed` 钳到「安全区内缩的短视口」，`fixed inset-0` 的 `bottom:0`
+   **到不了真正屏底**（列表+会话底部都浮在安全区上方一截）。迷惑点：此时 `env()` 仍正常、容器每层
+   `height` 也各自铺满 844——是短视口本身没到底。改用 **`body{min-height:100vh}` + html 不锁高度**
+   （对齐 claude-os）即铺满。同理 html/body 别加 `overflow:hidden`（同样钳短视口）。
+1. **应用壳根容器 `fixed inset-0 overflow-hidden`**（chat.tsx）**是锁滚动的全部**：出流 →
+   body 无流内容 → 文档天然不滚；滚动只在内部 `overflow-y-auto`。⚠ 不要改回 in-flow `h-dvh`
+   ——body 有 100dvh 流内容会被拖着微滚/橡皮筋、加载停偏移位，已证伪。
+2. **安全区 padding 归各面板自己垫、带自身 bg**：TopBar/会话列表头 `env(safe-area-inset-top)`、
+   composer/列表 footer 底部。⚠ 不放应用壳根层——根是 base-100，压在 base-200 列表上就是
+   上下色差条（claude-os 把 pt-safe-top 放根层，正是它没解决的那个毛病）。
+3. **底部一律 `max(env(safe-area-inset-bottom), 常规间距)` 不叠加**——home 条区本身够高，
+   `env + 12px` 双层叠出「过高的底部」。
+4. **画布色跟随当前面板**：iOS 给布局视口外/安全区条带涂「画布色」（body 设了 bg 用 body 的，
+   否则用 html 的）→ body 一律不设 bg（layout.tsx），chat.tsx 按视图给 `<html>` 挂/摘
+   `canvas-list` 类（globals.css：列表=base-200 / 会话=base-100），条带永远与所在页同色。
+5. 改 viewport/manifest 后 iOS 需**删主屏图标重新添加**才生效（安装时缓存）。
+6. **排查方法**：别肉眼猜截图。塞临时诊断浮层读 `navigator.standalone`/`innerHeight`/探针
+   `env()` 实测值，并在 `fixed bottom:0` 画条线看它到没到屏底——一张截图定位。
+   图标重生成：`node scripts/make-icons.mjs`（sharp，manifest 在 app/manifest.ts）。
+
 ## 运行 & 排障
 
 - **两个 launchd 常驻服务**（同前：`com.claudestra.web-bridge` / `com.claudestra.web-launcher`，
@@ -115,5 +142,7 @@ proxy.ts                Next16 proxy：只拦页面 cookie；API 由 handler 自
   活不到第一轮——事件间隙 >10s 的订阅者被静默掐掉。fork 已改为连接即发 `: connected` + 5s ping
   （bridge.ts handleEventsRequest）。merge upstream 后若流「偶尔收不到」先查这里有没有被冲掉。
 - **⚠ turbopack 冷启动**：dev 重启后的头几个 API 请求可能 401/502（env/编译未就绪），刷新即好。
+- **⚠ curl 验证 CSS 会看到陈旧 chunk**：turbopack dev 对静态 CSS chunk 不因 curl 请求重编译，
+  新样式经 HMR 推给真浏览器/整页刷新才生效——「curl grep 不到新规则」≠ 没编译进去，先在浏览器里确认。
 - cookie 7 天过期后页面自动跳 /login，重登即可。
 - Next 16 冷知识：`_` 开头目录不路由；macOS 无 `timeout`，测 SSE 用 `curl --max-time N`。

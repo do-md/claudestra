@@ -40,16 +40,56 @@
     --depth: 0;
 }
 
-html,
-body {
-    height: 100%;
+/* 安全区 padding 工具类（类名对齐 claude-os 的 pt-safe-top/pb-safe-bottom；
+   用普通 CSS 定义而非 @theme —— 本仓 Tailwind 4.3 下 @theme --padding-* 未生成
+   该工具类，普通类必定编译进产物，行为一致） */
+.pt-safe-top {
+    padding-top: env(safe-area-inset-top);
+}
+.pb-safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
 }
 
 /*
- * 安全区不再放在 body 上：聊天根容器用 h-dvh（= 视口高度）铺满，若 body 再加
- * padding 会撑出滚动条把 composer 顶到安全区外。改为在 TopBar(top) / Composer(bottom)
- * / Sidebar 抽屉各自用 env(safe-area-inset-*) 内缩（需 viewport-fit=cover，见 layout.tsx）。
+ * ── PWA 应用壳容器方案（完整对齐 claude-os，勿单点改动）────────────────
+ * 锁滚动只靠一件事：应用壳根容器 fixed inset-0 overflow-hidden（chat.tsx），内容全部
+ * 脱离文档流 → body 里没有流内容 → 文档天然不滚动。滚动只发生在内部 overflow-y-auto。
+ *
+ * ⚠ 不要给 html/body 加 height:100% 或 overflow:hidden（claude-os 都没加）：iOS standalone
+ *   下给根元素固定高度/裁剪会把 fixed 定位钳到「安全区内缩的短视口」，导致 fixed inset-0 的
+ *   bottom:0 到不了真正屏底、底部（列表+会话都）不贴屏底（owner 真机对比 claude-os 确认）。
+ *   claude-os 用 body{min-height:100vh}（可增长、不锁死），fixed inset-0 才铺满整屏。
+ * ⚠ 不要用 in-flow h-dvh 容器替代 fixed：那样 body 有 100dvh 流内容会被拖着微滚/橡皮筋。
  */
+html {
+    color-scheme: light dark;
+}
+body {
+    min-height: 100vh;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+/*
+ * 画布色跟随当前面板（解决列表页上下安全区色差——claude-os 未解决的问题）：
+ * iOS 给安全区/布局视口外条带涂的是「画布色」（body 设了 bg 就用 body 的，否则用 html 的，
+ * 故 body 一律不设 bg，见 layout.tsx）。chat.tsx 按当前视图给 <html> 挂/摘 canvas-list：
+ * 列表页=base-200、会话页=base-100，条带永远与所在页面板同色。
+ */
+html {
+    background-color: #ffffff; /* 会话页（light base-100） */
+}
+html.canvas-list {
+    background-color: #f7f7f7; /* 列表页（light base-200） */
+}
+@media (prefers-color-scheme: dark) {
+    html {
+        background-color: rgb(23, 24, 25); /* 会话页（dark base-100） */
+    }
+    html.canvas-list {
+        background-color: #1e2022; /* 列表页（dark base-200） */
+    }
+}
 
 /* iOS Safari：input/textarea 字号 <16px 会在聚焦时自动放大页面，移动端统一顶到 16px */
 @media (max-width: 767px) {
@@ -58,6 +98,55 @@ body {
     select {
         font-size: 16px;
     }
+}
+
+/*
+ * ── Chat 消息进入动画 + 流式「思考中」三点（抄自 Claude OS styles.tsx） ──
+ */
+@keyframes chat-msg-in {
+    from {
+        opacity: 0;
+        transform: translateY(6px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+.chat-msg-in {
+    animation: chat-msg-in 0.24s ease-out;
+}
+@keyframes chat-blink {
+    0%,
+    100% {
+        opacity: 0.25;
+    }
+    50% {
+        opacity: 1;
+    }
+}
+.chat-dot {
+    animation: chat-blink 1.2s ease-in-out infinite;
+}
+
+/*
+ * 「运行中」状态呼吸光晕：替换生硬的 animate-ping（scale(2)+opacity0 的雷达脉冲，
+ * owner 反馈「特别挫」）。改用慢速 ease-in-out 对称呼吸——小幅缩放的柔和外晕，
+ * 读作「活着的呼吸」而非扩散的雷达波。用于列表状态点 + composer「正在回复」。
+ */
+@keyframes cstra-breathe {
+    0%,
+    100% {
+        transform: scale(1);
+        opacity: 0.5;
+    }
+    50% {
+        transform: scale(1.7);
+        opacity: 0.1;
+    }
+}
+.animate-cstra-breathe {
+    animation: cstra-breathe 2.2s ease-in-out infinite;
 }
 
 /*

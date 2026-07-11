@@ -1,30 +1,47 @@
 "use client";
-import { useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { ChatStoreProvider, useChatStore, useChatStoreApi } from "../chat-store";
+import { ChatNavContext, useChatNav, type ChatNav } from "./nav-context";
 import { Sidebar } from "./sidebar";
 import { MessageList } from "./message-list";
 import { Composer } from "./composer";
 
-function TopBar({ onMenu }: { onMenu: () => void }) {
+/** 「会话内容」页的 hash 锚点：存在即处于内容视图，移动端横滑到内容栏 */
+const CONTENT_HASH = "#chat";
+const isContentHash = () =>
+  typeof window !== "undefined" &&
+  window.location.hash.split("?")[0] === CONTENT_HASH;
+/** 仅移动端（< sm 640px）走 hash 横滑；桌面双栏并存 */
+const isNarrow = () =>
+  typeof window !== "undefined" &&
+  window.matchMedia("(max-width: 639.98px)").matches;
+
+function TopBar() {
   const active = useChatStore((s) => s.state.activeAgent);
   const agents = useChatStore((s) => s.state.agents);
-  const store = useChatStoreApi();
+  const nav = useChatNav();
   const info = agents.find((a) => a.name === active);
   return (
+    // 安全区顶部由面板自己垫（bg=base-100，条带与内容同色无缝）
     <header
-      className="flex min-h-12 shrink-0 items-center gap-2 border-b border-base-300 px-3 sm:px-4"
+      className="flex min-h-12 shrink-0 items-center gap-2 border-b border-base-300 bg-base-100 px-3 sm:px-4"
       style={{ paddingTop: "env(safe-area-inset-top)" }}
     >
-      {/* 移动端汉堡：打开会话抽屉。桌面端侧栏常驻，隐藏此按钮 */}
+      {/* 移动端：返回会话列表（走 history.back 触发系统返回同款滑动）。桌面端双栏，隐藏 */}
       <button
-        className="btn btn-ghost btn-sm -ml-1 px-2 md:hidden"
-        onClick={onMenu}
-        aria-label="打开会话列表"
+        className="btn btn-ghost btn-sm -ml-1 px-2 sm:hidden"
+        onClick={nav.toList}
+        aria-label="返回会话列表"
       >
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-          <line x1="3" y1="6" x2="21" y2="6" />
-          <line x1="3" y1="12" x2="21" y2="12" />
-          <line x1="3" y1="18" x2="21" y2="18" />
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M15 18l-6-6 6-6" />
         </svg>
       </button>
       <span className="truncate font-semibold">{active || "Claudestra"}</span>
@@ -33,25 +50,72 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
           {info.cwd}
         </span>
       )}
-      {active && (
-        // 拉取最新历史（丢弃缓存快照，从 jsonl 重拉）——重开会话默认保持你上次看到的那份，
-        // 想看最新用这个，不必整页刷新。
-        <button
-          className="btn btn-ghost btn-xs ml-auto px-1.5"
-          onClick={() => store.reloadHistory()}
-          title="拉取最新历史"
-          aria-label="拉取最新历史"
-        >
-          ⟳
-        </button>
-      )}
     </header>
   );
 }
 
 function ChatInner() {
   const store = useChatStoreApi();
-  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // ── 移动端 hash 横滑：会话列表(基础页) ↔ 会话内容(#chat 压栈页) ──
+  const [showContent, setShowContent] = useState(false);
+  // 首帧禁用过渡：带 #chat 进入（如会话中刷新页面）时直接定位到内容页，
+  // 不从列表滑一下（用户反馈的「进来有偏移」）。首帧定位后再开启过渡。
+  // popstate（含 iOS 左滑返回）时也临时关动画避免闪屏。
+  const [disableTransition, setDisableTransition] = useState(true);
+  // 主动 history.back() 触发的 popstate 保留滑动动画
+  const skipDisableRef = useRef(false);
+
+  // 首帧按当前 hash 初始化定位，随后开启过渡
+  useLayoutEffect(() => {
+    setShowContent(isContentHash());
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => setDisableTransition(false)),
+    );
+  }, []);
+
+  // 浏览器返回（系统级手势 / 返回键）：出栈回到会话列表
+  useEffect(() => {
+    const onPop = () => {
+      if (!skipDisableRef.current) setDisableTransition(true);
+      setShowContent(isContentHash());
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => setDisableTransition(false)),
+      );
+      skipDisableRef.current = false;
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  const toContent = useCallback(() => {
+    if (!isNarrow()) return; // 桌面双栏并存，无需压栈/位移
+    if (!isContentHash()) window.history.pushState(null, "", CONTENT_HASH);
+    setShowContent(true);
+  }, []);
+
+  const toList = useCallback(() => {
+    if (isContentHash()) {
+      skipDisableRef.current = true; // 主动返回：保留滑动动画
+      window.history.back();
+    } else {
+      setShowContent(false);
+    }
+  }, []);
+
+  const nav = useMemo<ChatNav>(
+    () => ({ showContent, toContent, toList }),
+    [showContent, toContent, toList],
+  );
+
+  // 画布色跟随当前面板：列表页(base-200) / 会话页(base-100)。iOS 给安全区/布局视口外
+  // 的条带涂的是 html 画布色（body 不设 bg 才轮得到 html，见 globals.css + layout.tsx），
+  // 跟随后条带与所在页同色 → 列表页上下色差消失（claude-os 未解决的问题）。
+  useEffect(() => {
+    const el = document.documentElement;
+    el.classList.toggle("canvas-list", !showContent);
+    return () => el.classList.remove("canvas-list");
+  }, [showContent]);
 
   useEffect(() => {
     store.loadAgents();
@@ -79,14 +143,45 @@ function ChatInner() {
   }, [store]);
 
   return (
-    <div className="flex h-dvh w-full overflow-hidden">
-      <Sidebar open={drawerOpen} onClose={() => setDrawerOpen(false)} />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <TopBar onMenu={() => setDrawerOpen(true)} />
-        <MessageList />
-        <Composer />
+    <ChatNavContext.Provider value={nav}>
+      {/* PWA 应用壳（对齐 claude-os）：出流的 fixed inset-0 overflow-hidden 就是锁滚动的
+          全部——body 里没有流内容 → 文档天然不滚，滚动只在内部 overflow-y-auto。⚠ 不要给
+          html/body 加 overflow:hidden（会干扰 viewport-fit 撑满、底部不贴屏底，见 globals.css）。
+          安全区 padding 归各面板自己垫、条带色=面板色（不放根层，避免异色面板成色差条）。
+          onScroll 归零守卫：overflow:hidden 只是视觉裁剪，程序（iOS 键盘聚焦滚动 /
+          scrollIntoView 类调用）仍可给它塞 scrollLeft/scrollTop——残留量会叠在横滑
+          translate 上，让会话页「弹过头」渲染不满视窗。任何此类滚动立即归零。 */}
+      <div
+        className="fixed inset-0 flex overflow-hidden bg-base-100"
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          if (el.scrollLeft !== 0) el.scrollLeft = 0;
+          if (el.scrollTop !== 0) el.scrollTop = 0;
+        }}
+      >
+        {/* 横滑容器：移动端 sidebar + main 各 w-full 并排溢出，showContent 时整体 -100% 切到内容；
+            桌面端（sm+）sidebar 定宽 + main flex-1 双栏并存，translate 恒 0。 */}
+        <div
+          className={`flex min-h-0 w-full flex-1 transform-gpu ${
+            disableTransition
+              ? "transition-none"
+              : "transition-transform duration-300 ease-out will-change-transform"
+          } ${
+            showContent
+              ? "-translate-x-full sm:translate-x-0"
+              : "translate-x-0"
+          }`}
+        >
+          <Sidebar onSelect={toContent} />
+
+          <main className="flex w-full min-w-0 shrink-0 flex-col bg-base-100 sm:w-0 sm:flex-1">
+            <TopBar />
+            <MessageList />
+            <Composer />
+          </main>
+        </div>
       </div>
-    </div>
+    </ChatNavContext.Provider>
   );
 }
 

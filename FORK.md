@@ -29,7 +29,9 @@
 - `POST /api/v1/agents/:name/interrupt` — tmux C-c（master → master:0）
 - `POST /api/v1/agents/:name/answer` — AUQ submit/cancel（buildAuqKeystrokes）+
   权限弹窗 allow/allow_session/deny（发键前 tmuxCapture 重验）
-- `GET /api/v1/agents/:name/pending` — 挂起交互补拉（SSE 迟到订阅者 replay）
+- `GET /api/v1/agents/:name/pending` — 挂起交互补拉（SSE 迟到订阅者 replay）；
+  additive 加 `thinking: boolean`（该 agent 此刻是否在回合中，见「事件与状态」getAgentStatus），
+  web composer 连流时读它同步「暂停」态
 - `POST /api/v1/agents` + `POST /api/v1/agents/:name/{kill,restart}` — 生命周期，仅全权 token
 - `GET /api/v1/agents` 增强：`?include=stopped` 入列已停止 agent；master 入列
   （scope 显式含 "master" 才可见）
@@ -39,6 +41,10 @@
 ### 事件与状态
 - `bridge/event-bus.ts`：`question_cleared` 事件类型（additive）——AUQ 应答/取消后
   web 收卡；Discord AUQ 按钮 + API answer 双侧发射
+- `bridge/event-bus.ts`：`getAgentStatus(agent)`（additive）——O(1) 追踪每个 agent 最近一次
+  `agent_status`（thinking/done）。`emitEvent` 里旁路更新一个 `agentStatuses` map。供
+  `/pending` 的 `thinking` 字段用（web composer 刷新/切回/回前台连流时同步「暂停」态）。
+  bridge 重启清零（同 ring 的 R6，权威回合边界靠 Stop hook 的 done）。单测在 tests/event-bus.test.ts。
 - `bridge/ask-user-question.ts`：`registerAuqState` 把状态注册与 Discord 渲染解耦
   （web-only / post 失败时 answer 端点仍有状态可用）；jsonl-watcher 调用点先注册后渲染
 

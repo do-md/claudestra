@@ -319,11 +319,16 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
 
   // ─── 发送 ────────────────────────────────────────────────
 
+  /**
+   * 发送一条用户消息。流式进行中也可发（「插入会话」）——claudestra 后端对忙碌
+   * agent 无 busy 拦截，消息经 channel 投递后由 Claude Code 原生排队、当前回合边界
+   * 处理（Discord 侧本就如此）。这是 claude-os stdin steer 在 claudestra 架构下的等价：
+   * 不写进程 stdin，靠 CC 原生排队，语义即「插入正在跑的会话」。
+   */
   public async send(text: string, files?: File[]) {
     const display = text.trim();
     const hasFiles = !!files && files.length > 0;
-    if ((!display && !hasFiles) || !this.state.activeAgent || this.state.streaming)
-      return;
+    if ((!display && !hasFiles) || !this.state.activeAgent) return;
     const agent = this.state.activeAgent;
     // 用户气泡内回显：图片给 objectURL 预览，其它给文件名 chip
     const attachments: ChatAttachmentView[] | undefined = hasFiles
@@ -337,6 +342,12 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         })
       : undefined;
     this.produce((s) => {
+      // 流式中插话：给当前流式助手气泡定稿，用户插入独立成段（后续输出另起气泡），
+      // 避免把「插入前的回复」和「插入后的回复」挤进同一个气泡显得错乱。
+      if (s.streaming) {
+        const last = s.messages[s.messages.length - 1];
+        if (last?.role === "assistant" && last.streamed) last.streamed = false;
+      }
       s.messages.push({
         id: this.nextId(),
         role: "user",
@@ -439,11 +450,19 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   }
 
   public setStatus(status: "running" | "done") {
-    if (status === "done")
-      this.produce((s) => {
+    this.produce((s) => {
+      if (status === "done") {
         s.streaming = false;
         s.awaitingChunk = false;
-      });
+      } else if (!s.streaming) {
+        // 进入回合 → 锁 composer 成「停止」态。三种触发：本端 send（已置 streaming，
+        // 走不到这里）/ 他端（Discord/master/另一浏览器）触发该会话 / 刷新·切回·回前台后
+        // 连流时 BFF 补的 status:running（会话本就在回合中）。awaitingChunk 补「思考中」点，
+        // 首个工具/文本段到达即由 ensureLiveAssistant 清除。
+        s.streaming = true;
+        s.awaitingChunk = true;
+      }
+    });
   }
 
   public endTurn() {

@@ -6,57 +6,132 @@ import { Domd } from "@/components/domd";
 import { PermissionCard } from "./permission-card";
 import { AskQuestionCard } from "./ask-question-card";
 
-function fmtTime(ts?: string): string {
-  if (!ts) return "";
-  const d = new Date(ts);
-  if (isNaN(d.getTime())) return "";
-  return d.toLocaleTimeString("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-}
+/* 复刻 Claude OS features/chat 的对话观感：assistant 全宽 + ✦ Claude 头，
+   user 右对齐圆角矩形，工具调用 active（转圈）/ history（可展开）两态。
+   配色走 daisyUI token 跟随明暗主题：✦ 头用 accent，工具活动用 info。 */
+
+const TOOL_ICONS: Record<string, string> = {
+  Read: "📄",
+  Write: "📝",
+  Edit: "✏️",
+  Bash: "💻",
+  Grep: "🔍",
+  Glob: "📂",
+  Task: "🤖",
+  Agent: "🤖",
+  TodoWrite: "📋",
+  Skill: "⚡",
+  WebFetch: "🌐",
+  WebSearch: "🌐",
+};
+const toolIcon = (n: string) => TOOL_ICONS[n] || "🔧";
 
 /** formatTool 的 Bash 摘要用 ||command|| 包裹命令，展示时去掉这对标记。 */
 function cleanSummary(s: string): string {
   return s.replace(/\|\|/g, " ").replace(/\s+/g, " ").trim();
 }
 
-/**
- * 工具调用卡：可展开（<details>）。摘要本身自带 emoji+工具名+参数（formatTool），
- * 折叠行截断单行，展开看完整摘要（长路径/命令）。
- * 注：当前实时流只有「段级摘要」，完整入参/结果需后端补事件字段后再填。
- */
-function ToolCard({ tool }: { tool: ToolCallView }) {
-  const full = cleanSummary(tool.summary) || tool.name;
+/** 流式期间的工具行：紧凑单行，最后一个转圈。 */
+function ActiveToolRow({ tool, active }: { tool: ToolCallView; active: boolean }) {
+  const summary = cleanSummary(tool.summary);
   return (
-    <details className="group rounded-md bg-base-100/60 [&>summary]:list-none">
-      <summary className="flex cursor-pointer items-center gap-1.5 px-2 py-1 text-xs">
-        {tool.state === "running" ? (
-          <span className="loading loading-spinner loading-xs shrink-0" />
-        ) : tool.state === "error" ? (
-          <span className="shrink-0">❌</span>
-        ) : null}
-        <span className="min-w-0 flex-1 truncate font-mono opacity-75">
-          {full}
+    <div className="flex items-center gap-1.5 py-0.5 font-mono text-xs">
+      {active && tool.state === "running" ? (
+        <span className="loading loading-spinner loading-xs text-info" />
+      ) : tool.state === "error" ? (
+        <span className="shrink-0">❌</span>
+      ) : (
+        <span className="shrink-0 opacity-60">{toolIcon(tool.name)}</span>
+      )}
+      <span className="font-semibold text-info">{tool.name}</span>
+      {summary && (
+        <span className="truncate text-base-content/50 max-w-[60vw] lg:max-w-[40vw]">
+          {summary}
         </span>
-        <span className="shrink-0 opacity-30 transition-transform group-open:rotate-90">
+      )}
+    </div>
+  );
+}
+
+/** 历史 / 定稿后的工具行：可展开看完整摘要。 */
+function HistoryToolRow({ tool }: { tool: ToolCallView }) {
+  const summary = cleanSummary(tool.summary);
+  return (
+    <details className="group rounded-lg border border-info/25 bg-info/[0.06] [&>summary]:list-none">
+      <summary className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs">
+        <span className="shrink-0 opacity-70">
+          {tool.state === "error" ? "❌" : toolIcon(tool.name)}
+        </span>
+        <span className="font-semibold text-info">{tool.name}</span>
+        {summary && (
+          <span className="truncate text-base-content/50 max-w-[60vw] lg:max-w-[40vw]">
+            {summary.slice(0, 80)}
+          </span>
+        )}
+        <span className="ml-auto shrink-0 opacity-30 transition-transform group-open:rotate-90">
           ›
         </span>
       </summary>
-      <div className="border-t border-base-300/50 px-2 py-1.5">
-        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] opacity-80">
-          {full}
+      <div className="px-2.5 pb-2 pt-0.5">
+        <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-base-content/50">
+          {summary || tool.name}
         </pre>
       </div>
     </details>
   );
 }
 
+function ToolCallsBlock({
+  tools,
+  streamingLast,
+}: {
+  tools: ToolCallView[];
+  streamingLast: boolean;
+}) {
+  return (
+    <div className="mb-2 space-y-1">
+      {tools.map((t, i) =>
+        streamingLast ? (
+          <ActiveToolRow key={i} tool={t} active={i === tools.length - 1} />
+        ) : (
+          <HistoryToolRow key={i} tool={t} />
+        )
+      )}
+    </div>
+  );
+}
+
+/** 流式「思考中」三点。 */
+function ThinkingDots() {
+  return (
+    <span className="inline-flex gap-1 py-1.5">
+      {[0, 0.2, 0.4].map((d) => (
+        <span
+          key={d}
+          className="chat-dot size-1.5 rounded-full bg-base-content/45"
+          style={{ animationDelay: `${d}s` }}
+        />
+      ))}
+    </span>
+  );
+}
+
+/** ✦ Claude 头（assistant 消息 / 独立思考态共用）。 */
+function ClaudeHeader() {
+  return (
+    <div className="mb-[9px] flex items-center gap-2">
+      <span className="flex size-[21px] items-center justify-center rounded-md bg-accent text-[11px] text-white">
+        ✦
+      </span>
+      <span className="text-xs font-semibold text-base-content/60">Claude</span>
+    </div>
+  );
+}
+
 /** 用户气泡里的上传附件回显：图片缩略图 / 文件名 chip。 */
 function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
   return (
-    <div className="mb-1.5 flex flex-wrap gap-1.5">
+    <div className="flex max-w-[85%] flex-wrap justify-end gap-2">
       {items.map((a, i) =>
         a.kind === "image" && a.url ? (
           // eslint-disable-next-line @next/next/no-img-element
@@ -64,14 +139,15 @@ function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
             key={i}
             src={a.url}
             alt={a.name}
-            className="max-h-40 max-w-[12rem] rounded-lg object-cover"
+            className="max-h-52 max-w-[220px] rounded-[12px] border border-base-content/10 object-cover"
           />
         ) : (
           <span
             key={i}
-            className="flex items-center gap-1 rounded-md bg-base-100/30 px-2 py-1 text-xs"
+            title={a.name}
+            className="flex max-w-[220px] items-center gap-2 rounded-[12px] border border-base-content/10 bg-base-300 px-3 py-2 text-[12.5px] text-base-content/80"
           >
-            📎 <span className="max-w-[10rem] truncate">{a.name}</span>
+            📎 <span className="truncate">{a.name}</span>
           </span>
         )
       )}
@@ -79,11 +155,18 @@ function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
   );
 }
 
-/** 助手正文：流式进行中用纯文本（DOMD initMd 只读一次不适合增量喂字），定稿/历史走 DOMD 富文本。 */
-function AssistantContent({ m }: { m: ChatMessage }) {
+/** 助手正文：流式进行中用纯文本（DOMD 只读一次不适合增量喂字），定稿/历史走 DOMD 富文本。 */
+function AssistantBody({
+  m,
+  liveEmpty,
+}: {
+  m: ChatMessage;
+  liveEmpty: boolean;
+}) {
   if (m.streamed) {
+    if (liveEmpty) return <ThinkingDots />;
     return (
-      <div className="whitespace-pre-wrap break-words">
+      <div className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]">
         {m.content || <span className="opacity-40">…</span>}
       </div>
     );
@@ -92,43 +175,44 @@ function AssistantContent({ m }: { m: ChatMessage }) {
   return <Domd initMd={m.content} bodyClassName="chat-domd" />;
 }
 
-function Bubble({ m }: { m: ChatMessage }) {
-  const isUser = m.role === "user";
-  return (
-    <div className={`chat ${isUser ? "chat-end" : "chat-start"}`}>
-      {isUser && m.from && (
-        <div className="chat-header mb-0.5 text-[10px] opacity-50">{m.from}</div>
-      )}
-      <div
-        className={`chat-bubble max-w-[85%] break-words ${
-          isUser ? "chat-bubble-primary" : "bg-base-200 text-base-content"
-        }`}
-      >
-        {!isUser && m.toolCalls && m.toolCalls.length > 0 && (
-          <div className="mb-2 flex flex-col gap-1">
-            {m.toolCalls.map((t, i) => (
-              <ToolCard key={i} tool={t} />
-            ))}
+function Message({
+  m,
+  streaming,
+  isLast,
+  awaiting,
+}: {
+  m: ChatMessage;
+  streaming: boolean;
+  isLast: boolean;
+  awaiting: boolean;
+}) {
+  if (m.role === "user") {
+    const atts = m.attachments ?? [];
+    return (
+      <div className="chat-msg-in mb-[22px] flex flex-col items-end gap-2">
+        {m.from && (
+          <div className="pr-1 text-[10px] opacity-50">{m.from}</div>
+        )}
+        {atts.length > 0 && <AttachmentStrip items={atts} />}
+        {m.content && (
+          <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90">
+            {m.content}
           </div>
         )}
-        {isUser ? (
-          <>
-            {m.attachments && m.attachments.length > 0 && (
-              <AttachmentStrip items={m.attachments} />
-            )}
-            {m.content && (
-              <div className="whitespace-pre-wrap break-words">{m.content}</div>
-            )}
-          </>
-        ) : (
-          <AssistantContent m={m} />
-        )}
       </div>
-      {m.ts && (
-        <div className="chat-footer mt-0.5 text-[10px] opacity-40">
-          {fmtTime(m.ts)}
-        </div>
+    );
+  }
+
+  // assistant
+  const streamingLast = streaming && isLast;
+  const liveEmpty = streamingLast && awaiting && !m.content;
+  return (
+    <div className="chat-msg-in mb-[22px] w-full">
+      <ClaudeHeader />
+      {!!m.toolCalls?.length && (
+        <ToolCallsBlock tools={m.toolCalls} streamingLast={streamingLast} />
       )}
+      <AssistantBody m={m} liveEmpty={liveEmpty} />
     </div>
   );
 }
@@ -136,14 +220,21 @@ function Bubble({ m }: { m: ChatMessage }) {
 export function MessageList() {
   const messages = useChatStore((s) => s.state.messages);
   const awaiting = useChatStore((s) => s.state.awaitingChunk);
+  const streaming = useChatStore((s) => s.state.streaming);
   const loadingHistory = useChatStore((s) => s.state.loadingHistory);
   const active = useChatStore((s) => s.state.activeAgent);
   const pendingPermission = useChatStore((s) => s.state.pendingPermission);
   const pendingAsk = useChatStore((s) => s.state.pendingAsk);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollerRef = useRef<HTMLDivElement>(null);
 
+  // 滚到底部：直接设本滚动容器的 scrollTop，不用 scrollIntoView——后者会同时滚动
+  // 「所有可滚祖先、双轴」，包括 overflow:hidden 的应用壳根（视觉裁剪但可被程序滚动）。
+  // 移动端横滑动画进行中历史恰好落地时，scrollIntoView 会给根容器塞 scrollLeft 把
+  // 半途的锚点「拉进来」，残留量叠在 translate -100% 上 → 会话页越过目标位、渲染不满视窗
+  // （owner 真机截图 2026-07-11）。scrollTop 只动纵轴、只动本容器，无此副作用。
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = scrollerRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [messages, awaiting, pendingPermission, pendingAsk]);
 
   if (!active) {
@@ -155,9 +246,17 @@ export function MessageList() {
     );
   }
 
+  // 首个 chunk 到达前（last 还是用户气泡）单独渲染一条 ✦ Claude + 思考点；
+  // 若最后一条已是流式助手，思考点由该消息内部（liveEmpty）渲染，此处不重复。
+  const last = messages[messages.length - 1];
+  const standaloneThinking =
+    awaiting && !(last && last.role === "assistant" && last.streamed);
+
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-4">
-      <div className="mx-auto flex max-w-3xl flex-col gap-2">
+    <div ref={scrollerRef} className="flex-1 overflow-y-auto">
+      {/* 横向留白对齐 claude-os thread（px-7=28px + 居中限宽），手机端稍收到 24px，
+          原 px-4(16px) 太满不透气（owner 反馈）。滚动条落在最外层边缘更干净。 */}
+      <div className="mx-auto flex max-w-3xl flex-col px-6 pb-4 pt-6 sm:px-7">
         {loadingHistory && (
           <div className="flex items-center justify-center gap-2 py-6 text-sm opacity-40">
             <span className="loading loading-spinner loading-sm" />
@@ -169,19 +268,23 @@ export function MessageList() {
             向 {active} 发送第一条消息
           </div>
         )}
-        {messages.map((m) => (
-          <Bubble key={m.id} m={m} />
+        {messages.map((m, i) => (
+          <Message
+            key={m.id}
+            m={m}
+            streaming={streaming}
+            isLast={i === messages.length - 1}
+            awaiting={awaiting}
+          />
         ))}
         {pendingPermission && <PermissionCard p={pendingPermission} />}
         {pendingAsk && <AskQuestionCard a={pendingAsk} />}
-        {awaiting && (
-          <div className="chat chat-start">
-            <div className="chat-bubble bg-base-200">
-              <span className="loading loading-dots loading-sm" />
-            </div>
+        {standaloneThinking && (
+          <div className="chat-msg-in mb-[22px] w-full">
+            <ClaudeHeader />
+            <ThinkingDots />
           </div>
         )}
-        <div ref={bottomRef} />
       </div>
     </div>
   );
