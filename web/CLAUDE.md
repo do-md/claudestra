@@ -35,6 +35,19 @@ app/
     agents/settings/    GET/PUT per-agent 前端配置（init_message 开机指令，web SQLite）
     chat/permission/    POST（代理 /api/v1/agents/:name/answer kind=permission）
     chat/auq/           POST（代理 /api/v1/agents/:name/answer kind=auq）
+    terminal/stream/    GET SSE 纯透传（代理 /api/v1/agents/:name/terminal?cols=&rows=，fork 端点；
+                        浏览器断开→上游 abort→Bridge 销毁 PTY+viewer session）
+    terminal/input/     POST {id,d:base64}（代理 /api/v1/terminal/:id/input，逐键/微批，Bridge 不限流）
+    terminal/resize/    POST {id,cols,rows}（代理 /api/v1/terminal/:id/resize）
+features/terminal/      远程终端（会话详情 🖥️ 按钮 → 模态框实时镜像 tmux + 可输入）
+  terminal-button.tsx   TopBar 入口（active 会话 + master 都有；stopped 隐藏）
+  terminal-modal.tsx    createPortal 全屏模态框（visualViewport 钳高防 iOS 键盘遮挡）
+  terminal-view.tsx     @xterm/xterm v6 + fit + webgl(尽力)；SSE 下行 base64 帧→term.write，
+                        onData 8ms 微批+串行链→input POST（字节序），RO 防抖 150ms→resize POST。
+                        ?noWebgl=1 强制 DOM renderer（后台 tab 自动化验证用，WebGL hidden 不 paint）；
+                        window.__claudestraTerm debug 句柄（读 buffer 验数据面）
+  control-bar.tsx       移动端控制键条（Esc/Tab/⇧Tab/方向/⏎/^C + ⌨️ 聚焦唤软键盘；
+                        onPointerDown preventDefault 防抢焦点收键盘）
 features/chat/
   type.ts               ChatMessage / AgentSession / ToolCallView / PendingPermission / PendingAsk
   stream.ts             consumeSSEStream + processStreamEvent + StreamSink（协议 v1，迁移零改动）

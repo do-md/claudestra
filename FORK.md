@@ -42,6 +42,15 @@
   Shawn 看到的是原生 /clear，图谱注入藏在前端配置的消息文本里。
   ⚠ 实测：CC 原生 auto-memory（projects/<slug>/memory/）会跨 /clear 存活——
   上下文清零但 CC 自己的记忆层还在，这是 CC 原生行为不是 bug。
+- **Web 远程终端**（`src/bridge/web-terminal.ts` 新文件 + bridge.ts 三处挂点：import /
+  `/api/v1/` 分发前拦截 / 启动 sweep）：`GET /api/v1/agents/:name/terminal?cols=&rows=`
+  （SSE：PTY 输出 base64 帧；连接即建 `Bun.Terminal` + `tmux attach` 到 grouped
+  viewer session `webterm-<id>`，断开即销毁）+ `POST /api/v1/terminal/:id/{input,resize}`。
+  三端点**不走 SlidingWindowLimiter**（逐键输入秒超 30/min；Bearer + agentInScope +
+  termId 属主校验不变）。⚠ 两个不变式：resize 后必须手动 `proc.kill("SIGWINCH")`
+  （Bun.Terminal 子进程无 controlling tty，TIOCSWINSZ 生效但内核不发信号，PoC 实证）；
+  SSE 连接即发首包 + 5s ping（Bun idleTimeout 坑，同 handleEventsRequest 修复）。
+  需 Bun ≥1.3.5（Bun.Terminal）+ tmux ≥3.2（grouped session 窗口索引与 master 一致，实测）。
 - `GET /api/v1/agents` 增强：`?include=stopped` 入列已停止 agent；master 入列
   （scope 显式含 "master" 才可见）
 - `findApiAgent` master 特判：channelId=CONTROL_CHANNEL_ID、cwd 取 channel-server

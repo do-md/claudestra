@@ -63,6 +63,8 @@ import { cleanupBgJob } from "./lib/bg-jobs.js";
 import { startSessionReconciler } from "./bridge/session-reconciler.js";
 import { startBgActivityWatcher } from "./bridge/bg-activity-watcher.js";
 import { startArchiveSweeper } from "./bridge/archive-sweeper.js";
+// [fork] Web 远程终端（PTY attach → SSE；见 web-terminal.ts 头注释）
+import { handleTerminalApi, sweepStaleTerminalSessions } from "./bridge/web-terminal.js";
 // v2.6.0+ HTTP API 身份与授权（设计 §3.4 / §5）
 import {
   readPrincipals,
@@ -5405,6 +5407,10 @@ const server = Bun.serve({
 
     // v2.6.0+ token 鉴权的入站 API（多前端架构 Phase B）
     if (url.pathname.startsWith("/api/v1/")) {
+      // [fork] Web 远程终端 3 端点先行匹配（不走 30req/min 限流——逐键输入秒超；
+      // 鉴权在 web-terminal.ts：Bearer + agentInScope + termId 属主校验）
+      const termRes = await handleTerminalApi(req, url);
+      if (termRes) return termRes;
       return handleApiRequest(req, url);
     }
 
@@ -5576,6 +5582,10 @@ const server = Bun.serve({
 });
 
 console.log(`🚀 Bridge WebSocket 启动: ws://localhost:${BRIDGE_PORT}`);
+
+// [fork] 清扫上次崩溃/被杀残留的 webterm-* viewer session（grouped session 视图，
+// kill 不伤 master 本体）。Discord 与 Web-only 模式都需要。
+sweepStaleTerminalSessions().catch(() => {});
 
 // [fork:web-only] 无 DISCORD_BOT_TOKEN → Web-only 模式：不连 Discord，只跑与
 // 平台无关的初始化子集。HTTP/ws/api/事件流在上面 Bun.serve 时已就绪。
