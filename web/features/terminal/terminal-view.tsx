@@ -33,7 +33,14 @@ function b64decode(d: string): Uint8Array {
   return Uint8Array.from(atob(d), (c) => c.charCodeAt(0));
 }
 
-export function TerminalView({ agent }: { agent: string }) {
+export function TerminalView({
+  agent,
+  mobile,
+}: {
+  agent: string;
+  /** 手机端：控制条显示专用输入框（绕开 xterm 吞字的 textarea） */
+  mobile?: boolean;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const termIdRef = useRef<string | null>(null);
@@ -223,10 +230,49 @@ export function TerminalView({ agent }: { agent: string }) {
     });
     ro.observe(container);
 
+    // ── 触摸滑动 → 滚轮（xterm 移动端触摸滚动官方短板 #5377；CC TUI 在
+    //    alternate screen 无滚动缓冲，手指划屏本来毫无反应）。把竖向拖动合成
+    //    WheelEvent 派发到 .xterm-screen，由 xterm 按 CC 当前鼠标模式正确编码
+    //    上行——滑动始终是「滚动」，不会像补发方向键那样误碰输入/命令历史。
+    //    手指下拉 = 看更早历史（wheel up），上推 = 回到最新。[fork]
+    const screenEl = container.querySelector(".xterm-screen") as HTMLElement | null;
+    let touchY: number | null = null;
+    const WHEEL_FACTOR = 2.2; // 手指位移 → 滚轮像素放大系数（真机手感可调）
+    const onTouchStart = (e: TouchEvent) => {
+      touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (touchY === null || e.touches.length !== 1) return;
+      const y = e.touches[0].clientY;
+      const dy = y - touchY;
+      touchY = y;
+      if (dy === 0) return;
+      e.preventDefault(); // 吃掉原生滚动/橡皮筋，交给 xterm
+      (screenEl ?? container).dispatchEvent(
+        new WheelEvent("wheel", {
+          deltaY: -dy * WHEEL_FACTOR, // 下拉(dy>0) → deltaY<0 → wheel up → 看更早
+          deltaMode: 0, // DOM_DELTA_PIXEL
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+    };
+    const onTouchEnd = () => {
+      touchY = null;
+    };
+    container.addEventListener("touchstart", onTouchStart, { passive: true });
+    container.addEventListener("touchmove", onTouchMove, { passive: false });
+    container.addEventListener("touchend", onTouchEnd, { passive: true });
+    container.addEventListener("touchcancel", onTouchEnd, { passive: true });
+
     return () => {
       disposed = true;
       clearTimeout(connectTimer); // dev 双 effect：首个 effect 的连接在 fire 前取消
       ro.disconnect();
+      container.removeEventListener("touchstart", onTouchStart);
+      container.removeEventListener("touchmove", onTouchMove);
+      container.removeEventListener("touchend", onTouchEnd);
+      container.removeEventListener("touchcancel", onTouchEnd);
       if (resizeTimer !== null) clearTimeout(resizeTimer);
       if (flushTimerRef.current !== null) {
         clearTimeout(flushTimerRef.current);
@@ -243,7 +289,13 @@ export function TerminalView({ agent }: { agent: string }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-[#1e1e2e]">
       <div className="relative min-h-0 flex-1 px-2 pt-2">
-        <div ref={containerRef} className="h-full w-full" />
+        {/* touchAction:none —— 触摸手势全归我们处理（合成 wheel 滚动），
+            iOS 才不会在 preventDefault 前先把首个 move 吃成原生滚动/橡皮筋 */}
+        <div
+          ref={containerRef}
+          className="h-full w-full"
+          style={{ touchAction: "none" }}
+        />
         {status !== "connected" && (
           <div className="absolute inset-0 grid place-items-center bg-[#1e1e2e]/70">
             {status === "connecting" && (
@@ -272,6 +324,7 @@ export function TerminalView({ agent }: { agent: string }) {
         onKeys={(seq) => queueInputRef.current(seq)}
         onFocusTerm={() => termRef.current?.focus()}
         disabled={status !== "connected"}
+        mobile={mobile}
       />
     </div>
   );

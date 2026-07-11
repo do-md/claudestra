@@ -84,7 +84,7 @@ export function TerminalPage({
             {displayName} · 终端
           </span>
         </header>
-        <TerminalView agent={agent} />
+        <TerminalView agent={agent} mobile />
       </div>
     </div>,
     document.body
