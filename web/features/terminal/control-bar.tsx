@@ -33,7 +33,11 @@ export function ControlBar({
   return (
     <div
       className="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-white/10 bg-[#181825] px-2 py-1.5"
-      style={{ paddingBottom: "max(env(safe-area-inset-bottom), 6px)" }}
+      style={{
+        // --term-safe-bottom：软键盘弹起时 modal 置 0（home 条在键盘后面无需垫）
+        paddingBottom:
+          "max(var(--term-safe-bottom, env(safe-area-inset-bottom)), 6px)",
+      }}
     >
       {/* 唤起软键盘（iOS 必须在用户手势内 focus） */}
       <button

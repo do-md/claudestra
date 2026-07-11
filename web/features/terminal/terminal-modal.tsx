@@ -34,16 +34,25 @@ export function TerminalModal({
   displayName: string;
   onClose: () => void;
 }) {
-  const [vvh, setVvh] = useState<number | null>(null);
+  // iOS 软键盘：visualViewport 缩小时，modal-box 不能再走 daisyUI 的「居中」
+  // 布局——modal 容器是整个布局视口，矮了的 box 会被居中到中间：上面露出
+  // 半截背景页、下半截（控制键条）沉进键盘（真机 2026-07-11 实测塌陷）。
+  // 修法：键盘在场时把 box 改为 fixed 钉在可视视口顶部（top=vv.offsetTop，
+  // iOS 聚焦可能滚动布局视口），height=vv.height，正好铺满键盘上方区域。
+  const [vp, setVp] = useState<{ h: number; top: number } | null>(null);
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
-    const onResize = () => {
-      // 键盘弹起时 vv.height < innerHeight → 钳高度；收起后恢复 null（走 CSS）
-      setVvh(vv.height < window.innerHeight - 40 ? vv.height : null);
+    const update = () => {
+      const keyboardUp = window.innerHeight - vv.height > 40;
+      setVp(keyboardUp ? { h: vv.height, top: vv.offsetTop } : null);
     };
-    vv.addEventListener("resize", onResize);
-    return () => vv.removeEventListener("resize", onResize);
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update); // offsetTop 变化（聚焦滚动）也要跟
+    return () => {
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+    };
   }, []);
 
   // Esc 关闭（桌面）；注意 xterm 聚焦时 Esc 会被终端吃掉——这是预期
@@ -62,7 +71,22 @@ export function TerminalModal({
     <div className="modal modal-open">
       <div
         className="modal-box flex h-[100dvh] max-h-none w-screen max-w-none flex-col gap-0 overflow-hidden rounded-none p-0 sm:h-[88vh] sm:w-[92vw] sm:max-w-6xl sm:rounded-xl"
-        style={vvh !== null ? { height: vvh } : undefined}
+        style={
+          vp !== null
+            ? {
+                // 键盘在场：脱离居中布局，钉满键盘上方的可视区
+                position: "fixed",
+                top: vp.top,
+                left: 0,
+                width: "100vw",
+                maxWidth: "100vw",
+                height: vp.h,
+                borderRadius: 0,
+                // 键盘在场时 home 条在键盘后面，控制键条不再垫底部安全区
+                ["--term-safe-bottom" as string]: "0px",
+              } as React.CSSProperties
+            : undefined
+        }
       >
         <header
           className="flex shrink-0 items-center gap-2 border-b border-white/10 bg-[#181825] px-3 py-2 text-[#cdd6f4]"

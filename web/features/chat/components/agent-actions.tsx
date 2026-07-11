@@ -62,11 +62,32 @@ function PowerIcon() {
   );
 }
 
+/** 更多操作：竖三点（ellipsis-vertical） */
+function MoreIcon() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="12" cy="5" r="1" />
+      <circle cx="12" cy="12" r="1" />
+      <circle cx="12" cy="19" r="1" />
+    </svg>
+  );
+}
+
 /**
- * 会话详情顶栏右侧的操作区（清空 / 重启 / 停止）。
+ * 会话详情顶栏右侧的操作区。
  * - 大总管不渲染任何操作（clear 底层能力保留，UI 不放；生命周期归 launcher）。
- * - 清空：仅 active 时可用（要有活着的 TUI 才能打 /clear）→ 确认弹窗（开机指令）。
- * - 停止：仅 active 时显示；重启恒显。
+ * - active：清空/重启/停止收进一个 ⋮ 下拉（owner 2026-07-11：顶栏按钮太多）。
+ * - 非 active：保持原样——只有恒显的重启按钮。
+ * - 下拉用 daisyUI focus 模式（点外部/blur 自动收起），选项点击后主动 blur 收起。
  */
 export function AgentActions({ agent }: { agent: AgentSession }) {
   const store = useChatStoreApi();
@@ -76,8 +97,13 @@ export function AgentActions({ agent }: { agent: AgentSession }) {
 
   if (agent.pinnedMaster || agent.mock) return null;
 
+  const closeDropdown = () => {
+    (document.activeElement as HTMLElement | null)?.blur?.();
+  };
+
   const act = async (action: "kill" | "restart") => {
     if (busy) return;
+    closeDropdown();
     setBusy(action);
     setError("");
     const res =
@@ -88,52 +114,86 @@ export function AgentActions({ agent }: { agent: AgentSession }) {
     if (!res.ok) setError(res.error || `${action} 失败`);
   };
 
-  return (
-    <span className="ml-auto flex shrink-0 items-center gap-0.5">
-      {error && (
-        <span className="mr-1 max-w-40 truncate text-xs text-error" title={error}>
-          {error}
-        </span>
-      )}
-      {agent.status === "active" && (
+  const errorBadge = error ? (
+    <span className="mr-1 max-w-40 truncate text-xs text-error" title={error}>
+      {error}
+    </span>
+  ) : null;
+
+  // 非 active：与合并前一致，只保留重启
+  if (agent.status !== "active") {
+    return (
+      <span className="flex shrink-0 items-center gap-0.5">
+        {errorBadge}
         <button
-          className="btn btn-ghost btn-sm px-2 text-base-content/60 hover:text-warning"
-          title="清空会话（/clear + 开机指令）"
-          aria-label="清空会话"
-          onClick={() => setShowClear(true)}
+          className="btn btn-ghost btn-sm px-2 text-base-content/60 hover:text-base-content"
+          title="重启"
+          aria-label="重启"
+          onClick={() => act("restart")}
           disabled={busy !== ""}
         >
-          <EraserIcon />
-        </button>
-      )}
-      <button
-        className="btn btn-ghost btn-sm px-2 text-base-content/60 hover:text-base-content"
-        title="重启"
-        aria-label="重启"
-        onClick={() => act("restart")}
-        disabled={busy !== ""}
-      >
-        {busy === "restart" ? (
-          <span className="loading loading-spinner loading-xs" />
-        ) : (
-          <RestartIcon />
-        )}
-      </button>
-      {agent.status === "active" && (
-        <button
-          className="btn btn-ghost btn-sm px-2 text-base-content/60 hover:text-error"
-          title="停止"
-          aria-label="停止"
-          onClick={() => act("kill")}
-          disabled={busy !== ""}
-        >
-          {busy === "kill" ? (
+          {busy === "restart" ? (
             <span className="loading loading-spinner loading-xs" />
           ) : (
-            <PowerIcon />
+            <RestartIcon />
           )}
         </button>
-      )}
+      </span>
+    );
+  }
+
+  return (
+    <span className="flex shrink-0 items-center gap-0.5">
+      {errorBadge}
+      <div className="dropdown dropdown-end">
+        <div
+          tabIndex={0}
+          role="button"
+          aria-label="更多操作"
+          className={`btn btn-ghost btn-sm px-2 text-base-content/60 hover:text-base-content ${
+            busy ? "btn-disabled" : ""
+          }`}
+        >
+          {busy ? (
+            <span className="loading loading-spinner loading-xs" />
+          ) : (
+            <MoreIcon />
+          )}
+        </div>
+        <ul
+          tabIndex={0}
+          className="dropdown-content menu z-50 mt-1 w-44 rounded-box border border-base-300 bg-base-100 p-1 shadow-lg"
+        >
+          <li>
+            <button
+              onClick={() => {
+                closeDropdown();
+                setShowClear(true);
+              }}
+              disabled={busy !== ""}
+            >
+              <EraserIcon />
+              清空会话
+            </button>
+          </li>
+          <li>
+            <button onClick={() => act("restart")} disabled={busy !== ""}>
+              <RestartIcon />
+              重启
+            </button>
+          </li>
+          <li>
+            <button
+              className="text-error"
+              onClick={() => act("kill")}
+              disabled={busy !== ""}
+            >
+              <PowerIcon />
+              停止
+            </button>
+          </li>
+        </ul>
+      </div>
 
       {showClear && (
         <ClearAgentModal agent={agent} onClose={() => setShowClear(false)} />
