@@ -126,7 +126,12 @@ export function TerminalView({ agent }: { agent: string }) {
     term.onBinary((data) => queueInputRef.current(data));
 
     // ── SSE 下行 ──
-    (async () => {
+    // ⚠ 延迟 50ms 再连：React dev 双 effect 的第一个 effect 会被同步清理——若
+    // 它已发出 fetch，abort 落在「Bridge 已开 PTY、Next 响应流未建立」的 race
+    // 窗口时取消传导会丢（实测漏过一条 → Bridge 僵尸 PTY，靠 TTL 才能回收）。
+    // 延迟让第一个 effect 的连接根本不发生；50ms 对真人无感。
+    const connectTimer = window.setTimeout(connect, 50);
+    async function connect() {
       let res: Response;
       try {
         res = await fetch(
@@ -188,7 +193,7 @@ export function TerminalView({ agent }: { agent: string }) {
           setErrMsg("连接中断");
         }
       }
-    })();
+    }
 
     // ── resize 跟随容器 ──
     let lastCols = cols;
@@ -220,6 +225,7 @@ export function TerminalView({ agent }: { agent: string }) {
 
     return () => {
       disposed = true;
+      clearTimeout(connectTimer); // dev 双 effect：首个 effect 的连接在 fire 前取消
       ro.disconnect();
       if (resizeTimer !== null) clearTimeout(resizeTimer);
       if (flushTimerRef.current !== null) {

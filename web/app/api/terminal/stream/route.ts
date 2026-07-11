@@ -47,7 +47,40 @@ export async function GET(request: Request) {
     return new Response(msg, { status: upstream.status === 404 ? 404 : 502 });
   }
 
-  return new Response(upstream.body, {
+  // ⚠ 不要直接 `new Response(upstream.body)` 纯透传：客户端 abort 时 Next 对
+  // 透传 body 的取消传导不可靠（dev 双 effect 实测漏了一条流→Bridge 僵尸 PTY）。
+  // 手动泵流 + 显式监听 request.signal，保证断开必然传导到上游。
+  const upstreamBody = upstream.body;
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = upstreamBody.getReader();
+      const onAbort = () => reader.cancel().catch(() => {});
+      request.signal.addEventListener("abort", onAbort);
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+      } catch {
+        /* 客户端断开（enqueue 抛错）或上游断（Bridge 重启）*/
+        reader.cancel().catch(() => {});
+      } finally {
+        request.signal.removeEventListener("abort", onAbort);
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      }
+    },
+    cancel() {
+      // 消费端取消（客户端断开的另一条路径）→ 显式掐上游
+      upstreamBody.cancel().catch(() => {});
+    },
+  });
+
+  return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",

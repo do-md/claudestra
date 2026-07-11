@@ -278,17 +278,35 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
   });
 }
 
+/** 单条 PTY 会话的最长存活（TTL 兜底）。正常关闭走 SSE 断开；这里防的是
+ *  取消传导失败的僵尸（实测过一例：dev 双 effect + BFF 透传 body 漏 abort）。 */
+const MAX_TERM_AGE_MS = 12 * 60 * 60 * 1000;
+
+function reapExpiredTerminalSessions(): void {
+  const now = Date.now();
+  for (const sess of [...termSessions.values()]) {
+    if (now - sess.createdAt > MAX_TERM_AGE_MS) {
+      console.log(`🖥️ [term] TTL reap id=${sess.id.slice(0, 8)} agent=${sess.agent}（存活超 ${MAX_TERM_AGE_MS / 3600_000}h）`);
+      sess.destroy();
+    }
+  }
+}
+
 /**
- * Bridge 启动时清扫残留 viewer session（上次进程被 kill -9 / 崩溃时的孤儿）。
+ * Bridge 启动时清扫残留 viewer session（上次进程被 kill -9 / 崩溃时的孤儿），
+ * 并拉起 TTL 兜底回收（每 10 分钟）。孤儿判定：tmux 里 webterm-* 但不在本进程
+ * termSessions 表里的（同进程活跃 viewer 不能误杀——本函数只在启动时调，表必空）。
  * grouped session 只是 window 集的视图，kill 不伤 master 本体。
  */
 export async function sweepStaleTerminalSessions(): Promise<void> {
   const { code, out } = await tmuxRun(["list-sessions", "-F", "#{session_name}"]);
-  if (code !== 0 || !out) return;
-  for (const name of out.split("\n")) {
-    if (name.startsWith(VIEWER_PREFIX)) {
-      await tmuxRun(["kill-session", "-t", name]);
-      console.log(`🖥️ [term] swept stale viewer session ${name}`);
+  if (code === 0 && out) {
+    for (const name of out.split("\n")) {
+      if (name.startsWith(VIEWER_PREFIX)) {
+        await tmuxRun(["kill-session", "-t", name]);
+        console.log(`🖥️ [term] swept stale viewer session ${name}`);
+      }
     }
   }
+  setInterval(reapExpiredTerminalSessions, 10 * 60 * 1000);
 }

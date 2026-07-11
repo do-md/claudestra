@@ -165,18 +165,6 @@ export function AgentActions({ agent }: { agent: AgentSession }) {
           className="dropdown-content menu z-50 mt-1 w-44 rounded-box border border-base-300 bg-base-100 p-1 shadow-lg"
         >
           <li>
-            <button
-              onClick={() => {
-                closeDropdown();
-                setShowClear(true);
-              }}
-              disabled={busy !== ""}
-            >
-              <EraserIcon />
-              清空会话
-            </button>
-          </li>
-          <li>
             <button onClick={() => act("restart")} disabled={busy !== ""}>
               <RestartIcon />
               重启
@@ -190,6 +178,19 @@ export function AgentActions({ agent }: { agent: AgentSession }) {
             >
               <PowerIcon />
               停止
+            </button>
+          </li>
+          {/* 清空放最下（owner 2026-07-11）：破坏性最低但最常误触，远离手指起点 */}
+          <li>
+            <button
+              onClick={() => {
+                closeDropdown();
+                setShowClear(true);
+              }}
+              disabled={busy !== ""}
+            >
+              <EraserIcon />
+              清空
             </button>
           </li>
         </ul>
