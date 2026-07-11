@@ -310,11 +310,29 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       });
   }
 
-  /** 回前台 / bfcache 恢复：若有活动 agent 但流已断，重开流。 */
+  /**
+   * 回前台 / bfcache 恢复：对当前会话做一次**完整对齐**，而不只是「流断了才重连」。
+   *
+   * 后台挂起有两个坑，光重连流补不回（真机实测：退到后台看终端、回合在后台跑完，
+   * 回来后流卡住、回复看不到，必须杀 App 重进才看到）：
+   *   ① iOS 常把 fetch-based SSE 流挂起但不真正关闭 → streamReader 仍非空，旧的
+   *      「if (streamReader) return」守卫会永久挡住重连（僵尸流），这正是只能杀 App 的根因。
+   *   ② 实时流只带「新事件」，补不回后台期间已经发生的 reply / done —— 回复看不到、
+   *      done 漏收导致 composer 卡在「停止」。jsonl 才是权威，必须重拉历史。
+   * 所以这里无条件：断开旧流（detachActiveStream 会 cancel + 置空 reader + 令旧回调
+   * 失效）→ 重拉历史（追平错过的消息，bubble id 用 jsonl seq，追加只动尾部不闪）→
+   * 重连流（openStream 连上后 BFF /pending 补 thinking 态，把 composer 锁态也校准：
+   * 仍在回合则重锁「停止」，已结束则保持解锁）。
+   */
   public maybeReconnect() {
-    if (!this.state.activeAgent) return;
-    if (this.streamReader) return;
-    void this.openStream(this.state.activeAgent);
+    const name = this.state.activeAgent;
+    if (!name) return;
+    this.detachActiveStream();
+    const gen = ++this.openGen;
+    void this.loadMessages(name, gen).then(() => {
+      if (gen !== this.openGen) return;
+      void this.openStream(name);
+    });
   }
 
   // ─── 发送 ────────────────────────────────────────────────
