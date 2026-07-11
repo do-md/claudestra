@@ -12,6 +12,7 @@ import { ChatNavContext, useChatNav, type ChatNav } from "./nav-context";
 import { Sidebar } from "./sidebar";
 import { MessageList } from "./message-list";
 import { Composer } from "./composer";
+import { AgentActions } from "./agent-actions";
 
 /** 「会话内容」页的 hash 锚点：存在即处于内容视图，移动端横滑到内容栏 */
 const CONTENT_HASH = "#chat";
@@ -44,12 +45,16 @@ function TopBar() {
           <path d="M15 18l-6-6 6-6" />
         </svg>
       </button>
-      <span className="truncate font-semibold">{active || "Claudestra"}</span>
+      <span className="truncate font-semibold">
+        {info?.displayName || active || "Claudestra"}
+      </span>
       {info?.cwd && (
         <span className="hidden truncate font-mono text-xs opacity-50 sm:inline">
           {info.cwd}
         </span>
       )}
+      {/* 会话操作区（清空/重启/停止）——与标题同行靠右；大总管不渲染 */}
+      {info && <AgentActions agent={info} />}
     </header>
   );
 }

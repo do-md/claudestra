@@ -1,8 +1,6 @@
 "use client";
-import { useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
-import { ClearAgentModal } from "./clear-agent-modal";
 
 function StatusDot({ status }: { status: AgentSession["status"] }) {
   if (status === "active") {
@@ -19,97 +17,23 @@ function StatusDot({ status }: { status: AgentSession["status"] }) {
   );
 }
 
-/** 重启：循环箭头（refresh） */
-function RestartIcon() {
-  return (
-    <svg
-      width="15"
-      height="15"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
-      <path d="M21 3v5h-5" />
-    </svg>
-  );
-}
-
-/** 清空：扫帚（远程 /clear，上下文清零 + 可选开机指令） */
-function BroomIcon() {
-  return (
-    <svg
-      width="15"
-      height="15"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M19 3l-8.5 8.5" />
-      <path d="M13.5 8.5L5 13c-1.5.8-2.5 2.3-3 4.5-.2 1 .5 2.5 1.5 2.5 3.5 0 6-1 8-3l4-4.5" />
-      <path d="M9 15l2.5 2.5" />
-    </svg>
-  );
-}
-
-/** 停止：电源符号（关闭该 agent，语义比「■」更贴切） */
-function PowerIcon() {
-  return (
-    <svg
-      width="15"
-      height="15"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M12 3v9" />
-      <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
-    </svg>
-  );
-}
-
+/**
+ * 会话列表行——纯选择项。会话操作（清空/重启/停止）已迁到会话详情顶栏
+ * （agent-actions.tsx），列表保持干净。
+ */
 function AgentRow({
   a,
   active,
   onSelect,
-  onClear,
 }: {
   a: AgentSession;
   active: boolean;
   onSelect: () => void;
-  onClear: () => void;
 }) {
   const store = useChatStoreApi();
-  const [busy, setBusy] = useState<"" | "kill" | "restart">("");
-  const [error, setError] = useState("");
-
-  const act = async (
-    e: React.MouseEvent,
-    action: "kill" | "restart"
-  ) => {
-    e.stopPropagation();
-    if (busy || a.mock || a.pinnedMaster) return;
-    setBusy(action);
-    setError("");
-    const res =
-      action === "kill"
-        ? await store.killAgent(a.name)
-        : await store.restartAgent(a.name);
-    setBusy("");
-    if (!res.ok) setError(res.error || `${action} 失败`);
-  };
 
   return (
-    <li className="group">
+    <li>
       <div
         className={`flex items-center gap-2.5 rounded-lg px-2 py-2.5 sm:gap-2 sm:py-1.5 ${
           active ? "bg-base-300" : "hover:bg-base-300/60"
@@ -143,62 +67,7 @@ function AgentRow({
             )}
           </span>
         </button>
-
-        {!a.mock && (
-          // 触控设备无 hover，<sm 强制常显（max-sm:opacity-100）+ 加大触控尺寸
-          <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 max-sm:opacity-100">
-            {a.status === "active" && (
-              <button
-                className="btn btn-ghost btn-sm px-1.5 text-base-content/60 hover:text-warning sm:btn-xs"
-                title="清空会话（/clear + 开机指令）"
-                aria-label="清空会话"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClear();
-                }}
-                disabled={busy !== ""}
-              >
-                <BroomIcon />
-              </button>
-            )}
-            {!a.pinnedMaster && (
-              <>
-                <button
-                  className="btn btn-ghost btn-sm px-1.5 text-base-content/60 hover:text-base-content sm:btn-xs"
-                  title="重启"
-                  aria-label="重启"
-                  onClick={(e) => act(e, "restart")}
-                  disabled={busy !== ""}
-                >
-                  {busy === "restart" ? (
-                    <span className="loading loading-spinner loading-xs" />
-                  ) : (
-                    <RestartIcon />
-                  )}
-                </button>
-                {a.status === "active" && (
-                  <button
-                    className="btn btn-ghost btn-sm px-1.5 text-base-content/60 hover:text-error sm:btn-xs"
-                    title="停止"
-                    aria-label="停止"
-                    onClick={(e) => act(e, "kill")}
-                    disabled={busy !== ""}
-                  >
-                    {busy === "kill" ? (
-                      <span className="loading loading-spinner loading-xs" />
-                    ) : (
-                      <PowerIcon />
-                    )}
-                  </button>
-                )}
-              </>
-            )}
-          </span>
-        )}
       </div>
-      {error && (
-        <div className="px-2 pb-1 text-xs text-error break-words">{error}</div>
-      )}
     </li>
   );
 }
@@ -211,7 +80,6 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const agents = useChatStore((s) => s.state.agents);
   const loading = useChatStore((s) => s.state.loadingAgents);
   const active = useChatStore((s) => s.state.activeAgent);
-  const [clearTarget, setClearTarget] = useState<AgentSession | null>(null);
 
   return (
     <aside className="flex w-full shrink-0 flex-col border-r border-base-300 bg-base-200 sm:w-64">
@@ -239,7 +107,6 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
               a={a}
               active={active === a.name}
               onSelect={onSelect}
-              onClear={() => setClearTarget(a)}
             />
           ))}
         </ul>
@@ -252,13 +119,6 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
       >
         Claudestra Web
       </div>
-
-      {clearTarget && (
-        <ClearAgentModal
-          agent={clearTarget}
-          onClose={() => setClearTarget(null)}
-        />
-      )}
     </aside>
   );
 }

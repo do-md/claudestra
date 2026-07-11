@@ -258,7 +258,6 @@ export function MessageList() {
     };
     el.addEventListener("scroll", onScroll);
     const ro = new ResizeObserver(() => {
-      console.log(`[scrollfx] ro follow=${followRef.current} sh=${el.scrollHeight} st=${el.scrollTop}`);
       if (followRef.current) el.scrollTop = el.scrollHeight;
     });
     ro.observe(inner);
