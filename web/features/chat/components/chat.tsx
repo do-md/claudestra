@@ -81,6 +81,11 @@ function ChatInner() {
 
   // 首帧按当前 hash 初始化定位，随后开启过渡
   useLayoutEffect(() => {
+    // 带 #terminal 刷新进入：终端页状态不可恢复（termId 已随连接销毁），
+    // 降级回会话内容页（#chat），避免 hash 悬空
+    if (window.location.hash.split("?")[0] === "#terminal") {
+      window.history.replaceState(null, "", "#chat");
+    }
     setShowContent(isContentHash());
     requestAnimationFrame(() =>
       requestAnimationFrame(() => setDisableTransition(false)),

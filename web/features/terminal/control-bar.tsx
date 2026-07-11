@@ -19,6 +19,9 @@ const KEYS: { label: string; seq: string; title?: string }[] = [
   { label: "→", seq: "\x1b[C" },
   { label: "⏎", seq: "\r", title: "Enter" },
   { label: "^C", seq: "\x03", title: "Ctrl+C（中断）" },
+  // CC TUI 在 alternate screen（无终端滚动缓冲，tmux pane 历史也为空）——
+  // 看更早的转录要用 CC 原生的 Ctrl+O transcript 模式（进入后滚轮/方向键可滚）
+  { label: "^O", seq: "\x0f", title: "Ctrl+O（Claude Code 转录视图，可滚动）" },
 ];
 
 export function ControlBar({

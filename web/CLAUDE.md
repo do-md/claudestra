@@ -39,15 +39,24 @@ app/
                         浏览器断开→上游 abort→Bridge 销毁 PTY+viewer session）
     terminal/input/     POST {id,d:base64}（代理 /api/v1/terminal/:id/input，逐键/微批，Bridge 不限流）
     terminal/resize/    POST {id,cols,rows}（代理 /api/v1/terminal/:id/resize）
-features/terminal/      远程终端（会话详情 🖥️ 按钮 → 模态框实时镜像 tmux + 可输入）
-  terminal-button.tsx   TopBar 入口（active 会话 + master 都有；stopped 隐藏）
-  terminal-modal.tsx    createPortal 全屏模态框（visualViewport 钳高防 iOS 键盘遮挡）
+features/terminal/      远程终端（会话详情 🖥️ 按钮 → 实时镜像 tmux + 可输入）
+  terminal-button.tsx   TopBar 入口（active 会话 + master 都有；stopped 隐藏）。形态分流：
+                        窄屏(<sm) → hash 伪路由 #terminal 全屏页（左滑/返回键退出，同 #chat
+                        导航栈）；宽屏 → 大模态框。⚠ 手机端别用模态框——软键盘 + daisyUI
+                        居中模态是结构性冲突（塌陷/露背/背面可滚，真机两轮实测）
+  terminal-page.tsx     移动端全屏页（createPortal + fixed inset-0 不透明底；软键盘时内容层
+                        钉 visualViewport (top=offsetTop,h=height) + --term-safe-bottom 归零）
+  terminal-modal.tsx    桌面模态框（无键盘逻辑）
   terminal-view.tsx     @xterm/xterm v6 + fit + webgl(尽力)；SSE 下行 base64 帧→term.write，
                         onData 8ms 微批+串行链→input POST（字节序），RO 防抖 150ms→resize POST。
+                        连接延迟 50ms（dev 双 effect 取消传导 race，见 prin-645ac3）。
                         ?noWebgl=1 强制 DOM renderer（后台 tab 自动化验证用，WebGL hidden 不 paint）；
                         window.__claudestraTerm debug 句柄（读 buffer 验数据面）
-  control-bar.tsx       移动端控制键条（Esc/Tab/⇧Tab/方向/⏎/^C + ⌨️ 聚焦唤软键盘；
+  control-bar.tsx       控制键条（Esc/Tab/⇧Tab/方向/⏎/^C/^O + ⌨️ 聚焦唤软键盘；
                         onPointerDown preventDefault 防抢焦点收键盘）
+                        ⚠ 滚动语义：CC TUI 在 alternate screen（无终端滚动缓冲，tmux pane
+                        history 也为空）——看转录历史用 ^O（CC transcript 模式，可滚）；
+                        viewer session 已开 tmux mouse（shell 场景滚轮进 copy-mode 可用）
 features/chat/
   type.ts               ChatMessage / AgentSession / ToolCallView / PendingPermission / PendingAsk
   stream.ts             consumeSSEStream + processStreamEvent + StreamSink（协议 v1，迁移零改动）

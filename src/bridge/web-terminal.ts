@@ -200,6 +200,11 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
     await tmuxRun(["kill-session", "-t", viewerSession]);
     return json(500, { ok: false, error: `tmux select-window failed: ${selected.err}` });
   }
+  // 滚动支持：CC TUI 在 alternate screen（无滚动缓冲），滚轮要靠 tmux 的
+  // copy-mode——viewer session 开 mouse（session 级选项，master/本地 attach
+  // 不受影响），tmux 会向 PTY 请求鼠标上报，xterm.js 自动转发滚轮 → tmux
+  // 进 copy-mode 翻 pane 历史（Esc/q 或滚到底退出，与 iTerm 体验一致）。
+  await tmuxRun(["set-option", "-t", viewerSession, "mouse", "on"]);
 
   const enc = new TextEncoder();
   let ping: ReturnType<typeof setInterval> | null = null;
