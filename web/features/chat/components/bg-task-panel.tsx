@@ -1,4 +1,5 @@
 "use client";
+import { useEffect, useRef } from "react";
 import { useChatStore } from "../chat-store";
 import type { BgTaskView } from "../type";
 
@@ -45,12 +46,37 @@ function BgTaskCard({ t }: { t: BgTaskView }) {
         {t.lines.length === 0 ? (
           <div className="py-1 text-[11px] opacity-40">等待输出…</div>
         ) : (
-          <pre className="max-h-56 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-base-content/60">
-            {t.lines.map(cleanLine).join("\n")}
-          </pre>
+          <BgLines lines={t.lines} />
         )}
       </div>
     </details>
+  );
+}
+
+/**
+ * 进度行视口：固定高度内滚动（不撑开页面），新行吸底跟随（像 tail -f）,
+ * 用户上翻离底 >30px 就不打扰、回底恢复。overscroll-contain 防滚动链
+ * 穿透到消息列表（iOS 嵌套滚动）。
+ */
+function BgLines({ lines }: { lines: string[] }) {
+  const ref = useRef<HTMLPreElement>(null);
+  const followRef = useRef(true);
+  useEffect(() => {
+    const el = ref.current;
+    if (el && followRef.current) el.scrollTop = el.scrollHeight;
+  }, [lines.length]);
+  return (
+    <pre
+      ref={ref}
+      onScroll={(e) => {
+        const el = e.currentTarget;
+        followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+      }}
+      className="max-h-48 touch-pan-y overflow-y-auto overscroll-contain whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-base-content/60"
+      style={{ WebkitOverflowScrolling: "touch" }}
+    >
+      {lines.map(cleanLine).join("\n")}
+    </pre>
   );
 }
 

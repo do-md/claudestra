@@ -5,9 +5,12 @@
  *
  *   xterm.js ⇄ Next.js BFF ⇄ 本文件 3 端点 ⇄ Bun.Terminal(PTY) ⇄ tmux attach ⇄ master:agent-X
  *
- * - 每个 viewer 一条 PTY：`tmux new-session -d -t master -s webterm-<id>`（**grouped
- *   session**——共享 master 的 window 集但 current window 独立，select-window 不会
- *   切走真 session/其他 client 的当前窗口）→ `Bun.Terminal` + `Bun.spawn(tmux attach)`。
+ * - 每个 viewer 一条 PTY：**独立 session + link-window**——`new-session -d -s
+ *   webterm-<id>` 后 `link-window master:<win> → viewer:9`（同一 window 实体，
+ *   内容/输入实时同步）→ `Bun.Terminal` + `Bun.spawn(tmux attach)`。
+ *   ⚠ 不能用 grouped session（new-session -t master）：master 上挂着 iTerm2 的
+ *   tmux -CC control client，它会同步整个 session group 的 current window，把
+ *   viewer 的当前窗口漂到最大索引（「跳到最后一个 tab」bug，2026-07-12 实验钉死）。
  * - 输出：PTY 字节流 → SSE `{"t":"o","d":<base64>}`（连接即发首包 + 5s ping，
  *   Bun.serve idleTimeout≈10s 坑，同 handleEventsRequest 的 [fork] 修复）。
  * - 输入：POST base64 原始字节（xterm onData 的转义序列原样）→ term.write —— tmux
@@ -209,21 +212,32 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
   const termId = randomBytes(12).toString("hex");
   const viewerSession = `${VIEWER_PREFIX}${termId}`;
 
-  // grouped session：共享 master 的 windows，current window 独立
+  // 独立 session + link-window（不是 grouped session！）：
+  // grouped（new-session -t master）共享 master 的 window 集，而 master 上挂着
+  // iTerm2 的 tmux -CC control-mode client——它会主动同步/管理整个 session group
+  // 的 current window，把 viewer 的当前窗口「漂」到窗口列表最大索引（用户点 A 的
+  // 终端,过一会儿跳到最后一个 tab）。受控实验钉死：同一 control client 环境下
+  // grouped 必漂、link-window 零漂（2026-07-12,25 次实测）。
+  // 做法：独立 session（不入 group,control client 摸不到）+ link-window 把目标
+  // 窗口链接进来（同一 window 实体,内容/输入实时同步）+ 干掉默认窗口。
   const created = await tmuxRun([
-    "new-session", "-d", "-t", MASTER_SESSION, "-s", viewerSession,
+    "new-session", "-d", "-s", viewerSession,
     "-x", String(cols), "-y", String(rows),
   ]);
   if (created.code !== 0) {
     release();
     return json(500, { ok: false, error: `tmux new-session failed: ${created.err}` });
   }
-  const selected = await tmuxRun(["select-window", "-t", `${viewerSession}:${windowRef}`]);
-  if (selected.code !== 0) {
+  const linked = await tmuxRun([
+    "link-window", "-s", `${MASTER_SESSION}:${windowRef}`, "-t", `${viewerSession}:9`,
+  ]);
+  if (linked.code !== 0) {
     await tmuxRun(["kill-session", "-t", viewerSession]);
     release();
-    return json(500, { ok: false, error: `tmux select-window failed: ${selected.err}` });
+    return json(500, { ok: false, error: `tmux link-window failed: ${linked.err}` });
   }
+  await tmuxRun(["select-window", "-t", `${viewerSession}:9`]);
+  await tmuxRun(["kill-window", "-t", `${viewerSession}:0`]);
   // 滚动支持：CC TUI 在 alternate screen（无滚动缓冲），滚轮要靠 tmux 的
   // copy-mode——viewer session 开 mouse（session 级选项，master/本地 attach
   // 不受影响），tmux 会向 PTY 请求鼠标上报，xterm.js 自动转发滚轮 → tmux

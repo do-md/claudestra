@@ -213,10 +213,13 @@ function AssistantBody({
   m,
   liveEmpty,
   streamingLast,
+  onToggleTs,
 }: {
   m: ChatMessage;
   liveEmpty: boolean;
   streamingLast: boolean;
+  /** 点击叙述/回复正文 → 切换本条消息的秒级时间显示。 */
+  onToggleTs?: () => void;
 }) {
   const segs = m.segments;
   const hasSegs = !!segs && segs.length > 0;
@@ -228,11 +231,17 @@ function AssistantBody({
 
   const renderText = (text: string, key: number | string) =>
     m.streamed ? (
-      <div key={key} className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]">
+      <div
+        key={key}
+        className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]"
+        onClick={onToggleTs}
+      >
         {text}
       </div>
     ) : (
-      <Domd key={key} initMd={text} bodyClassName="chat-domd" />
+      <div key={key} onClick={onToggleTs}>
+        <Domd initMd={text} bodyClassName="chat-domd" />
+      </div>
     );
 
   const narration = hasSegs ? (
@@ -268,11 +277,16 @@ function AssistantBody({
         <>
           {hasNarration && <ReplyDivider />}
           {m.streamed ? (
-            <div className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]">
+            <div
+              className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]"
+              onClick={onToggleTs}
+            >
               {m.replyText}
             </div>
           ) : (
-            <Domd initMd={m.replyText!} bodyClassName="chat-domd" />
+            <div onClick={onToggleTs}>
+              <Domd initMd={m.replyText!} bodyClassName="chat-domd" />
+            </div>
           )}
         </>
       )}
@@ -335,7 +349,12 @@ function Message({
       {!hasSegs && !!m.toolCalls?.length && (
         <ToolCallsBlock tools={m.toolCalls} streamingLast={streamingLast} />
       )}
-      <AssistantBody m={m} liveEmpty={liveEmpty} streamingLast={streamingLast} />
+      <AssistantBody
+        m={m}
+        liveEmpty={liveEmpty}
+        streamingLast={streamingLast}
+        onToggleTs={() => setShowTs((v) => !v)}
+      />
       {!!m.replyComponents?.length && <ReplyComponents m={m} />}
     </div>
   );
