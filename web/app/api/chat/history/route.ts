@@ -69,9 +69,11 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
     if (m.compactSummary) continue;
 
     if (m.role === "system") {
-      // 目前只有 compact 分隔线 → 一条轻量 assistant 提示（独立气泡，不并组）
+      // system 级事件（compact 边界 / 斜杠命令记录 / 命令输出）→ 居中分隔条，
+      // 渲染交给前端 SystemDivider。剥掉老 bridge 自带的「── ──」装饰（兼容）。
       group = null;
-      out.push({ id: `h${m.seq}`, role: "assistant", content: `── ${m.text || "上下文已压缩"} ──`, ts: m.ts });
+      const text = (m.text || "上下文已压缩").replace(/^[─—\s]+|[─—\s]+$/g, "");
+      out.push({ id: `h${m.seq}`, role: "system", content: text, ts: m.ts });
       continue;
     }
 
@@ -84,14 +86,14 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
       group = null; // 用户消息断开 assistant 分组
       // CC 写入的中断标记不是用户打的字 → 渲染成轻分隔线
       if (/^\[Request interrupted/.test(m.text || "")) {
-        out.push({ id: `h${m.seq}`, role: "assistant", content: "── 已被用户中断 ──", ts: m.ts });
+        out.push({ id: `h${m.seq}`, role: "system", content: "已被用户中断", ts: m.ts });
         continue;
       }
       // TUI 斜杠命令记录（如 clear 后新会话首条 <command-name>/clear</command-name>）
       // 不是用户打的字 → 渲染成轻分隔线
       const cmdMatch = (m.text || "").match(/^<command-name>(\/[\w-]+)<\/command-name>/);
       if (cmdMatch) {
-        out.push({ id: `h${m.seq}`, role: "assistant", content: `── ${cmdMatch[1]} ──`, ts: m.ts });
+        out.push({ id: `h${m.seq}`, role: "system", content: cmdMatch[1], ts: m.ts });
         continue;
       }
       const from = m.from && !SELF_FROM.has(m.from) ? m.from : undefined;

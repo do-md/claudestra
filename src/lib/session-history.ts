@@ -281,7 +281,8 @@ export async function readSessionHistory(
     const ts = typeof rec.timestamp === "string" ? rec.timestamp : null;
 
     if (rec.type === "system" && rec.subtype === "compact_boundary") {
-      all.push({ seq: i, ts, role: "system", text: "── 上下文已压缩（compact）──" });
+      // 纯文本不带装饰——system 条目的分隔线样式由各前端自己渲染
+      all.push({ seq: i, ts, role: "system", text: "上下文已压缩（compact）" });
       continue;
     }
 

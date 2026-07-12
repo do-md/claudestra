@@ -49,8 +49,10 @@ export interface ChatAttachmentView {
 
 export interface ChatMessage {
   id: string;
-  role: "user" | "assistant";
-  /** assistant：过程叙述文本（流式 assistant_text）。user：消息正文。 */
+  /** system = 会话级事件（compact 边界 / 斜杠命令记录 / 中断标记 / 命令输出），
+   *  渲染成居中分隔条（SystemDivider），无头像无气泡。 */
+  role: "user" | "assistant" | "system";
+  /** assistant：过程叙述文本（流式 assistant_text）。user：消息正文。system：事件文本。 */
   content: string;
   /** assistant 的交错段序列（叙述/工具按时间序）。存在时渲染层优先用它；
    *  content/toolCalls 仍聚合维护（判空、数量统计、旧快照兼容）。 */

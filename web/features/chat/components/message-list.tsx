@@ -192,6 +192,27 @@ function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
   );
 }
 
+/** system 级事件（compact / 斜杠命令 / 中断 / 命令输出）的通用居中分隔条。
+ *  与消息气泡视觉解耦：无头像无名字，两侧细线 + 小灰字；点击附带秒级时间。 */
+function SystemDivider({ m }: { m: ChatMessage }) {
+  const [showTs, setShowTs] = useState(false);
+  return (
+    <div
+      className="chat-msg-in mb-[22px] flex cursor-pointer select-none items-center gap-3"
+      onClick={() => setShowTs((v) => !v)}
+    >
+      <span className="h-px flex-1 bg-base-content/10" />
+      <span className="max-w-[70%] shrink-0 truncate text-[11px] font-medium tracking-wide text-base-content/35">
+        {m.content}
+        {showTs && m.ts && (
+          <span className="ml-1.5 font-mono text-[10px] tabular-nums opacity-70">{fmtTs(m.ts)}</span>
+        )}
+      </span>
+      <span className="h-px flex-1 bg-base-content/10" />
+    </div>
+  );
+}
+
 /** [fork] 过程叙述 ↔ 最终回复 之间的淡分隔线（仅两者都在时出现）。 */
 function ReplyDivider() {
   return (
@@ -307,6 +328,7 @@ function Message({
 }) {
   // 点击消息（user 气泡 / ✦ 头）切换秒级时间显示
   const [showTs, setShowTs] = useState(false);
+  if (m.role === "system") return <SystemDivider m={m} />;
   if (m.role === "user") {
     const atts = m.attachments ?? [];
     return (
