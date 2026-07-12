@@ -20,6 +20,8 @@ export interface AgentSession {
   pinnedMaster?: boolean;
   /** 遗留字段（mock 模式已随 /api/v1 迁移移除，恒为 undefined）。 */
   mock?: boolean;
+  /** 最近活动时间（session jsonl mtime，ms epoch）；列表按它降序。 */
+  lastActivityTs?: number | null;
 }
 
 interface ApiAgent {
@@ -27,6 +29,8 @@ interface ApiAgent {
   status?: string;
   idle?: boolean;
   purpose?: string;
+  /** agent 当前 session jsonl 的 mtime（ms epoch），Bridge fork 字段；无 session 为 null */
+  lastActivityTs?: number | null;
 }
 
 /**
@@ -49,6 +53,7 @@ export async function loadAgents(): Promise<AgentSession[]> {
         cwd: "",
         status: a.status === "stopped" ? "stopped" : "active",
         pinnedMaster: true,
+        lastActivityTs: a.lastActivityTs ?? null,
       };
     }
     const bare = a.name.replace(/^agent-/, "");
@@ -58,8 +63,13 @@ export async function loadAgents(): Promise<AgentSession[]> {
       purpose: a.purpose || "",
       cwd: "",
       status: a.status === "stopped" ? "stopped" : "active",
+      lastActivityTs: a.lastActivityTs ?? null,
     };
   });
-  // master 置顶（Bridge 已 unshift，这里兜底排序）
-  return list.sort((a, b) => Number(!!b.pinnedMaster) - Number(!!a.pinnedMaster));
+  // 排序：master 置顶 → 其余按最近活动降序（无时间戳的沉底，registry 序兜底稳定）
+  return list.sort((a, b) => {
+    const pin = Number(!!b.pinnedMaster) - Number(!!a.pinnedMaster);
+    if (pin) return pin;
+    return (b.lastActivityTs ?? 0) - (a.lastActivityTs ?? 0);
+  });
 }

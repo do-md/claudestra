@@ -247,14 +247,35 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
       const agents = ((listResult.agents || []) as any[])
         .filter((a) => agentInScope(principal, a.name))
         .map((a) => ({ name: a.name, status: a.status, idle: a.idle, purpose: a.purpose }));
+      // [fork] lastActivityTs：agent 当前 session jsonl 的 mtime（ms epoch）——
+      // 前端「按最近活跃排序」的数据源。registry 读 cwd/sessionId，stat 失败给 null。
+      {
+        const { readRegistryAgents } = await import("../lib/registry.js");
+        const { projectJsonlPath } = await import("../lib/jsonl-cost.js");
+        const { statSync } = await import("fs");
+        const bySessions = new Map<string, number>();
+        for (const r of await readRegistryAgents()) {
+          if (!r.cwd || !r.sessionId) continue;
+          try {
+            bySessions.set(r.name, statSync(projectJsonlPath(r.cwd, r.sessionId)).mtimeMs);
+          } catch { /* session 文件不在（已清理/未落盘）→ 无时间戳 */ }
+        }
+        for (const a of agents) (a as any).lastActivityTs = bySessions.get(a.name) ?? null;
+      }
       // [fork] ?include=stopped：registry 里已停止的 agent 也入列（additive；
       // web 侧栏保留 stopped 会话入口，其历史经归档仍可读——正是归档的意义）。
       if (url.searchParams.get("include") === "stopped") {
         const { readRegistryAgents } = await import("../lib/registry.js");
+        const { projectJsonlPath } = await import("../lib/jsonl-cost.js");
+        const { statSync } = await import("fs");
         const listed = new Set(agents.map((a) => a.name));
         for (const r of await readRegistryAgents()) {
           if (listed.has(r.name) || !agentInScope(principal, r.name)) continue;
-          agents.push({ name: r.name, status: "stopped", idle: undefined, purpose: r.purpose });
+          let ts: number | null = null;
+          if (r.cwd && r.sessionId) {
+            try { ts = statSync(projectJsonlPath(r.cwd, r.sessionId)).mtimeMs; } catch { /* 同上 */ }
+          }
+          agents.push({ name: r.name, status: "stopped", idle: undefined, purpose: r.purpose, lastActivityTs: ts } as any);
         }
       }
       // [fork] master 入列（token scope 显式含 "master" 才可见，"*" 不含）。

@@ -209,6 +209,9 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
 
   public async openAgent(name: string) {
     if (name === this.state.activeAgent) return;
+    // 记住最后打开的会话——iOS 把后台页整个回收重载后（store 全新、hash 还在
+    // #chat），据此自动恢复，不让用户卡在空内容页手动重选（2026-07-12 真机）。
+    try { localStorage.setItem("cstra_last_agent", name); } catch { /* 隐私模式等 */ }
     // 切走前把当前会话快照进缓存，回来时原样恢复（见 messageCache 注释）
     const prev = this.state.activeAgent;
     if (prev) this.messageCache.set(prev, this.state.messages);

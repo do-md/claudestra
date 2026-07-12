@@ -69,6 +69,8 @@ function TopBar() {
 
 function ChatInner() {
   const store = useChatStoreApi();
+  const agents = useChatStore((s) => s.state.agents);
+  const activeAgent = useChatStore((s) => s.state.activeAgent);
 
   // ── 移动端 hash 横滑：会话列表(基础页) ↔ 会话内容(#chat 压栈页) ──
   const [showContent, setShowContent] = useState(false);
@@ -134,6 +136,23 @@ function ChatInner() {
     el.classList.toggle("canvas-list", !showContent);
     return () => el.classList.remove("canvas-list");
   }, [showContent]);
+
+  // 会话恢复：iOS 把后台页整个回收重载后，URL 还带 #chat 但 store 是全新的
+  // （activeAgent=""）——之前就卡在空内容页要手动返回重选（2026-07-12 真机）。
+  // agents 列表首次到位后：上次会话还在 → 自动重开；不在 → 退回列表页。
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current || activeAgent || agents.length === 0) return;
+    restoredRef.current = true;
+    let saved = "";
+    try { saved = localStorage.getItem("cstra_last_agent") || ""; } catch { /* 隐私模式 */ }
+    if (saved && agents.some((a) => a.name === saved)) {
+      void store.openAgent(saved);
+    } else if (isContentHash()) {
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      setShowContent(false);
+    }
+  }, [agents, activeAgent, store]);
 
   useEffect(() => {
     store.loadAgents();
