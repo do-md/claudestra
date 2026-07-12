@@ -133,6 +133,29 @@ describe("readSessionHistory", () => {
     expect(asst.tools?.map((t) => t.name)).toEqual(["Read"]); // reply 不再混进工具卡
   });
 
+  test("[fork] TUI 斜杠命令记录 → system 轻条目，stdout 去 ANSI，空输出过滤", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hist-"));
+    const p = writeJsonl(dir, `${SID}.jsonl`, [
+      // command-name 开头
+      { type: "user", timestamp: "2026-07-01T00:00:00Z", message: { content: "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>claude-fable-5</command-args>" } },
+      // stdout 带 ANSI
+      { type: "user", timestamp: "2026-07-01T00:00:01Z", message: { content: "<local-command-stdout>Set model to \x1b[1mFable 5\x1b[22m and saved</local-command-stdout>" } },
+      // command-message 开头（顺序颠倒的变体，之前漏网裸渲染）
+      { type: "user", timestamp: "2026-07-01T00:00:02Z", message: { content: "<command-message>save-compact</command-message>\n<command-name>/save-compact</command-name>" } },
+      // 空 stdout → 整条过滤
+      { type: "user", timestamp: "2026-07-01T00:00:03Z", message: { content: "<local-command-stdout>(no content)</local-command-stdout>" } },
+      // 真实用户输入不受影响
+      { type: "user", timestamp: "2026-07-01T00:00:04Z", message: { content: "正常消息" } },
+    ]);
+    const page = await readSessionHistory(p);
+    expect(page.messages.map((m) => [m.role, m.text])).toEqual([
+      ["system", "/model"],
+      ["system", "Set model to Fable 5 and saved"],
+      ["system", "/save-compact"],
+      ["user", "正常消息"],
+    ]);
+  });
+
   test("[fork] reply 附带 components 提取进 replyComponents（历史也渲染按钮）", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hist-"));
     const p = writeJsonl(dir, `${SID}.jsonl`, [

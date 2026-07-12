@@ -76,7 +76,11 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
         continue;
       }
       const from = m.from && !SELF_FROM.has(m.from) ? m.from : undefined;
-      out.push({ id: `h${m.seq}`, role: "user", content: m.text || "", ts: m.ts, from });
+      // 按钮/选单点击的机器 payload → 友好化（live 时显示的是 label，历史里只有 id）
+      const btnMatch = (m.text || "").match(/^\[button:([\w-]+)\]$/);
+      const selMatch = (m.text || "").match(/^\[select:([\w-]+):(.+)\]$/);
+      const content = btnMatch ? `🔘 ${btnMatch[1]}` : selMatch ? `🔘 ${selMatch[2]}` : m.text || "";
+      out.push({ id: `h${m.seq}`, role: "user", content, ts: m.ts, from });
       continue;
     }
 

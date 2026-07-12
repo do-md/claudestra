@@ -51,6 +51,12 @@ function isReplyTool(name: string): boolean {
   return name.startsWith("mcp__") && name.endsWith("__reply");
 }
 
+/** 去掉 ANSI 转义序列（local-command-stdout 里的 \x1b[1m 等，裸渲染是豆腐块）。 */
+function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+}
+
 /** jsonl 里的 components 不可信——只放行结构完整的按钮行/选单行，其余丢弃。 */
 function sanitizeComponents(raw: unknown): ReplyComponentRow[] {
   if (!Array.isArray(raw)) return [];
@@ -298,6 +304,23 @@ export async function readSessionHistory(
         continue;
       }
       if (!text.trim()) continue; // 纯 tool_result 载荷
+      // [fork] TUI 斜杠命令记录（不带 isMeta 的裸 user 条目）不是用户打的字：
+      //   <command-name>/x</command-name> ± <command-message>…（顺序不定）→ system 轻条目「/x」
+      //   <local-command-stdout>输出</local-command-stdout> → system 轻条目（去 ANSI、截断）
+      // 不处理会把原始标签 + ANSI 转义裸渲染成用户气泡（2026-07-12 真机截图）。
+      const trimmed = text.trim();
+      if (/^<command-(name|message)>/.test(trimmed)) {
+        const cmd = /<command-name>(\/[\w:-]+)<\/command-name>/.exec(trimmed);
+        if (cmd) all.push({ seq: i, ts, role: "system", text: cmd[1] });
+        continue; // 无 command-name 的畸形命令记录直接丢
+      }
+      const stdout = /^<local-command-stdout>([\s\S]*)<\/local-command-stdout>$/.exec(trimmed);
+      if (stdout) {
+        const body = stripAnsi(stdout[1]).trim();
+        if (!body || body === "(no content)") continue;
+        all.push({ seq: i, ts, role: "system", text: body.length > 200 ? body.slice(0, 200) + "…" : body });
+        continue;
+      }
       const msg: HistoryMessage = { seq: i, ts, role: "user", text };
       if (rec.isCompactSummary === true) msg.compactSummary = true;
       all.push(msg);
