@@ -4,3 +4,4 @@ node_modules/
 .idea/
 master/CLAUDE.md
 master/.claude/
+.playwright-mcp/
