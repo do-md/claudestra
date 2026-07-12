@@ -84,7 +84,8 @@ proxy.ts                Next16 proxy：只拦页面 cookie；API 由 handler 自
 - **分层**：`proxy.ts` 只拦「页面」（无 cookie → /login）；API 路由各自在 handler 调 `isAuthed()`（遵 prin-475132；且 proxy 跑 edge 运行时读不到 `.env.local`）。
 - cookie 名用 `cstra_session`（不是 claude-os 的 `cos_session`）——localhost 下 cookie 按 host 不按端口隔离，必须避名。
 - **BFF → Bridge 的鉴权**：`CLAUDESTRA_API_TOKEN`（`.env.local`）。签发：
-  `bun src/manager.ts token-add web-ui --agents '*,master' --force`（master 必须显式列，`"*"` 不含）。
+  `bun src/manager.ts token-add web-ui --agents '*,master' --force --terminal`（master 必须显式列，`"*"` 不含；
+  `--terminal` 显式授予远程终端 = 宿主 shell 级访问，独立于 messaging scope，不加则 🖥️ 终端 403，chat/历史/中断照常）。
   BFF 在 server 端带 `Authorization: Bearer`，浏览器永不直连 3847，也天然绕开
   EventSource 不能带 header 的坑（guide §4.3）。
 

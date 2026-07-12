@@ -54,8 +54,11 @@
   `/api/v1/` 分发前拦截 / 启动 sweep）：`GET /api/v1/agents/:name/terminal?cols=&rows=`
   （SSE：PTY 输出 base64 帧；连接即建 `Bun.Terminal` + `tmux attach` 到 grouped
   viewer session `webterm-<id>`，断开即销毁）+ `POST /api/v1/terminal/:id/{input,resize}`。
-  三端点**不走 SlidingWindowLimiter**（逐键输入秒超 30/min；Bearer + agentInScope +
-  termId 属主校验不变）。⚠ 两个不变式：resize 后必须手动 `proc.kill("SIGWINCH")`
+  三端点**不走 SlidingWindowLimiter**（逐键输入秒超 30/min；Bearer + termId 属主校验不变）。
+  🔒 鉴权（合并后 code review B2 收敛）：终端 = **宿主 shell 级访问**（可 Ctrl-C 逃出 CC
+  落到裸 shell、绕过 `--disallowedTools`），故要求 `terminalAllowed`（token 需 `token-add
+  --terminal` 显式授予 terminal scope，不复用裸 messaging scope）；并发有 MAX_TERM_SESSIONS
+  上限（含在途占坑，防并发绕过）。⚠ 两个不变式：resize 后必须手动 `proc.kill("SIGWINCH")`
   （Bun.Terminal 子进程无 controlling tty，TIOCSWINSZ 生效但内核不发信号，PoC 实证）；
   SSE 连接即发首包 + 5s ping（Bun idleTimeout 坑，同 handleEventsRequest 修复）。
   需 Bun ≥1.3.5（Bun.Terminal）+ tmux ≥3.2（grouped session 窗口索引与 master 一致，实测）。

@@ -182,7 +182,7 @@ bun src/manager.ts auto-update claudestra on|off   # Claudestra self-update (30 
 bun src/manager.ts auto-update claude on|off       # Claude Code CLI (weekly poll)
 
 # Multi-frontend API tokens (v2.6.0+; scope = per-agent whitelist, "*" = all non-master)
-bun src/manager.ts token-add <name> --agents <a,b|*> [--force] [--no-mirror]
+bun src/manager.ts token-add <name> --agents <a,b|*> [--force] [--no-mirror] [--terminal]  # --terminal = 远程终端(宿主 shell 级)独立授予
 bun src/manager.ts token-list
 bun src/manager.ts token-revoke <tokenId|name>
 bun src/manager.ts create <name> <dir> --external   # mark agent as safe-to-expose (R1 guard)

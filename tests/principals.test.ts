@@ -11,9 +11,11 @@ import {
   findByBearer,
   findToken,
   agentInScope,
+  terminalAllowed,
   SlidingWindowLimiter,
   readPrincipals,
   writePrincipals,
+  type Principal,
   type PrincipalsFile,
 } from "../src/lib/principals.ts";
 
@@ -116,6 +118,46 @@ describe("SlidingWindowLimiter", () => {
     expect(l.tryAcquire(t0 + 20)).toBe(false);
     // t0 的那次滑出窗口
     expect(l.tryAcquire(t0 + 1001)).toBe(true);
+  });
+});
+
+describe("terminalAllowed（B2 远程终端能力位）", () => {
+  const mk = (over: Partial<Principal>): Principal => ({
+    id: "token:tok_x",
+    role: "external",
+    agents: ["worker"],
+    createdAt: "2026-01-01T00:00:00Z",
+    ...over,
+  });
+
+  test("external token 默认无终端权限（即便 agent 在 scope 内）", () => {
+    expect(terminalAllowed(mk({ agents: ["worker"] }), "worker")).toBe(false);
+  });
+
+  test("external token + terminal:true 且 agent 在 scope → 允许", () => {
+    expect(terminalAllowed(mk({ agents: ["worker"], terminal: true }), "worker")).toBe(true);
+  });
+
+  test("terminal:true 但 agent 不在 scope → 拒绝（scope 仍是前置条件）", () => {
+    expect(terminalAllowed(mk({ agents: ["worker"], terminal: true }), "other")).toBe(false);
+  });
+
+  test("owner 默认允许（无需 terminal 字段）", () => {
+    expect(terminalAllowed(mk({ role: "owner", agents: ["*", "master"] }), "worker")).toBe(true);
+  });
+
+  test('"*" scope + terminal 不覆盖 master（master 仍需显式 scope）', () => {
+    expect(terminalAllowed(mk({ agents: ["*"], terminal: true }), "master")).toBe(false);
+    expect(terminalAllowed(mk({ agents: ["*", "master"], terminal: true }), "master")).toBe(true);
+  });
+
+  test("disabled token → 拒绝", () => {
+    expect(terminalAllowed(mk({ agents: ["worker"], terminal: true, disabled: true }), "worker")).toBe(false);
+  });
+
+  test("newTokenPrincipal opts.terminal 透传", () => {
+    expect(newTokenPrincipal("t", ["a"]).terminal).toBeUndefined();
+    expect(newTokenPrincipal("t", ["a"], { terminal: true }).terminal).toBe(true);
   });
 });
 

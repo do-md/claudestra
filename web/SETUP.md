@@ -62,12 +62,17 @@ Fill `.env.local`:
 **Issue the API token** (from the repo root, replace `bun` path as needed):
 
 ```bash
-bun src/manager.ts token-add web-ui --agents '*,master' --force
+bun src/manager.ts token-add web-ui --agents '*,master' --force --terminal
 ```
 
 - `--agents '*,master'` — `*` covers all non-master agents; **`master` must be
   listed explicitly** (the wildcard excludes it).
 - `--force` — acknowledges the shared-context guard for non-`--external` agents.
+- `--terminal` — grants the **remote terminal** (the 🖥️ live-tmux feature). This is
+  **host-shell-level access**: a terminal can Ctrl-C out of Claude Code into a raw
+  shell, bypassing `--disallowedTools`. It is a separate capability from messaging,
+  so it must be granted explicitly. Drop `--terminal` if you don't want the web
+  terminal — chat/history/interrupt all work without it.
 
 Copy the printed token into `CLAUDESTRA_API_TOKEN`.
 
