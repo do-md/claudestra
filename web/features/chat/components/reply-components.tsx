@@ -18,15 +18,24 @@ const BTN_STYLE: Record<string, string> = {
 };
 const btnClass = (style?: string) => BTN_STYLE[style ?? "secondary"] ?? BTN_STYLE.secondary;
 
-export function ReplyComponents({ m }: { m: ChatMessage }) {
+export function ReplyComponents({
+  m,
+  interactive = true,
+}: {
+  m: ChatMessage;
+  /** false = 历史里已翻篇的旧按钮：显示但禁用，防误点（如过去的 Push/Release 确认）。 */
+  interactive?: boolean;
+}) {
   const store = useChatStoreApi();
   const rows = m.replyComponents;
   const [busy, setBusy] = useState("");
   if (!rows || rows.length === 0) return null;
+  // 已点过、或本条已翻篇（用户在其后发过消息）→ 整组禁用
   const answered = !!m.replyClickedId;
+  const disabled = answered || !interactive;
 
   const choose = async (choiceId: string, label: string, wire: string) => {
-    if (answered || busy) return;
+    if (disabled || busy) return;
     setBusy(choiceId);
     await store.clickReplyComponent(m.id, choiceId, label, wire);
     setBusy("");
@@ -45,10 +54,10 @@ export function ReplyComponents({ m }: { m: ChatMessage }) {
                   <button
                     key={b.id}
                     type="button"
-                    disabled={answered || busy !== ""}
+                    disabled={disabled || busy !== ""}
                     onClick={() => choose(b.id, label, `[button:${b.id}]`)}
                     className={`btn btn-sm ${btnClass(b.style)} ${
-                      answered && !chosen ? "opacity-40" : ""
+                      disabled && !chosen ? "opacity-40" : ""
                     } ${chosen ? "ring-2 ring-offset-1 ring-base-content/30" : ""}`}
                   >
                     {busy === b.id ? (
@@ -76,13 +85,13 @@ export function ReplyComponents({ m }: { m: ChatMessage }) {
                 <button
                   key={o.value}
                   type="button"
-                  disabled={answered || busy !== ""}
+                  disabled={disabled || busy !== ""}
                   onClick={() => choose(choiceId, o.label, `[select:${row.id}:${o.value}]`)}
                   className={`flex items-start gap-2 rounded-lg border px-2.5 py-1.5 text-left text-[13px] transition-colors ${
                     chosen
                       ? "border-primary bg-primary/15"
                       : "border-base-content/10 bg-base-100/40 hover:bg-base-content/[0.04]"
-                  } ${answered && !chosen ? "opacity-40" : ""}`}
+                  } ${disabled && !chosen ? "opacity-40" : ""}`}
                 >
                   <span className="min-w-0">
                     <span className="font-medium opacity-90">{o.label}</span>
