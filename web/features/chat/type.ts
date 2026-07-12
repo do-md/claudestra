@@ -4,7 +4,14 @@ export interface ToolCallView {
   name: string;
   summary: string;
   state: "running" | "done" | "error";
+  /** 调用时间（ISO）：历史来自 jsonl 条目 ts，直播由前端 stamp。点击工具卡显示。 */
+  ts?: string;
 }
+
+/** assistant 气泡内的交错段——叙述与工具按真实时间顺序排列（修「工具全堆气泡顶部」）。 */
+export type AssistantSegment =
+  | { kind: "text"; text: string }
+  | { kind: "tools"; tools: ToolCallView[] };
 
 /** 待处理的权限 / session-idle 卡（一个会话同时最多一张）。 */
 export interface PendingPermission {
@@ -45,6 +52,9 @@ export interface ChatMessage {
   role: "user" | "assistant";
   /** assistant：过程叙述文本（流式 assistant_text）。user：消息正文。 */
   content: string;
+  /** assistant 的交错段序列（叙述/工具按时间序）。存在时渲染层优先用它；
+   *  content/toolCalls 仍聚合维护（判空、数量统计、旧快照兼容）。 */
+  segments?: AssistantSegment[];
   /** [fork] assistant 的「最终回复」（reply() 正文）——与过程叙述 content 分区渲染，
    *  中间用淡分隔线隔开。历史来自 jsonl 的 reply tool_use，直播来自 chat_message(out)。 */
   replyText?: string;

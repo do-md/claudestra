@@ -1,7 +1,7 @@
 "use client";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useChatStore } from "../chat-store";
-import type { ChatMessage, ChatAttachmentView, ToolCallView } from "../type";
+import type { ChatMessage, ChatAttachmentView, ToolCallView, AssistantSegment } from "../type";
 import { Domd } from "@/components/domd";
 import { PermissionCard } from "./permission-card";
 import { AskQuestionCard } from "./ask-question-card";
@@ -33,11 +33,40 @@ function cleanSummary(s: string): string {
   return s.replace(/\|\|/g, " ").replace(/\s+/g, " ").trim();
 }
 
-/** 流式期间的工具行：紧凑单行，最后一个转圈。 */
+/** 秒级时间戳展示（点击消息/工具卡时冒出）。跨天带日期，当天只时分秒。 */
+function fmtTs(iso?: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const hms = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  return sameDay ? hms : `${d.getMonth() + 1}-${pad(d.getDate())} ${hms}`;
+}
+
+/** 点击切换的时间小签（消息气泡 / 工具行共用）。 */
+function TsBadge({ ts, shown }: { ts?: string; shown: boolean }) {
+  if (!shown || !ts) return null;
+  return (
+    <span className="ml-1.5 shrink-0 font-mono text-[10px] tabular-nums opacity-40">
+      {fmtTs(ts)}
+    </span>
+  );
+}
+
+/** 流式期间的工具行：紧凑单行，最后一个转圈。点击显示秒级时间。 */
 function ActiveToolRow({ tool, active }: { tool: ToolCallView; active: boolean }) {
   const summary = cleanSummary(tool.summary);
+  const [showTs, setShowTs] = useState(false);
   return (
-    <div className="flex items-center gap-1.5 py-0.5 font-mono text-xs">
+    <div
+      className="flex cursor-pointer items-center gap-1.5 py-0.5 font-mono text-xs"
+      onClick={() => setShowTs((v) => !v)}
+    >
       {active && tool.state === "running" ? (
         <span className="loading loading-spinner loading-xs text-info" />
       ) : tool.state === "error" ? (
@@ -51,6 +80,7 @@ function ActiveToolRow({ tool, active }: { tool: ToolCallView; active: boolean }
           {summary}
         </span>
       )}
+      <TsBadge ts={tool.ts} shown={showTs} />
     </div>
   );
 }
@@ -75,6 +105,11 @@ function HistoryToolRow({ tool }: { tool: ToolCallView }) {
         </span>
       </summary>
       <div className="px-2.5 pb-2 pt-0.5">
+        {tool.ts && (
+          <div className="pb-1 font-mono text-[10px] tabular-nums opacity-40">
+            🕐 {fmtTs(tool.ts)}
+          </div>
+        )}
         <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-base-content/50">
           {summary || tool.name}
         </pre>
@@ -169,44 +204,76 @@ function ReplyDivider() {
 }
 
 /**
- * 助手正文：过程叙述（content）+ 最终回复（replyText）两段，中间淡分隔线。
- * 流式进行中用纯文本（DOMD 只读一次不适合增量喂字），定稿/历史走 DOMD 富文本。
- * reply 在回合 done 之后到达时气泡已定稿 → 直接走 Domd（不再停在纯文本）。
+ * 助手正文：过程叙述 + 最终回复（replyText）分区渲染，中间淡分隔线。
+ * 有 segments（叙述/工具的真实交错序）时按段渲染——修「工具全堆气泡顶部、
+ * 文本全挤底部」的时间线错乱；无 segments（旧缓存快照）回退 content+toolCalls。
+ * 流式进行中文本段用纯文本（DOMD 只读一次不适合增量喂字），定稿/历史走 DOMD。
  */
 function AssistantBody({
   m,
   liveEmpty,
+  streamingLast,
 }: {
   m: ChatMessage;
   liveEmpty: boolean;
+  streamingLast: boolean;
 }) {
-  const hasNarration = !!m.content;
+  const segs = m.segments;
+  const hasSegs = !!segs && segs.length > 0;
+  const hasNarration = hasSegs || !!m.content;
   const hasReply = !!m.replyText;
-  if (m.streamed) {
-    if (liveEmpty && !hasReply) return <ThinkingDots />;
-    return (
-      <div className="text-[14.5px] leading-[1.7]">
-        {hasNarration && (
-          <div className="whitespace-pre-wrap break-words">{m.content}</div>
-        )}
-        {hasReply && (
-          <>
-            {hasNarration && <ReplyDivider />}
-            <div className="whitespace-pre-wrap break-words">{m.replyText}</div>
-          </>
-        )}
-        {!hasNarration && !hasReply && <span className="opacity-40">…</span>}
-      </div>
-    );
-  }
+
+  if (m.streamed && liveEmpty && !hasReply && !hasSegs) return <ThinkingDots />;
   if (!hasNarration && !hasReply) return null;
+
+  const renderText = (text: string, key: number | string) =>
+    m.streamed ? (
+      <div key={key} className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]">
+        {text}
+      </div>
+    ) : (
+      <Domd key={key} initMd={text} bodyClassName="chat-domd" />
+    );
+
+  const narration = hasSegs ? (
+    <>
+      {segs!.map((seg: AssistantSegment, i) =>
+        seg.kind === "text" ? (
+          renderText(seg.text, i)
+        ) : (
+          <div key={i} className="my-2 space-y-1">
+            {seg.tools.map((t, j) =>
+              streamingLast ? (
+                <ActiveToolRow
+                  key={j}
+                  tool={t}
+                  active={i === segs!.length - 1 && j === seg.tools.length - 1}
+                />
+              ) : (
+                <HistoryToolRow key={j} tool={t} />
+              )
+            )}
+          </div>
+        )
+      )}
+    </>
+  ) : hasNarration ? (
+    renderText(m.content, "legacy")
+  ) : null;
+
   return (
     <>
-      {hasNarration && <Domd initMd={m.content} bodyClassName="chat-domd" />}
+      {narration}
       {hasReply && (
         <>
           {hasNarration && <ReplyDivider />}
-          <Domd initMd={m.replyText!} bodyClassName="chat-domd" />
+          {m.streamed ? (
+            <div className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]">
+              {m.replyText}
+            </div>
+          ) : (
+            <Domd initMd={m.replyText!} bodyClassName="chat-domd" />
+          )}
         </>
       )}
     </>
@@ -224,6 +291,8 @@ function Message({
   isLast: boolean;
   awaiting: boolean;
 }) {
+  // 点击消息（user 气泡 / ✦ 头）切换秒级时间显示
+  const [showTs, setShowTs] = useState(false);
   if (m.role === "user") {
     const atts = m.attachments ?? [];
     return (
@@ -233,9 +302,15 @@ function Message({
         )}
         {atts.length > 0 && <AttachmentStrip items={atts} />}
         {m.content && (
-          <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90">
+          <div
+            className="max-w-[85%] cursor-pointer whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90"
+            onClick={() => setShowTs((v) => !v)}
+          >
             {m.content}
           </div>
+        )}
+        {showTs && m.ts && (
+          <div className="pr-1 font-mono text-[10px] tabular-nums opacity-40">{fmtTs(m.ts)}</div>
         )}
       </div>
     );
@@ -243,14 +318,24 @@ function Message({
 
   // assistant
   const streamingLast = streaming && isLast;
-  const liveEmpty = streamingLast && awaiting && !m.content;
+  const liveEmpty = streamingLast && awaiting && !m.content && !m.segments?.length;
+  const hasSegs = !!m.segments?.length;
   return (
     <div className="chat-msg-in mb-[22px] w-full">
-      <ClaudeHeader />
-      {!!m.toolCalls?.length && (
+      {/* 点 ✦ Claude 头显示/隐藏本条消息时间（秒级） */}
+      <div className="cursor-pointer" onClick={() => setShowTs((v) => !v)}>
+        <ClaudeHeader />
+      </div>
+      {showTs && m.ts && (
+        <div className="-mt-1.5 mb-1.5 font-mono text-[10px] tabular-nums opacity-40">
+          {fmtTs(m.ts)}
+        </div>
+      )}
+      {/* 有 segments（交错序）时工具在段内渲染；旧快照回退整块工具卡 */}
+      {!hasSegs && !!m.toolCalls?.length && (
         <ToolCallsBlock tools={m.toolCalls} streamingLast={streamingLast} />
       )}
-      <AssistantBody m={m} liveEmpty={liveEmpty} />
+      <AssistantBody m={m} liveEmpty={liveEmpty} streamingLast={streamingLast} />
       {!!m.replyComponents?.length && <ReplyComponents m={m} />}
     </div>
   );

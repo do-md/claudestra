@@ -3,7 +3,7 @@ export const runtime = "nodejs";
 import { NextResponse } from "next/server";
 import { apiAgentName, bridgeGet } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
-import type { ChatMessage, ToolCallView } from "@/features/chat/type";
+import type { ChatMessage, ToolCallView, AssistantSegment } from "@/features/chat/type";
 import type { WebComponentRow } from "@/lib/chat/events";
 
 /**
@@ -76,7 +76,7 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
     }
 
     const toolCalls: ToolCallView[] | undefined = m.tools?.length
-      ? m.tools.map((t) => ({ name: t.name, summary: t.summary, state: "done" as const }))
+      ? m.tools.map((t) => ({ name: t.name, summary: t.summary, state: "done" as const, ts: m.ts }))
       : undefined;
     if (!m.text && !toolCalls && !m.replyText) continue;
 
@@ -113,9 +113,11 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
       continue;
     }
 
-    // assistant：累积进当前回合气泡（首条建组并入 out，后续 mutate 同一引用）
+    // assistant：累积进当前回合气泡（首条建组并入 out，后续 mutate 同一引用）。
+    // segments 保留叙述/工具的真实交错序——不然长回合渲染成「一坨工具卡在顶 +
+    // 一坨文本在底」，时间线全乱（2026-07-12 真机反馈）。
     if (!group) {
-      group = { id: `h${m.seq}`, role: "assistant", content: m.text || "", toolCalls, ts: m.ts };
+      group = { id: `h${m.seq}`, role: "assistant", content: m.text || "", toolCalls, ts: m.ts, segments: [] };
       if (m.replyText) group.replyText = m.replyText;
       if (m.replyComponents?.length) group.replyComponents = m.replyComponents;
       out.push(group);
@@ -125,6 +127,17 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
       if (m.replyText) group.replyText = group.replyText ? `${group.replyText}\n${m.replyText}` : m.replyText;
       // 同一回合多条 reply 的组件累积（通常只一组）
       if (m.replyComponents?.length) group.replyComponents = [...(group.replyComponents ?? []), ...m.replyComponents];
+    }
+    const segs = group.segments as AssistantSegment[];
+    if (m.text) {
+      const tail = segs[segs.length - 1];
+      if (tail?.kind === "text") tail.text += `\n\n${m.text}`;
+      else segs.push({ kind: "text", text: m.text });
+    }
+    if (toolCalls) {
+      const tail = segs[segs.length - 1];
+      if (tail?.kind === "tools") tail.tools.push(...toolCalls);
+      else segs.push({ kind: "tools", tools: toolCalls });
     }
     if (group.replyComponents?.length) lastWithComponents = group;
   }

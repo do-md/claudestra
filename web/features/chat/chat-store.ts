@@ -464,6 +464,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         id: this.nextId(),
         role: "assistant",
         content: "",
+        segments: [],
         streamed: true,
         toolCalls: [],
         ts: new Date().toISOString(),
@@ -481,8 +482,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     this.produce((s) => {
       const last = s.messages[s.messages.length - 1];
       if (last?.role === "assistant") {
+        const tc = { name, summary, state, ts: new Date().toISOString() };
         last.toolCalls = last.toolCalls ?? [];
-        last.toolCalls.push({ name, summary, state });
+        last.toolCalls.push(tc);
+        // segments 保持叙述/工具的真实交错序（渲染层优先用它）
+        last.segments = last.segments ?? [];
+        const tail = last.segments[last.segments.length - 1];
+        if (tail?.kind === "tools") tail.tools.push(tc);
+        else last.segments.push({ kind: "tools", tools: [tc] });
       }
       s.awaitingChunk = false;
     });
@@ -492,7 +499,13 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     this.ensureLiveAssistant();
     this.produce((s) => {
       const last = s.messages[s.messages.length - 1];
-      if (last?.role === "assistant") last.content += text;
+      if (last?.role === "assistant") {
+        last.content += text;
+        last.segments = last.segments ?? [];
+        const tail = last.segments[last.segments.length - 1];
+        if (tail?.kind === "text") tail.text += text;
+        else last.segments.push({ kind: "text", text });
+      }
       s.awaitingChunk = false;
     });
   }
