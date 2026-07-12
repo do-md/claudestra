@@ -22,6 +22,12 @@ export interface HistoryToolCall {
   summary: string;
 }
 
+/** [fork] reply() 附带的交互组件（按钮/选单），点击回投 [button:id]/[select:id:v]。
+ *  形状与 bridge NeutralMessage 的 components 对齐，历史里原样透传给前端渲染。 */
+export type ReplyComponentRow =
+  | { type: "buttons"; buttons: { id: string; label: string; style?: string; emoji?: string }[] }
+  | { type: "select"; id: string; placeholder?: string; options: { label: string; value: string; description?: string }[] };
+
 export interface HistoryMessage {
   /** jsonl 行号（0-based），分页锚点，同一文件内稳定 */
   seq: number;
@@ -31,6 +37,8 @@ export interface HistoryMessage {
   tools?: HistoryToolCall[];
   /** [fork] reply() 工具的正文——发给用户的「最终回复」，与过程叙述 text 分开渲染 */
   replyText?: string;
+  /** [fork] reply() 附带的按钮/选单——历史里也渲染（否则用户不在直播那刻就看不到按钮） */
+  replyComponents?: ReplyComponentRow[];
   /** compact 产生的摘要条目（不是真实用户输入） */
   compactSummary?: boolean;
   model?: string;
@@ -41,6 +49,46 @@ export interface HistoryMessage {
 /** [fork] MCP reply 工具名：mcp__<MCP_NAME>__reply（MCP_NAME 可配，按前后缀匹配）。 */
 function isReplyTool(name: string): boolean {
   return name.startsWith("mcp__") && name.endsWith("__reply");
+}
+
+/** jsonl 里的 components 不可信——只放行结构完整的按钮行/选单行，其余丢弃。 */
+function sanitizeComponents(raw: unknown): ReplyComponentRow[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ReplyComponentRow[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== "object") continue;
+    const r = row as Record<string, unknown>;
+    if (r.type === "buttons" && Array.isArray(r.buttons)) {
+      const buttons = r.buttons
+        .filter((b): b is Record<string, unknown> => !!b && typeof b === "object")
+        .filter((b) => typeof b.id === "string" && typeof b.label === "string")
+        .map((b) => ({
+          id: b.id as string,
+          label: b.label as string,
+          ...(typeof b.style === "string" ? { style: b.style } : {}),
+          ...(typeof b.emoji === "string" ? { emoji: b.emoji } : {}),
+        }));
+      if (buttons.length) out.push({ type: "buttons", buttons });
+    } else if (r.type === "select" && typeof r.id === "string" && Array.isArray(r.options)) {
+      const options = r.options
+        .filter((o): o is Record<string, unknown> => !!o && typeof o === "object")
+        .filter((o) => typeof o.label === "string" && typeof o.value === "string")
+        .map((o) => ({
+          label: o.label as string,
+          value: o.value as string,
+          ...(typeof o.description === "string" ? { description: o.description } : {}),
+        }));
+      if (options.length) {
+        out.push({
+          type: "select",
+          id: r.id,
+          ...(typeof r.placeholder === "string" ? { placeholder: r.placeholder } : {}),
+          options,
+        });
+      }
+    }
+  }
+  return out;
 }
 
 export interface HistoryPage {
@@ -261,6 +309,7 @@ export async function readSessionHistory(
       if (!Array.isArray(content)) continue;
       const texts: string[] = [];
       const replyTexts: string[] = [];
+      const replyComponents: ReplyComponentRow[] = [];
       const tools: HistoryToolCall[] = [];
       for (const b of content) {
         if (b?.type === "text" && b.text?.trim()) texts.push(b.text);
@@ -270,6 +319,8 @@ export async function readSessionHistory(
           // 直播能看到、进历史就没了）。这样历史与直播都渲染同一份 reply。
           if (isReplyTool(b.name) && typeof b.input?.text === "string" && b.input.text.trim()) {
             replyTexts.push(b.input.text);
+            // reply 附带的按钮/选单也进历史（否则用户不在直播那刻就看不到按钮）
+            replyComponents.push(...sanitizeComponents(b.input?.components));
           } else {
             tools.push({ name: b.name, summary: fmt(b.name, b.input) });
           }
@@ -278,6 +329,7 @@ export async function readSessionHistory(
       if (!texts.length && !replyTexts.length && !tools.length) continue;
       const msg: HistoryMessage = { seq: i, ts, role: "assistant", text: texts.join("\n") };
       if (replyTexts.length) msg.replyText = replyTexts.join("\n");
+      if (replyComponents.length) msg.replyComponents = replyComponents;
       if (tools.length) msg.tools = tools;
       if (typeof rec.message?.model === "string") msg.model = rec.message.model;
       all.push(msg);

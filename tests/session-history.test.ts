@@ -133,6 +133,65 @@ describe("readSessionHistory", () => {
     expect(asst.tools?.map((t) => t.name)).toEqual(["Read"]); // reply 不再混进工具卡
   });
 
+  test("[fork] reply 附带 components 提取进 replyComponents（历史也渲染按钮）", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hist-"));
+    const p = writeJsonl(dir, `${SID}.jsonl`, [
+      {
+        type: "assistant",
+        timestamp: "2026-07-01T00:01:00Z",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              name: "mcp__claudestra__reply",
+              input: {
+                text: "要发布吗?",
+                components: [
+                  { type: "buttons", buttons: [
+                    { id: "go", label: "✅ 发布", style: "success" },
+                    { id: "no", label: "取消" },
+                    { bad: "缺 id/label 的按钮被丢弃" },
+                  ] },
+                  { type: "select", id: "pick", placeholder: "选一个", options: [
+                    { label: "A", value: "a", description: "选项A" },
+                    { label: "缺 value 被丢弃" },
+                  ] },
+                  { type: "unknown-row-dropped" },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    ]);
+    const page = await readSessionHistory(p);
+    const asst = page.messages.find((m) => m.role === "assistant")!;
+    expect(asst.replyText).toBe("要发布吗?");
+    expect(asst.replyComponents).toEqual([
+      { type: "buttons", buttons: [
+        { id: "go", label: "✅ 发布", style: "success" },
+        { id: "no", label: "取消" },
+      ] },
+      { type: "select", id: "pick", placeholder: "选一个", options: [
+        { label: "A", value: "a", description: "选项A" },
+      ] },
+    ]);
+  });
+
+  test("[fork] reply 无 components / components 非数组 → replyComponents 不出现", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hist-"));
+    const p = writeJsonl(dir, `${SID}.jsonl`, [
+      {
+        type: "assistant",
+        timestamp: "2026-07-01T00:01:00Z",
+        message: { content: [{ type: "tool_use", name: "mcp__claudestra__reply", input: { text: "普通回复", components: "坏数据" } }] },
+      },
+    ]);
+    const page = await readSessionHistory(p);
+    expect(page.messages[0].replyText).toBe("普通回复");
+    expect(page.messages[0].replyComponents).toBeUndefined();
+  });
+
   test("[fork] 纯 reply（无叙述、无其它工具）也保留：text 空 + replyText 有值", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hist-"));
     const p = writeJsonl(dir, `${SID}.jsonl`, [

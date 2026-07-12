@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 import { apiAgentName, bridgeGet } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
 import type { ChatMessage, ToolCallView } from "@/features/chat/type";
+import type { WebComponentRow } from "@/lib/chat/events";
 
 /**
  * 某 agent 的历史消息（打开会话时先拉，刷新不丢）。
@@ -21,6 +22,8 @@ interface NeutralMessage {
   tools?: { name: string; summary: string }[];
   /** [fork] reply() 的最终回复正文（后端从 jsonl 的 reply tool_use 提取） */
   replyText?: string;
+  /** [fork] reply() 附带的按钮/选单（后端从 reply tool_use 的 input.components 提取） */
+  replyComponents?: WebComponentRow[];
   compactSummary?: boolean;
   /** 入站消息发送者标签（<channel> user 属性：API token 名 / Discord 用户名 / 来源 agent） */
   from?: string;
@@ -81,11 +84,14 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
     if (!group) {
       group = { id: `h${m.seq}`, role: "assistant", content: m.text || "", toolCalls, ts: m.ts };
       if (m.replyText) group.replyText = m.replyText;
+      if (m.replyComponents?.length) group.replyComponents = m.replyComponents;
       out.push(group);
     } else {
       if (m.text) group.content = group.content ? `${group.content}\n\n${m.text}` : m.text;
       if (toolCalls) group.toolCalls = [...(group.toolCalls ?? []), ...toolCalls];
       if (m.replyText) group.replyText = group.replyText ? `${group.replyText}\n${m.replyText}` : m.replyText;
+      // 同一回合多条 reply 的组件累积（通常只一组）
+      if (m.replyComponents?.length) group.replyComponents = [...(group.replyComponents ?? []), ...m.replyComponents];
     }
   }
   return out;
