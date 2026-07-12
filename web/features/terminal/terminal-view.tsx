@@ -176,7 +176,7 @@ export function TerminalView({
               .filter((l) => l.startsWith("data:"))
               .map((l) => l.slice(5).trimStart());
             if (dataLines.length === 0) continue; // 心跳注释
-            let evt: { t: string; d?: string; id?: string };
+            let evt: { t: string; d?: string; id?: string; cols?: number; rows?: number };
             try {
               evt = JSON.parse(dataLines.join("\n"));
             } catch {
@@ -186,6 +186,12 @@ export function TerminalView({
               term.write(b64decode(evt.d));
             } else if (evt.t === "open" && evt.id) {
               termIdRef.current = evt.id;
+              // 后端把 PTY clamp 到 tmux window 实际尺寸（被 iTerm 钳住时 < 视口）
+              // ——xterm 同步到实际值,视口=window 就没有 tmux 填充点区域,
+              // 空余部分留终端背景色(比一屏点好看多了)。
+              if (evt.cols && evt.rows && (term.cols !== evt.cols || term.rows !== evt.rows)) {
+                term.resize(evt.cols, evt.rows);
+              }
               if (!disposed) setStatus("connected");
             } else if (evt.t === "exit") {
               if (!disposed) setStatus("exited");
@@ -224,7 +230,22 @@ export function TerminalView({
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ id, cols: term.cols, rows: term.rows }),
-          }).catch(() => {});
+          })
+            .then((r) => r.json())
+            .then((j: { cols?: number; rows?: number }) => {
+              // 后端按 tmux window 实际尺寸 clamp 过（iTerm 钳制时 < 请求值），
+              // xterm 收敛到实际值——视口=window 才没有填充点区域。
+              if (
+                j.cols && j.rows &&
+                (term.cols !== j.cols || term.rows !== j.rows) &&
+                !disposed
+              ) {
+                lastCols = j.cols;
+                lastRows = j.rows;
+                term.resize(j.cols, j.rows);
+              }
+            })
+            .catch(() => {});
         }
       }, 150);
     });

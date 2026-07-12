@@ -169,6 +169,21 @@ export async function GET(request: Request) {
         /* pending 补拉失败不阻塞流 */
       }
 
+      // bg 任务 replay：SSE 只带增量,刷新/重连后活跃任务面板会空——连流即补拉
+      // 快照,合成 bg-start + bg-update 下发（已积累的尾部行一次性给到）。
+      try {
+        const bg = await bridgeGet<{
+          ok: boolean;
+          tasks: { id: string; kind: "subagent" | "shell"; title: string; lines: string[] }[];
+        }>(`/agents/${encodeURIComponent(apiName)}/bg-tasks`, { timeoutMs: 5000 });
+        for (const t of bg.tasks || []) {
+          send({ t: "bg-start", id: t.id, kind: t.kind, title: t.title });
+          if (t.lines?.length) send({ t: "bg-update", id: t.id, items: t.lines });
+        }
+      } catch {
+        /* bg 补拉失败不阻塞流 */
+      }
+
       const reader = upstreamBody.getReader();
       let buffer = "";
       try {

@@ -60,7 +60,12 @@ interface Activity {
   flushTimer: ReturnType<typeof setTimeout> | null;
   eventCount: number;
   finished: boolean;
+  /** 已 flush 的渲染行尾部环形缓冲（封顶 RECENT_MAX）——web 端刷新/连流后
+   *  replay 活跃任务用（GET /api/v1/agents/:name/bg-tasks），不然面板一刷新就空 */
+  recent: string[];
 }
+
+const RECENT_MAX = 100;
 
 interface AgentLite {
   name: string;
@@ -175,6 +180,7 @@ async function startActivity(
     flushTimer: null,
     eventCount: 0,
     finished: false,
+    recent: [],
   };
   activities.set(filePath, act);
   console.log(`🧵 bg 活动开始: ${agent.name} ${title}${threadId ? ` → thread ${threadId}` : "（无子区，仅事件）"}`);
@@ -242,6 +248,9 @@ async function flush(act: Activity): Promise<void> {
   }
   if (!act.queue.length) return;
   const lines = act.queue.splice(0, act.queue.length);
+  // 尾部环形缓冲（replay 用）
+  act.recent.push(...lines);
+  if (act.recent.length > RECENT_MAX) act.recent = act.recent.slice(-RECENT_MAX);
   // items 带上实际渲染行（每行已在 consume 里截断）——非 Discord 前端（web）据此
   // 还原子区内容；lines 保留计数供轻量消费者。内容通道，不追求完整性（源文件才是）。
   emitEvent({
@@ -366,4 +375,27 @@ export function startBgActivityWatcher(): void {
 /** 测试/诊断：当前活跃活动数 */
 export function activeBgActivities(): number {
   return activities.size;
+}
+
+/** web 连流后的 replay：某 agent 当前活跃（未 finalize）的 bg 任务快照。
+ *  lines = 已 flush 的尾部行（≤RECENT_MAX）;刷新后前端据此重建面板。 */
+export function activeBgTasksFor(agentName: string): Array<{
+  id: string;
+  kind: BgActivityKind;
+  title: string;
+  startedAt: number;
+  lines: string[];
+}> {
+  const out: Array<{ id: string; kind: BgActivityKind; title: string; startedAt: number; lines: string[] }> = [];
+  for (const act of activities.values()) {
+    if (act.agentName !== agentName || act.finished) continue;
+    out.push({
+      id: act.id,
+      kind: act.kind,
+      title: titleFor(act.kind, act.filePath),
+      startedAt: act.startedAt,
+      lines: [...act.recent],
+    });
+  }
+  return out.sort((a, b) => a.startedAt - b.startedAt);
 }

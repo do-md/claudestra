@@ -402,6 +402,21 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     });
   }
 
+  // [fork] GET /api/v1/agents/:name/bg-tasks —— 当前活跃 bg 任务快照（replay）。
+  // web 刷新/连流后据此重建后台任务面板（SSE 只带增量,不 replay 已发生的）。
+  const bgTasksMatch = path.match(/^\/agents\/([^/]+)\/bg-tasks$/);
+  if (bgTasksMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(bgTasksMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const { activeBgTasksFor } = await import("./bg-activity-watcher.js");
+    const name = agentParam.startsWith("agent-") ? agentParam : `agent-${agentParam}`;
+    // 两种名字形态都试（master/裸名兼容）
+    const tasks = [...activeBgTasksFor(name), ...(name !== agentParam ? activeBgTasksFor(agentParam) : [])];
+    return apiJson(200, { ok: true, tasks });
+  }
+
   // v2.9+ GET /api/v1/agents/:name/history —— session 清单（live + 归档快照）。
   // agent 已被 kill 时归档仍可读（这正是归档存在的意义），所以 registry 查不到
   // 不算 404，降级为只列归档。响应不含服务器路径（path 字段剥掉）。

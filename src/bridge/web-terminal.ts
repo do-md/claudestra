@@ -61,6 +61,8 @@ interface TermSession {
   tokenId: string;
   agent: string;
   viewerSession: string;
+  /** master 侧被 link 的窗口引用（断开时恢复 window-size latest 用） */
+  windowRef: string;
   term: InstanceType<typeof Bun.Terminal>;
   proc: ReturnType<typeof Bun.spawn>;
   createdAt: number;
@@ -162,18 +164,28 @@ export async function handleTerminalApi(req: Request, url: URL): Promise<Respons
       }
       return json(200, { ok: true });
     }
-    // resize
+    // resize：先尝试把 window 拉到新视口,再按 window 实际尺寸 clamp PTY
+    // （window 被 iTerm -CC 的 per-tab 尺寸钳住时拉不动——视口>window 的区域
+    // tmux 会画填充点,所以 PTY 必须 ≤ window;实际值回传给前端 xterm 同步）。
     const cols = clampInt(String(body.cols ?? ""), 0, 20, 500);
     const rows = clampInt(String(body.rows ?? ""), 0, 5, 200);
     if (!cols || !rows) return json(400, { ok: false, error: "missing/invalid cols,rows" });
+    await tmuxRun(["resize-window", "-t", `${sess.viewerSession}:9`, "-x", String(cols), "-y", String(rows)]).catch(() => {});
+    let effCols = cols, effRows = rows;
+    const actual = await tmuxRun(["display-message", "-p", "-t", `${sess.viewerSession}:9`, "#{window_width}x#{window_height}"]);
+    const m = /^(\d+)x(\d+)$/.exec(actual.out.trim());
+    if (actual.code === 0 && m) {
+      effCols = Math.min(cols, parseInt(m[1], 10));
+      effRows = Math.min(rows, parseInt(m[2], 10));
+    }
     try {
-      sess.term.resize(cols, rows);
+      sess.term.resize(effCols, effRows);
       // 无 controlling tty → 内核不发 SIGWINCH，必须手动补（PoC 实证，勿删）
       sess.proc.kill("SIGWINCH");
     } catch (e) {
       return json(500, { ok: false, error: `resize failed: ${(e as Error).message}` });
     }
-    return json(200, { ok: true, cols, rows });
+    return json(200, { ok: true, cols: effCols, rows: effRows });
   }
 
   return null;
@@ -238,6 +250,23 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
   }
   await tmuxRun(["select-window", "-t", `${viewerSession}:9`]);
   await tmuxRun(["kill-window", "-t", `${viewerSession}:0`]);
+  // 消「点阵」两步（2026-07-13 真机「点好多好恶心」）：
+  // ① resize-window 尝试把 window 拉到 viewer 视口——但 tmux 铁律是 window 尺寸
+  //    ≤ 显示它的最小 client（master 上 iTerm -CC 给每个 tab 报自己的尺寸），
+  //    拉不动就会被钳住（实验：exit=0、置 manual、尺寸纹丝不动）。
+  // ② 所以反向 clamp：读 window 实际尺寸,PTY/xterm 用 min(视口, window)——
+  //    视口=window 就没有「window 外」区域,tmux 无处画点;空余留前端背景色。
+  //    断开时恢复 window-size latest,把尺寸决定权还给 iTerm。
+  await tmuxRun(["resize-window", "-t", `${viewerSession}:9`, "-x", String(cols), "-y", String(rows)]);
+  const actual = await tmuxRun(["display-message", "-p", "-t", `${viewerSession}:9`, "#{window_width}x#{window_height}"]);
+  let effCols = cols, effRows = rows;
+  {
+    const m = /^(\d+)x(\d+)$/.exec(actual.out.trim());
+    if (actual.code === 0 && m) {
+      effCols = Math.min(cols, parseInt(m[1], 10));
+      effRows = Math.min(rows, parseInt(m[2], 10));
+    }
+  }
   // 滚动支持：CC TUI 在 alternate screen（无滚动缓冲），滚轮要靠 tmux 的
   // copy-mode——viewer session 开 mouse（session 级选项，master/本地 attach
   // 不受影响），tmux 会向 PTY 请求鼠标上报，xterm.js 自动转发滚轮 → tmux
@@ -259,6 +288,9 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
         try { sess.term.close(); } catch { /* 已关闭 */ }
         // fire-and-forget：viewer session 清理失败由启动 sweep 兜底
         tmuxRun(["kill-session", "-t", viewerSession]).catch(() => {});
+        // 把 window 尺寸决定权还回去（resize-window 置了 manual;不恢复的话
+        // master/iTerm 里这个窗口会一直钉在手机尺寸）
+        tmuxRun(["set-option", "-w", "-t", `${MASTER_SESSION}:${windowRef}`, "window-size", "latest"]).catch(() => {});
         try { controller.close(); } catch { /* 已关闭 */ }
         console.log(`🖥️ [term] closed id=${termId.slice(0, 8)} agent=${agentParam}`);
       };
@@ -276,8 +308,8 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
       let proc: ReturnType<typeof Bun.spawn>;
       try {
         term = new Bun.Terminal({
-          cols,
-          rows,
+          cols: effCols,
+          rows: effRows,
           data(_t: unknown, bytes: Uint8Array) {
             send(`data: {"t":"o","d":"${Buffer.from(bytes).toString("base64")}"}\n\n`);
           },
@@ -298,6 +330,7 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
         tokenId: tokenIdOf(principal),
         agent: agentParam,
         viewerSession,
+        windowRef,
         term,
         proc,
         createdAt: Date.now(),
@@ -308,7 +341,7 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
 
       // 首包立即 flush（Bun idleTimeout 坑）+ 告知前端 termId（input/resize 用）
       send(`: connected\n\n`);
-      send(`data: {"t":"open","id":"${termId}","cols":${cols},"rows":${rows}}\n\n`);
+      send(`data: {"t":"open","id":"${termId}","cols":${effCols},"rows":${effRows}}\n\n`);
       ping = setInterval(() => send(`: ping\n\n`), 5_000);
 
       // PTY 进程退出（window 被 kill / tmux server 重启）→ 通知前端并收尾
