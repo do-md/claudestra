@@ -108,15 +108,26 @@ export async function GET(request: Request) {
       ok: boolean;
       sessions: { sessionId: string; source: string }[];
     }>(`/agents/${name}/history`, { timeoutMs: 8000 });
-    const latest = list.sessions?.[0];
-    if (!latest) return NextResponse.json({ data: [] });
+    const sessions = list.sessions ?? [];
+    if (!sessions.length) return NextResponse.json({ data: [] });
 
-    // 2) 最新 session 的尾部 N 条（合并同回合后约为 N/每回合条数 个气泡）
-    const page = await bridgeGet<{ ok: boolean; messages: NeutralMessage[] }>(
-      `/agents/${name}/history/${encodeURIComponent(latest.sessionId)}?limit=500`,
-      { timeoutMs: 10_000 }
-    );
-    return NextResponse.json({ data: toChatMessages(page.messages || []) });
+    // 2) 依次试最新的几个 session，读到一个成功的就返回。/clear 轮转中途最新
+    //    session 可能正被拷贝/刚建空 → 单读失败就整个历史空白；回退到次新的保连续性。
+    //    最多试 3 个（够覆盖一次轮转），全失败才报错。
+    let lastErr: Error | null = null;
+    for (const s of sessions.slice(0, 3)) {
+      try {
+        const page = await bridgeGet<{ ok: boolean; messages: NeutralMessage[] }>(
+          `/agents/${name}/history/${encodeURIComponent(s.sessionId)}?limit=500`,
+          { timeoutMs: 10_000 }
+        );
+        return NextResponse.json({ data: toChatMessages(page.messages || []) });
+      } catch (e) {
+        lastErr = e as Error;
+        // not found（轮转竞态）→ 试下一个；其它错误也顺延，全败再抛
+      }
+    }
+    throw lastErr ?? new Error("no readable session");
   } catch (e) {
     const msg = (e as Error).message;
     // agent 尚无历史（新建）不是错误
