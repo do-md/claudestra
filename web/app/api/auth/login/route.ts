@@ -41,8 +41,11 @@ export async function POST(request: Request) {
   const session = createSession(username);
   const res = NextResponse.json({ data: { username } });
   const maxAge = SESSION_DAYS * 24 * 60 * 60;
-  // 生产默认带 Secure；仅当显式 COOKIE_SECURE=off 才关（本地无 TLS 开发用）
-  const secure = process.env.COOKIE_SECURE !== "off";
+  // Secure 默认**关**：这套 web 常经 Tailscale / 本机的明文 HTTP 访问，Secure cookie
+  // 在 HTTP 下会被浏览器直接丢弃 → 登录成功但 cookie 存不下、一直跳回登录页。
+  // 只有前面是 HTTPS 反代终止 TLS 的部署才设 COOKIE_SECURE=on 显式开。
+  // (httpOnly + sameSite=strict 已提供 XSS/CSRF 防护，Secure 只防明文窃听。)
+  const secure = process.env.COOKIE_SECURE === "on";
 
   res.cookies.set(SESSION_COOKIE, session.id, {
     httpOnly: true,
