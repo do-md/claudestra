@@ -13,7 +13,7 @@
  *   bun src/manager.ts sessions [search]
  */
 
-import { readFile, writeFile, mkdir, readdir, stat } from "fs/promises";
+import { readFile, writeFile, mkdir, readdir, stat, rename } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
 
@@ -147,9 +147,18 @@ async function migrateWorkerToAgent(): Promise<{ migrated: boolean; entries: num
   return { migrated: true, entries: Object.keys(raw.agents).length };
 }
 
+let regWriteSeq = 0;
 async function saveRegistry(reg: Registry) {
   await mkdir(`${process.env.HOME}/.claude-orchestrator`, { recursive: true });
-  await writeFile(REGISTRY_PATH, JSON.stringify(reg, null, 2));
+  // 原子写：同目录临时文件 + rename（POSIX 下 rename 原子）。防并发 reader 读到
+  // 半写文件（JSON.parse 抛错），也防单次写被撕裂。tmp 名带 pid + 进程内递增序号，
+  // 两个 manager 进程 / 同进程连续写都不撞同一 tmp。
+  // 注：这解决"半写/撕裂"，但不消除跨进程 read-modify-write 的 lost-update 窗口
+  // （两进程各自 load→mutate→save 精确交错时后写覆盖先写）——该窗口概率低，
+  // 真出问题再上文件锁。bridge 侧后台写者（clear 轮转）已尽量避开活跃 agent。
+  const tmp = `${REGISTRY_PATH}.${process.pid}.${regWriteSeq++}.tmp`;
+  await writeFile(tmp, JSON.stringify(reg, null, 2));
+  await rename(tmp, REGISTRY_PATH);
 }
 
 import { bridgeRequest } from "./lib/bridge-client.js";
@@ -2391,12 +2400,12 @@ async function cmdInviteLink(args: string[]) {
  * 生成一个 API token，scope 限定在指定 agent。secret 只显示这一次。
  * R1 防呆：目标 agent 未标 external:true（create --external）时要求 --force。
  */
-async function cmdTokenAdd(name: string, agentsCsv: string, force: boolean, noMirror: boolean) {
+async function cmdTokenAdd(name: string, agentsCsv: string, force: boolean, noMirror: boolean, terminal: boolean) {
   const { readPrincipals, writePrincipals, newTokenPrincipal, tokenIdOf } =
     await import("./lib/principals.js");
   const agents = agentsCsv.split(",").map((s) => s.trim()).filter(Boolean);
   if (!name || agents.length === 0) {
-    output({ ok: false, error: 'token-add <name> --agents <a,b|*> [--force] [--no-mirror]' });
+    output({ ok: false, error: 'token-add <name> --agents <a,b|*> [--force] [--no-mirror] [--terminal]' });
     return;
   }
 
@@ -2446,8 +2455,12 @@ async function cmdTokenAdd(name: string, agentsCsv: string, force: boolean, noMi
     if (!info.external) warnings.push(`"${a}" 未标 external，已用 --force 强制开放`);
   }
 
+  if (terminal) {
+    warnings.push(`--terminal：此 token 可开远程终端（往 agent 的 tmux 注入按键 = 宿主 shell 级访问，可绕过 --disallowedTools）`);
+  }
+
   const file = await readPrincipals();
-  const p = newTokenPrincipal(name, agents);
+  const p = newTokenPrincipal(name, agents, { terminal });
   if (noMirror) p.mirror = false;
   file.principals.push(p);
   await writePrincipals(file);
@@ -2458,6 +2471,7 @@ async function cmdTokenAdd(name: string, agentsCsv: string, force: boolean, noMi
     name,
     agents,
     mirror: p.mirror,
+    terminal: p.terminal === true,
     secret: p.secret,
     secretNote: "⚠️ secret 只显示这一次，请立即保存。调用方式: Authorization: Bearer <secret>",
     warnings,
@@ -2881,16 +2895,17 @@ switch (cmd) {
   case "token-add": {
     const { rest: afterForce, value: force } = extractBoolFlag(args, "--force");
     const { rest: afterMirror, value: noMirror } = extractBoolFlag(afterForce, "--no-mirror");
+    const { rest: afterTerm, value: terminal } = extractBoolFlag(afterMirror, "--terminal");
     // --agents a,b（也接受 --agents=a,b）
     let agentsCsv = "";
     const posArgs: string[] = [];
-    for (let i = 0; i < afterMirror.length; i++) {
-      const a = afterMirror[i];
-      if (a === "--agents") agentsCsv = afterMirror[++i] || "";
+    for (let i = 0; i < afterTerm.length; i++) {
+      const a = afterTerm[i];
+      if (a === "--agents") agentsCsv = afterTerm[++i] || "";
       else if (a.startsWith("--agents=")) agentsCsv = a.slice("--agents=".length);
       else posArgs.push(a);
     }
-    await cmdTokenAdd(posArgs.join(" "), agentsCsv, force, noMirror);
+    await cmdTokenAdd(posArgs.join(" "), agentsCsv, force, noMirror, terminal);
     break;
   }
   case "token-list":

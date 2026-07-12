@@ -103,9 +103,12 @@ const CHANNEL_WRAP_RE = /^\s*<channel\s+([^>]*)>\r?\n?([\s\S]*?)\r?\n?<\/channel
  */
 function stripChannelHeader(body: string): string {
   if (!/^\[(🌐|🤖|📢|📣)/.test(body)) return body;
-  const end = body.indexOf("]\n\n");
-  if (end === -1) return body;
-  return body.slice(end + 3).trim();
+  // header 块与正文用空行分隔——兼容 LF 与 CRLF（L7：CRLF jsonl 下 "]\n\n" 匹配不到
+  // 会把 framing 头留在正文）。仍要求"]"+空行做边界，不用单个换行（正文里可能出现
+  // "]\n"，会误切）。
+  const m = body.match(/]\r?\n\r?\n/);
+  if (!m || m.index === undefined) return body;
+  return body.slice(m.index + m[0].length).trim();
 }
 
 /**

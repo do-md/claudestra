@@ -37,6 +37,13 @@ export interface Principal {
   createdAt: string;
   /** R2 审计镜像开关（默认 true = API 对话镜像到 agent 的 Discord 频道） */
   mirror?: boolean;
+  /**
+   * 远程终端授予（B2）。终端把原始按键注入 agent 的 tmux，可 Ctrl-C 逃出 CC TUI
+   * 落到宿主 shell、绕过 `--disallowedTools`——能力等级 == 宿主 shell 访问，严格
+   * 强于 messaging。因此独立开关、默认关：external token 需 `token-add --terminal`
+   * 显式授予，不让一个只读/messaging token 静默拿到 shell。owner 默认允许。
+   */
+  terminal?: boolean;
 }
 
 export interface PrincipalsFile {
@@ -64,7 +71,11 @@ export async function writePrincipals(data: PrincipalsFile, path = PRINCIPALS_PA
 }
 
 /** 生成一个新 token principal（不落盘，调用方决定何时 write） */
-export function newTokenPrincipal(name: string, agents: string[]): Principal {
+export function newTokenPrincipal(
+  name: string,
+  agents: string[],
+  opts?: { terminal?: boolean },
+): Principal {
   const tokenId = `tok_${randomBytes(4).toString("hex")}`;
   return {
     id: `token:${tokenId}`,
@@ -75,6 +86,7 @@ export function newTokenPrincipal(name: string, agents: string[]): Principal {
     disabled: false,
     createdAt: new Date().toISOString(),
     mirror: true,
+    ...(opts?.terminal ? { terminal: true } : {}),
   };
 }
 
@@ -121,6 +133,16 @@ export function agentInScope(p: Principal, agentName: string): boolean {
     if (a === agentName || `agent-${a}` === agentName || a === `agent-${agentName}`) return true;
   }
   return false;
+}
+
+/**
+ * 远程终端授权（B2）。终端 = 宿主 shell 访问级别（可从 CC 逃到裸 shell、绕过
+ * `--disallowedTools`），严格强于 messaging，故在 agentInScope 之外**额外**要求
+ * 显式 terminal 授予，不让只读/messaging token 静默获得 shell。owner 默认允许。
+ */
+export function terminalAllowed(p: Principal, agentName: string): boolean {
+  if (!agentInScope(p, agentName)) return false;
+  return p.role === "owner" || p.terminal === true;
 }
 
 /**

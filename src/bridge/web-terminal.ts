@@ -17,9 +17,12 @@
  * - 生命周期：SSE 断开（cancel / enqueue 失败 / PTY 退出）→ kill attach 进程 +
  *   kill viewer session。Bridge 启动时 sweepStaleTerminalSessions() 清残留。
  *
- * 鉴权：Bearer + agentInScope 同 /api/v1 messaging 端点，但**不走 SlidingWindowLimiter**
- * （逐键输入秒超 30 req/min；termId 为 crypto 随机 + input/resize 校验 token 属主，
- * 服务只绑 127.0.0.1，风险面与 messaging 相同）。
+ * 鉴权（B2）：终端把原始按键注入 agent 的 tmux，可 Ctrl-C 逃出 CC TUI 落到宿主
+ * shell、绕过 `--disallowedTools`——能力等级 == **宿主 shell 访问**，严格强于
+ * messaging。因此在 Bearer 之上要求 `terminalAllowed`（token 需显式 terminal 授予，
+ * 不复用裸 messaging scope；见 principals.ts）。input/resize 额外校验 termId 属主。
+ * 不走 SlidingWindowLimiter（逐键输入秒超 30 req/min），但有 MAX_TERM_SESSIONS
+ * 并发上限（含在途占坑，防并发绕过）+ TTL 回收兜底。服务默认只绑 127.0.0.1。
  */
 
 import { randomBytes } from "node:crypto";
@@ -27,7 +30,7 @@ import { TMUX_SOCK, MASTER_SESSION } from "../lib/tmux-helper.js";
 import {
   readPrincipals,
   findByBearer,
-  agentInScope,
+  terminalAllowed,
   tokenIdOf,
   type Principal,
 } from "../lib/principals.js";
@@ -62,6 +65,13 @@ interface TermSession {
 }
 
 const termSessions = new Map<string, TermSession>();
+/**
+ * 已通过容量检查、但 tmux/PTY 尚未建好登记进 termSessions 的"在途"名额数（M1）。
+ * openTerminal 的容量检查在 3 个 tmux await 之前、set 在 await 之后——并发请求
+ * 若只看 termSessions.size 会全部读到"未满"而各自建 PTY，绕过上限。占坑计入此数，
+ * 使容量检查同步生效；登记成真 session 或走失败路径时释放。
+ */
+let pendingReservations = 0;
 /** 并发 viewer 上限（防泄漏兜底；正常一人用 1-2 个） */
 const MAX_TERM_SESSIONS = 8;
 const VIEWER_PREFIX = "webterm-";
@@ -171,15 +181,27 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
   const auth = await authNoLimit(req);
   if (auth instanceof Response) return auth;
   const principal = auth;
-  if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
-    return json(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+  // B2：终端 = 宿主 shell 级访问，须显式 terminal 授予（不复用裸 messaging scope）
+  if (!terminalAllowed(principal, agentParam) && !terminalAllowed(principal, `agent-${agentParam}`)) {
+    return json(403, {
+      ok: false,
+      error: `terminal access not granted for agent "${agentParam}" (needs a token with terminal scope: token-add --terminal)`,
+    });
   }
+
+  // M1：容量检查计入在途占坑，且检查+占坑在任何 await 之前**同步**完成，
+  // 并发请求无法各自读到"未满"。此后每条 return / start() 都要 release()。
+  if (termSessions.size + pendingReservations >= MAX_TERM_SESSIONS) {
+    return json(429, { ok: false, error: `too many terminal sessions (max ${MAX_TERM_SESSIONS})` });
+  }
+  pendingReservations++;
+  let reserved = true;
+  const release = () => { if (reserved) { reserved = false; pendingReservations--; } };
+
   const windowRef = await resolveWindowRef(agentParam);
   if (windowRef === null) {
+    release();
     return json(404, { ok: false, error: `no live tmux window for agent "${agentParam}"` });
-  }
-  if (termSessions.size >= MAX_TERM_SESSIONS) {
-    return json(429, { ok: false, error: `too many terminal sessions (max ${MAX_TERM_SESSIONS})` });
   }
 
   const cols = clampInt(url.searchParams.get("cols"), 100, 20, 500);
@@ -193,11 +215,13 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
     "-x", String(cols), "-y", String(rows),
   ]);
   if (created.code !== 0) {
+    release();
     return json(500, { ok: false, error: `tmux new-session failed: ${created.err}` });
   }
   const selected = await tmuxRun(["select-window", "-t", `${viewerSession}:${windowRef}`]);
   if (selected.code !== 0) {
     await tmuxRun(["kill-session", "-t", viewerSession]);
+    release();
     return json(500, { ok: false, error: `tmux select-window failed: ${selected.err}` });
   }
   // 滚动支持：CC TUI 在 alternate screen（无滚动缓冲），滚轮要靠 tmux 的
@@ -232,17 +256,29 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
         }
       };
 
-      const term = new Bun.Terminal({
-        cols,
-        rows,
-        data(_t: unknown, bytes: Uint8Array) {
-          send(`data: {"t":"o","d":"${Buffer.from(bytes).toString("base64")}"}\n\n`);
-        },
-      });
-      const proc = Bun.spawn(tmuxArgs(["attach", "-t", viewerSession]), {
-        terminal: term,
-        env: { ...process.env, TERM: "xterm-256color", LANG: process.env.LANG || "en_US.UTF-8" },
-      });
+      // L8：term/proc 构造若抛错，viewerSession 已建但未登记（destroy 拿不到），
+      // 会泄漏到下次启动 sweep——就地清理 tmux session + 释放占坑 + 报错收流。
+      let term: InstanceType<typeof Bun.Terminal>;
+      let proc: ReturnType<typeof Bun.spawn>;
+      try {
+        term = new Bun.Terminal({
+          cols,
+          rows,
+          data(_t: unknown, bytes: Uint8Array) {
+            send(`data: {"t":"o","d":"${Buffer.from(bytes).toString("base64")}"}\n\n`);
+          },
+        });
+        proc = Bun.spawn(tmuxArgs(["attach", "-t", viewerSession]), {
+          terminal: term,
+          env: { ...process.env, TERM: "xterm-256color", LANG: process.env.LANG || "en_US.UTF-8" },
+        });
+      } catch (e) {
+        release();
+        tmuxRun(["kill-session", "-t", viewerSession]).catch(() => {});
+        try { controller.error(e); } catch { /* 已关闭 */ }
+        console.error(`🖥️ [term] spawn failed id=${termId.slice(0, 8)} agent=${agentParam}:`, e);
+        return;
+      }
       const sess: TermSession = {
         id: termId,
         tokenId: tokenIdOf(principal),
@@ -254,6 +290,7 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
         destroy,
       };
       termSessions.set(termId, sess);
+      release(); // 占坑转为实际登记（size 已计入），释放在途名额
 
       // 首包立即 flush（Bun idleTimeout 坑）+ 告知前端 termId（input/resize 用）
       send(`: connected\n\n`);
@@ -270,6 +307,7 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
       console.log(`🖥️ [term] open id=${termId.slice(0, 8)} agent=${agentParam} ${cols}x${rows} (token=${sess.tokenId})`);
     },
     cancel() {
+      release(); // stream 从未 start 就被取消时兜底释放占坑（幂等）
       termSessions.get(termId)?.destroy();
     },
   });

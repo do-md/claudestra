@@ -73,8 +73,8 @@ import {
   apiThreadResults,
   apiFiles,
   apiReqKey,
-  // [fork] master session probe（scheduleClearRotation 复用；定义随 /api/v1 路由块一起落 api-routes.ts）
-  latestSessionIdForCwd,
+  // [fork] clear 轮转的快照 diff 用（定义随 /api/v1 路由块落 api-routes.ts）
+  listSessionIdsForCwd,
   type PendingApiRequest,
   type ApiReplyResult,
 } from "./bridge/api-routes.js";
@@ -4692,20 +4692,26 @@ const STATIC_DIR = process.env.BRIDGE_STATIC_DIR || "";
  * [fork] clear 后的会话轮转收尾（后台异步）。
  *
  * TUI 里 /clear 会轮转 sessionId，但新 session 的 jsonl 往往要等**首条消息**
- * 才落盘——所以 clear 端点先返回 202，这里每 1.5s poll cwd 的 projects slug
- * 目录，见到「不属于任何其他 agent 的新 jsonl」就：
+ * 才落盘——所以 clear 端点先返回 202，这里每 1.5s poll cwd 的 projects slug 目录。
+ *
+ * M2：同 cwd 可能有多个 agent，共享同一个 projects slug 目录。光取「最新 jsonl」
+ * 会把别的 agent 正在写的既有 session 误认成自己的新会话，串台并污染 registry。
+ * 改为**快照 diff**：clear 前记录目录里已有的全部 sid（beforeSids），此后只认领
+ * 快照里没有、且非 oldSid 的**新** sid（列表按 mtime 降序，取最新的那个）。再叠一层
+ * ownedByOther（新 sid 恰好是别的 agent 官方 session 则跳过）兜双重巧合。命中后：
  *   manager set-session（归档旧会话 + registry 切换，保持 manager 唯一写者）
  *   -> stopWatchingByChannel + startWatching 重绑 jsonl-watcher（否则盯死文件，工具流断掉）。
  * 超时（2min，比如该 CC 版本 /clear 不轮转 session）则放弃，watcher 维持原样。
- * 同 cwd 可能有多个 agent —— probe 到的 sid 若是别的 agent 的官方 session 则跳过。
- * latestSessionIdForCwd 随 /api/v1 路由块迁到 api-routes.ts，这里 import 复用。
  */
 function scheduleClearRotation(agentName: string, channelId: string, cwd: string, oldSid?: string) {
   const deadline = Date.now() + 120_000;
+  const beforeSids = new Set(listSessionIdsForCwd(cwd)); // clear 前的会话快照
   const tick = async () => {
     try {
-      const sid = latestSessionIdForCwd(cwd);
-      if (sid && sid !== oldSid) {
+      // 只认领快照外的新 sid（排除同 cwd 其他 agent 一直在写的既有 session）；
+      // 列表 mtime 降序，[0] 是最新出现的那个新会话。
+      const sid = listSessionIdsForCwd(cwd).find((s) => !beforeSids.has(s) && s !== oldSid);
+      if (sid) {
         const listResult = await runManager("list");
         const ownedByOther = ((listResult.agents || []) as any[]).some(
           (a) => a.name !== agentName && a.sessionId === sid,
@@ -4715,16 +4721,16 @@ function scheduleClearRotation(agentName: string, channelId: string, cwd: string
           if (r?.ok) {
             stopWatchingByChannel(channelId);
             startWatching(agentName, cwd, sid, channelId, discord);
-            console.log(`\U0001F9F9 clear 轮转完成 agent=${agentName} ${oldSid?.slice(0, 8) ?? "?"}->${sid.slice(0, 8)}`);
+            console.log(`🧹 clear 轮转完成 agent=${agentName} ${oldSid?.slice(0, 8) ?? "?"}->${sid.slice(0, 8)}`);
           } else {
-            console.error(`\U0001F9F9 clear 轮转 set-session 失败 agent=${agentName}:`, r?.error);
+            console.error(`🧹 clear 轮转 set-session 失败 agent=${agentName}:`, r?.error);
           }
           return;
         }
       }
     } catch { /* 下一轮重试 */ }
     if (Date.now() < deadline) setTimeout(tick, 1500);
-    else console.warn(`\U0001F9F9 clear 轮转超时 agent=${agentName}（未见新 session jsonl，watcher 维持原 session）`);
+    else console.warn(`🧹 clear 轮转超时 agent=${agentName}（未见新 session jsonl，watcher 维持原 session）`);
   };
   setTimeout(tick, 1200);
 }

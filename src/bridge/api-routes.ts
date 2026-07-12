@@ -67,6 +67,25 @@ export function latestSessionIdForCwd(cwd: string): string | undefined {
   }
 }
 
+/**
+ * [fork] 列出 cwd 的 projects slug 目录里所有 session id（无序）。
+ * clear 轮转用它做"clear 前快照 vs 之后新增"的集合 diff（M2）——同 cwd 多 agent
+ * 共享一个 slug 目录，光取"最新 jsonl"会误认别人正在写的既有 session；只认领
+ * 快照里没有的**新 sid**才不会串台。
+ */
+export function listSessionIdsForCwd(cwd: string): string[] {
+  try {
+    const dir = `${process.env.HOME}/.claude/projects/${projectsSlug(cwd)}`;
+    return readdirSync(dir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => ({ sid: f.slice(0, -".jsonl".length), mtime: statSync(`${dir}/${f}`).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime) // mtime 降序：调用方取 [0] 即最新
+      .map((e) => e.sid);
+  } catch {
+    return [];
+  }
+}
+
 // ── API 会话状态（v2.6.0+，原 bridge.ts Phase B 区块） ──────────────────
 
 /**
@@ -662,6 +681,17 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
             .map((n: unknown) => Number(n))
             .filter((n: number) => Number.isInteger(n) && n >= 0 && n < q.options.length);
         });
+      }
+      // M4：发方向键+Enter 前重验菜单还在（与 permission 分支同款防误击）。AUQ 若已在
+      // TUI 侧被应答/取消而 AuqState 尚未清（/pending replay 让陈旧提交更易发生），pane
+      // 会回到空闲输入框——此时导航键会误入 composer。pane 已 idle → 清态 + 409。
+      // 抓不到 pane 就跳过重验，退回原行为（不因抓取失败误拒合法提交）。
+      let auqPane = "";
+      try { auqPane = await tmuxCapture(state.tmuxTarget, 40); } catch { /* 跳过重验 */ }
+      if (auqPane && paneLooksIdle(auqPane)) {
+        clearAuqState(agent.channelId);
+        emitEvent({ agent: agent.name, chatId: agent.channelId, type: "question_cleared", data: { reason: "stale", via: "api" } });
+        return apiJson(409, { ok: false, error: "AskUserQuestion no longer active (answered elsewhere?)" });
       }
       const keys = buildAuqKeystrokes(state);
       try {

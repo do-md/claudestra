@@ -94,8 +94,19 @@ function renderToolMsg(tools: ToolEntry[]): string {
 }
 
 /** 发送或编辑 tool 消息 */
+/**
+ * M6：web-only 模式下会话地址是 `local-<uuid>` 合成 id，Discord client 未登录，
+ * 对它 `discord.channels.fetch` 必然 reject（虽被各 send 的 try/catch 吞掉，但每 tick
+ * 空跑一次无意义的 fetch）。web 前端的实时内容走 event-bus SSE，与这些 Discord 发送
+ * 无关——命中 local 频道直接短路。
+ */
+function isLocalChannel(channelId: string): boolean {
+  return channelId.startsWith("local-");
+}
+
 async function syncToolMsg(state: WatcherState, discord: Client) {
   if (state.tools.length === 0) return;
+  if (isLocalChannel(state.channelId)) return;
   const content = renderToolMsg(state.tools);
 
   try {
@@ -119,6 +130,7 @@ async function syncToolMsg(state: WatcherState, discord: Client) {
  *  上限自动分段，再加 trackSentMessage 跟原逻辑一致。 */
 async function flushText(state: WatcherState, discord: Client) {
   if (state.textQueue.length === 0) return;
+  if (isLocalChannel(state.channelId)) { state.textQueue.length = 0; return; }
   const items = state.textQueue.splice(0);
   const body = items.map((item) => `-# ${item}`).join("\n");
   try {
@@ -203,6 +215,7 @@ export async function hasRecentScheduleWakeup(
 // 又试别的被拦操作会再产生 → 15s 窗口内每个 channel 只弹一次「临时放行」按钮。
 const lastAutoDenyPost = new Map<string, number>();
 async function maybePostAutoDeny(discord: Client, state: WatcherState, reason: string) {
+  if (isLocalChannel(state.channelId)) return;
   const now = Date.now();
   if (now - (lastAutoDenyPost.get(state.channelId) || 0) < 15_000) return;
   lastAutoDenyPost.set(state.channelId, now);
@@ -331,9 +344,13 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
               // [fork] 先注册状态（与 Discord 渲染解耦）：web-only / Discord post 失败时
               // /api/v1 answer 端点也能拿到 AuqState 下键。post 成功只回填 messageId。
               registerAuqState(state.channelId, tmuxTarget, questions);
-              postAskUserQuestionMessage(discord, state.channelId, tmuxTarget, questions)
-                .catch((e) => console.error("AUQ post 失败:", e));
-              console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) → posted Discord components for ${state.agentName}`);
+              // M6：local-* 频道没有 Discord 面，跳过 post（event-bus 的 question 事件仍发，
+              // web 前端靠它渲染交互卡）。
+              if (!isLocalChannel(state.channelId)) {
+                postAskUserQuestionMessage(discord, state.channelId, tmuxTarget, questions)
+                  .catch((e) => console.error("AUQ post 失败:", e));
+              }
+              console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) for ${state.agentName}`);
               emitEvent({ agent: state.agentName, chatId: state.channelId, type: "question", data: { questions } });
               continue; // 跳过本 entry 的 tool/text 处理
             }
