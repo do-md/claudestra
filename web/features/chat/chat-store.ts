@@ -270,9 +270,13 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     }
   }
 
+  /** 断流自动重连的退避（ms）：流存活 ≥10s 视为曾健康、重置 3s；快速反复断则翻倍封顶 30s。 */
+  private reconnectDelay = 3_000;
+
   /** 打开某 agent 的持久 SSE 输出流。会话切换 / 重连共用。 */
   private async openStream(name: string) {
     const gen = ++this.streamGen;
+    const startedAt = Date.now();
     try {
       const res = await fetch(
         `/api/chat/stream?agent=${encodeURIComponent(name)}`
@@ -287,7 +291,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         processStreamEvent(this, evt);
       });
     } catch {
-      /* 断流：保持静默，可由 reconnect 续 */
+      /* 断流：保持静默，由下面的自动重连续 */
     } finally {
       // 流关闭/断开时，若本轮仍卡在 streaming（done 没收到、流被掐、bridge 重启），
       // 解锁 composer——别让「■ 停止」永久卡住导致用户发不出/看着像没渲染。仅清当前流。
@@ -299,6 +303,20 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           s.streaming = false;
           s.awaitingChunk = false;
         });
+      }
+      // [fork] 断流自动重连：bridge 重启 / 网络抖动会掐 SSE。此前只有「回前台」
+      // 触发 maybeReconnect，页面一直在前台就永远断着——断流期间 agent 的过程
+      // 记录直播全丢，也不重拉历史（2026-07-12 真机：bridge 重启后用户盯着页面，
+      // 后续处理过程 web 上完全没有）。仍是当前流才自动重连；走 maybeReconnect
+      // 完整对齐（重拉历史把断流期间的消息补回来）。后台页交给 visibilitychange。
+      if (gen === this.streamGen && this.state.activeAgent === name) {
+        this.reconnectDelay =
+          Date.now() - startedAt >= 10_000 ? 3_000 : Math.min(this.reconnectDelay * 2, 30_000);
+        setTimeout(() => {
+          if (gen !== this.streamGen || this.state.activeAgent !== name) return;
+          if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+          this.maybeReconnect();
+        }, this.reconnectDelay);
       }
     }
   }
