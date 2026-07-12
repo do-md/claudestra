@@ -26,14 +26,35 @@ export interface WebAuqQuestion {
   multiSelect: boolean;
 }
 
+/**
+ * reply() 附带的交互组件（按钮 / 选单）。形状与 bridge NeutralMessage 的
+ * components JSON 一一对应（原样透传，前端点击后回投 [button:<id>] /
+ * [select:<id>:<value>]，与 Discord 侧语义完全一致）。
+ */
+export interface WebButton {
+  id: string;
+  label: string;
+  style?: "primary" | "secondary" | "success" | "danger";
+  emoji?: string;
+}
+export interface WebSelectOption {
+  label: string;
+  value: string;
+  description?: string;
+}
+export type WebComponentRow =
+  | { type: "buttons"; buttons: WebButton[] }
+  | { type: "select"; id: string; placeholder?: string; options: WebSelectOption[] };
+
 export type WebStreamEvent =
   | { t: "status"; status: "running" | "done" }
   /** 一次工具调用的段级摘要（📖 Read xxx / ✏️ Edit xxx / ⚙️ Bash ...） */
   | { t: "tool"; name: string; summary: string; state: "running" | "done" | "error" }
   /** 助手文本段（过程叙述，追加到当前流式助手消息的 content） */
   | { t: "text"; text: string }
-  /** [fork] reply() 的最终回复（挂到当前 assistant 气泡的 replyText，与叙述分区渲染） */
-  | { t: "reply"; text: string }
+  /** [fork] reply() 的最终回复（挂到当前 assistant 气泡的 replyText，与叙述分区渲染）。
+   *  components：reply 附带的按钮/选单（点击回投 [button:<id>] / [select:<id>:<value>]）。 */
+  | { t: "reply"; text: string; components?: WebComponentRow[] }
   /** 本轮结束 */
   | { t: "done" }
   | { t: "error"; error: string }

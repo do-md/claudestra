@@ -5,6 +5,7 @@ import type { ChatMessage, ChatAttachmentView, ToolCallView } from "../type";
 import { Domd } from "@/components/domd";
 import { PermissionCard } from "./permission-card";
 import { AskQuestionCard } from "./ask-question-card";
+import { ReplyComponents } from "./reply-components";
 
 /* 复刻 Claude OS features/chat 的对话观感：assistant 全宽 + ✦ Claude 头，
    user 右对齐圆角矩形，工具调用 active（转圈）/ history（可展开）两态。
@@ -249,6 +250,7 @@ function Message({
         <ToolCallsBlock tools={m.toolCalls} streamingLast={streamingLast} />
       )}
       <AssistantBody m={m} liveEmpty={liveEmpty} />
+      {!!m.replyComponents?.length && <ReplyComponents m={m} />}
     </div>
   );
 }

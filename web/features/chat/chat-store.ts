@@ -8,7 +8,7 @@ import type {
   PendingAsk,
 } from "./type";
 import { consumeSSEStream, processStreamEvent, type StreamSink } from "./stream";
-import type { WebStreamEvent } from "@/lib/chat/events";
+import type { WebStreamEvent, WebComponentRow } from "@/lib/chat/events";
 
 /**
  * roster 变化指纹：捕获会影响侧栏渲染的字段（成员 + 状态 + 展示名 + 置顶/mock 标记）。
@@ -343,11 +343,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
    * 处理（Discord 侧本就如此）。这是 claude-os stdin steer 在 claudestra 架构下的等价：
    * 不写进程 stdin，靠 CC 原生排队，语义即「插入正在跑的会话」。
    */
-  public async send(text: string, files?: File[]) {
+  public async send(text: string, files?: File[], wireText?: string) {
     const display = text.trim();
     const hasFiles = !!files && files.length > 0;
     if ((!display && !hasFiles) || !this.state.activeAgent) return;
     const agent = this.state.activeAgent;
+    // wireText：发给 agent 的真实 payload（默认=展示文本）。按钮点击时展示 label、
+    // 实际发 [button:<id>]，二者不同——agent 收到的是分支用的机器 payload。
+    const wire = (wireText ?? display).trim() || display;
     // 用户气泡内回显：图片给 objectURL 预览，其它给文件名 chip
     const attachments: ChatAttachmentView[] | undefined = hasFiles
       ? files!.map((f) => {
@@ -382,14 +385,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         // multipart：不手动设 Content-Type，浏览器自动带 boundary
         const fd = new FormData();
         fd.append("agent", agent);
-        fd.append("text", display);
+        fd.append("text", wire);
         for (const f of files!) fd.append("files", f);
         res = await fetch("/api/chat/send", { method: "POST", body: fd });
       } else {
         res = await fetch("/api/chat/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ agent, text: display }),
+          body: JSON.stringify({ agent, text: wire }),
         });
       }
       if (res.status === 401) return this.gotoLogin();
@@ -477,12 +480,15 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
    * 直接挂到最后一条 assistant 气泡上（无论是否已定稿），已定稿的保持定稿 → reply 走
    * Domd 富文本。没有前置 assistant 气泡（纯 reply 无叙述）才新建，且回合外直接定稿。
    */
-  public setReplyText(text: string) {
+  public setReplyText(text: string, components?: WebComponentRow[]) {
+    const hasComp = Array.isArray(components) && components.length > 0;
     const last = this.state.messages[this.state.messages.length - 1];
     if (last && last.role === "assistant") {
       this.produce((s) => {
         const m = s.messages[s.messages.length - 1];
         m.replyText = m.replyText ? `${m.replyText}\n${text}` : text;
+        // 组件挂到承载 reply 的气泡；一条 reply 多段拼接时后到的组件覆盖（通常只一组）
+        if (hasComp) m.replyComponents = components;
         s.awaitingChunk = false;
       });
     } else {
@@ -493,12 +499,34 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           role: "assistant",
           content: "",
           replyText: text,
+          ...(hasComp ? { replyComponents: components } : {}),
           streamed,
           ts: new Date().toISOString(),
         });
         s.awaitingChunk = false;
       });
     }
+  }
+
+  /**
+   * 点击 reply 附带的按钮 / 选单：回投 [button:<id>] / [select:<id>:<value>] 给 agent
+   * （与 Discord 侧语义完全一致），同时禁用该条 reply 的整组组件、高亮所选。
+   * 展示气泡用人类可读的 label（而非裸的 [button:id]），wire 才是 agent 分支用的 payload。
+   */
+  public async clickReplyComponent(
+    messageId: string,
+    choiceId: string,
+    label: string,
+    wire: string
+  ) {
+    // 已作答过就忽略（防重复点）
+    const target = this.state.messages.find((m) => m.id === messageId);
+    if (!target || target.replyClickedId) return;
+    this.produce((s) => {
+      const m = s.messages.find((x) => x.id === messageId);
+      if (m) m.replyClickedId = choiceId;
+    });
+    await this.send(label, undefined, wire);
   }
 
   public setStatus(status: "running" | "done") {

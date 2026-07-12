@@ -1,4 +1,4 @@
-import type { WebPermAction, WebAuqQuestion } from "@/lib/chat/events";
+import type { WebPermAction, WebAuqQuestion, WebComponentRow } from "@/lib/chat/events";
 
 export interface ToolCallView {
   name: string;
@@ -37,6 +37,10 @@ export interface ChatMessage {
   /** [fork] assistant 的「最终回复」（reply() 正文）——与过程叙述 content 分区渲染，
    *  中间用淡分隔线隔开。历史来自 jsonl 的 reply tool_use，直播来自 chat_message(out)。 */
   replyText?: string;
+  /** reply 附带的交互组件（按钮/选单）。点击回投 [button:<id>] / [select:<id>:<value>]。 */
+  replyComponents?: WebComponentRow[];
+  /** 已点击的按钮/选项 id —— 点后禁用整组，高亮所选（一条 reply 只作答一次）。 */
+  replyClickedId?: string;
   toolCalls?: ToolCallView[];
   /** 由本轮流式生成（区别于历史加载） */
   streamed?: boolean;

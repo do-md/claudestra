@@ -1,6 +1,6 @@
 export const runtime = "nodejs";
 
-import { SSE_DONE, type WebStreamEvent, type WebAuqQuestion } from "@/lib/chat/events";
+import { SSE_DONE, type WebStreamEvent, type WebAuqQuestion, type WebComponentRow } from "@/lib/chat/events";
 import { apiAgentName, bridgeGet, bridgeAuthHeaders, BRIDGE } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
 
@@ -70,7 +70,12 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
       if (d.direction !== "out") return null;
       // [fork] reply() 的最终回复 → 独立 reply 事件（挂 replyText，与过程叙述分区、
       // 走 Domd 富文本、且回合 done 之后到达也能定稿——修「回复完又冒一条纯文本」）
-      return { t: "reply", text: String(d.text ?? "") };
+      // components：reply 附带的按钮/选单（后端 #29 起 chat_message 事件带上），原样透传
+      return {
+        t: "reply",
+        text: String(d.text ?? ""),
+        ...(Array.isArray(d.components) ? { components: d.components as WebComponentRow[] } : {}),
+      };
     case "question":
       return { t: "ask", id: `auq-${evt.seq}`, questions: mapAuqQuestions(d.questions) };
     case "question_cleared":
