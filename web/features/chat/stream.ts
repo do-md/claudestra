@@ -20,6 +20,10 @@ export interface StreamSink {
   /** Phase 2：待处理交互卡（null=清卡）。 */
   setPermission(p: PendingPermission | null): void;
   setAsk(a: PendingAsk | null): void;
+  /** 后台任务（subagent / bg shell）跟踪。 */
+  bgTaskStart(id: string, kind: "subagent" | "shell", title: string): void;
+  bgTaskUpdate(id: string, items: string[]): void;
+  bgTaskDone(id: string, durationMs?: number): void;
 }
 
 /** 处理一条已解析的 Web 流事件。初次发送与断线重连共用。 */
@@ -60,6 +64,15 @@ export function processStreamEvent(sink: StreamSink, evt: WebStreamEvent) {
       break;
     case "ask-cleared":
       sink.setAsk(null);
+      break;
+    case "bg-start":
+      sink.bgTaskStart(evt.id, evt.kind, evt.title);
+      break;
+    case "bg-update":
+      sink.bgTaskUpdate(evt.id, evt.items);
+      break;
+    case "bg-done":
+      sink.bgTaskDone(evt.id, evt.durationMs);
       break;
   }
 }

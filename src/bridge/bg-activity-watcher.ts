@@ -242,11 +242,13 @@ async function flush(act: Activity): Promise<void> {
   }
   if (!act.queue.length) return;
   const lines = act.queue.splice(0, act.queue.length);
+  // items 带上实际渲染行（每行已在 consume 里截断）——非 Discord 前端（web）据此
+  // 还原子区内容；lines 保留计数供轻量消费者。内容通道，不追求完整性（源文件才是）。
   emitEvent({
     agent: act.agentName,
     chatId: act.ownerChatId,
     type: "bg_task_update",
-    data: { kind: act.kind, id: act.id, lines: lines.length, threadId: act.threadId },
+    data: { kind: act.kind, id: act.id, lines: lines.length, items: lines, threadId: act.threadId },
   });
   if (!act.threadId || !act.adapter) return;
 

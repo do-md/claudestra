@@ -21,6 +21,17 @@ export interface PendingAsk {
   questions: WebAuqQuestion[];
 }
 
+/** 后台任务（subagent / bg shell）跟踪视图 —— Discord 子区在 web 的对应物。 */
+export interface BgTaskView {
+  id: string;
+  kind: "subagent" | "shell";
+  title: string;
+  /** 已渲染的进度行（subagent：🔧工具/💬文本；shell：原始输出行）。 */
+  lines: string[];
+  status: "running" | "done";
+  durationMs?: number;
+}
+
 /** 用户消息里附带的上传文件（用于自己气泡内回显）。 */
 export interface ChatAttachmentView {
   name: string;

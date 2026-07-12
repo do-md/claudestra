@@ -25,7 +25,8 @@ const SSE_HEADERS = {
  *   chat_message(out)     → {t:"reply"}（reply() 的最终回复，挂 replyText 与叙述分区渲染）
  *   question              → {t:"ask"}；question_cleared → {t:"ask-cleared"}（fork 事件）
  *   auto_deny             → {t:"text", "🚫 …"}
- *   其余（turn_duration / bg_task_* / session_anomaly）v1 暂不消费
+ *   bg_task_started/update/completed → {t:"bg-start"/"bg-update"/"bg-done"}（后台任务面板）
+ *   其余（turn_duration / session_anomaly）v1 暂不消费
  *
  * 连流后先补拉 GET /api/v1/agents/:name/pending —— question 事件可能发生在
  * 订阅之前（切会话/刷新/回前台），对应旧 web-hub 的 pendingInteraction replay。
@@ -82,6 +83,19 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
       return { t: "ask-cleared" };
     case "auto_deny":
       return { t: "text", text: `🚫 一个操作被 auto 模式拦下${d.reason ? `：${String(d.reason)}` : ""}` };
+    case "bg_task_started":
+      return {
+        t: "bg-start",
+        id: String(d.id ?? ""),
+        kind: d.kind === "shell" ? "shell" : "subagent",
+        title: String(d.title ?? ""),
+      };
+    case "bg_task_update":
+      // items 缺失（老 bridge）→ 无内容可渲染，丢弃（避免空更新扰动 UI）
+      if (!Array.isArray(d.items) || d.items.length === 0) return null;
+      return { t: "bg-update", id: String(d.id ?? ""), items: (d.items as unknown[]).map(String) };
+    case "bg_task_completed":
+      return { t: "bg-done", id: String(d.id ?? ""), durationMs: typeof d.durationMs === "number" ? d.durationMs : undefined };
     default:
       return null;
   }

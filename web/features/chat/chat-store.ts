@@ -6,6 +6,7 @@ import type {
   ChatAttachmentView,
   PendingPermission,
   PendingAsk,
+  BgTaskView,
 } from "./type";
 import { consumeSSEStream, processStreamEvent, type StreamSink } from "./stream";
 import type { WebStreamEvent, WebComponentRow } from "@/lib/chat/events";
@@ -36,6 +37,8 @@ interface ChatState {
   pendingPermission: PendingPermission | null;
   /** Phase 2：当前会话待处理的 AskUserQuestion 卡（null=无） */
   pendingAsk: PendingAsk | null;
+  /** 当前会话的后台任务（subagent / bg shell）跟踪面板，按到达顺序。 */
+  bgTasks: BgTaskView[];
 }
 
 /**
@@ -73,6 +76,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       awaitingChunk: false,
       pendingPermission: null,
       pendingAsk: null,
+      bgTasks: [],
     });
   }
 
@@ -221,6 +225,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       // 交互卡是 per-session 的：切走先清空，新流连上后 bridge 会 replay 当前 pending。
       s.pendingPermission = null;
       s.pendingAsk = null;
+      // bg 任务面板 per-session：切走清空（新流只带连上后的新任务，watcher 不 replay 旧的）
+      s.bgTasks = [];
     });
     // 无论有无缓存都重拉历史（stale-while-revalidate）——离开期间 agent 的产出
     // 只存在于 jsonl，不重拉就永远看不到。历史解析已稳定，重拉不再"漂"。
@@ -568,6 +574,51 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     this.produce((s) => {
       s.pendingAsk = a;
       if (a) s.awaitingChunk = false;
+    });
+  }
+
+  // ── 后台任务（subagent / bg shell）跟踪 ──
+  // 每行已在 bridge 侧截断；这里再给单任务的行数封顶，防长跑任务无界增长。
+  private static readonly BG_MAX_LINES = 500;
+
+  public bgTaskStart(id: string, kind: "subagent" | "shell", title: string) {
+    if (!id) return;
+    this.produce((s) => {
+      const existing = s.bgTasks.find((t) => t.id === id);
+      if (existing) {
+        // 同 id 重开（restart 后 baseline 再触发）→ 重置为 running
+        existing.status = "running";
+        existing.title = title || existing.title;
+      } else {
+        s.bgTasks.push({ id, kind, title, lines: [], status: "running" });
+      }
+    });
+  }
+
+  public bgTaskUpdate(id: string, items: string[]) {
+    if (!id || !items.length) return;
+    this.produce((s) => {
+      let t = s.bgTasks.find((x) => x.id === id);
+      if (!t) {
+        // update 早于 start（事件乱序/连流后补）→ 建一个占位任务
+        t = { id, kind: "subagent", title: id, lines: [], status: "running" };
+        s.bgTasks.push(t);
+      }
+      t.lines.push(...items);
+      if (t.lines.length > ChatStore.BG_MAX_LINES) {
+        t.lines = t.lines.slice(-ChatStore.BG_MAX_LINES);
+      }
+    });
+  }
+
+  public bgTaskDone(id: string, durationMs?: number) {
+    if (!id) return;
+    this.produce((s) => {
+      const t = s.bgTasks.find((x) => x.id === id);
+      if (t) {
+        t.status = "done";
+        t.durationMs = durationMs;
+      }
     });
   }
 

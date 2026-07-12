@@ -6,6 +6,7 @@ import { Domd } from "@/components/domd";
 import { PermissionCard } from "./permission-card";
 import { AskQuestionCard } from "./ask-question-card";
 import { ReplyComponents } from "./reply-components";
+import { BgTaskPanel } from "./bg-task-panel";
 
 /* 复刻 Claude OS features/chat 的对话观感：assistant 全宽 + ✦ Claude 头，
    user 右对齐圆角矩形，工具调用 active（转圈）/ history（可展开）两态。
@@ -263,6 +264,7 @@ export function MessageList() {
   const active = useChatStore((s) => s.state.activeAgent);
   const pendingPermission = useChatStore((s) => s.state.pendingPermission);
   const pendingAsk = useChatStore((s) => s.state.pendingAsk);
+  const bgTaskCount = useChatStore((s) => s.state.bgTasks.length);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
 
@@ -285,7 +287,7 @@ export function MessageList() {
     const el = scrollerRef.current;
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     followRef.current = true;
-  }, [messages.length, awaiting, pendingPermission, pendingAsk]);
+  }, [messages.length, awaiting, pendingPermission, pendingAsk, bgTaskCount]);
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -345,6 +347,7 @@ export function MessageList() {
             awaiting={awaiting}
           />
         ))}
+        <BgTaskPanel />
         {pendingPermission && <PermissionCard p={pendingPermission} />}
         {pendingAsk && <AskQuestionCard a={pendingAsk} />}
         {standaloneThinking && (

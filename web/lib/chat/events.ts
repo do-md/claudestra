@@ -70,6 +70,10 @@ export type WebStreamEvent =
     }
   | { t: "permission-cleared" }
   | { t: "ask"; id: string; questions: WebAuqQuestion[] }
-  | { t: "ask-cleared" };
+  | { t: "ask-cleared" }
+  // 后台任务（subagent / bg shell）子会话跟踪：Discord 侧开子区，web 侧渲染折叠面板。
+  | { t: "bg-start"; id: string; kind: "subagent" | "shell"; title: string }
+  | { t: "bg-update"; id: string; items: string[] }
+  | { t: "bg-done"; id: string; durationMs?: number };
 
 export const SSE_DONE = "[DONE]";
