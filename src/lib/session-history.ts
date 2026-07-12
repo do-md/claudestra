@@ -29,9 +29,18 @@ export interface HistoryMessage {
   role: "user" | "assistant" | "system";
   text: string;
   tools?: HistoryToolCall[];
+  /** [fork] reply() 工具的正文——发给用户的「最终回复」，与过程叙述 text 分开渲染 */
+  replyText?: string;
   /** compact 产生的摘要条目（不是真实用户输入） */
   compactSummary?: boolean;
   model?: string;
+  /** [fork] 入站消息的发送者标签（<channel> 的 user 属性：API token 名 / Discord 用户名 / 来源 agent） */
+  from?: string;
+}
+
+/** [fork] MCP reply 工具名：mcp__<MCP_NAME>__reply（MCP_NAME 可配，按前后缀匹配）。 */
+function isReplyTool(name: string): boolean {
+  return name.startsWith("mcp__") && name.endsWith("__reply");
 }
 
 export interface HistoryPage {
@@ -78,6 +87,38 @@ export function listSubagentFiles(mainJsonlPath: string): string[] {
   } catch {
     return [];
   }
+}
+
+// [fork] channel 送达的入站消息在 CC jsonl 里落成 isMeta:true + "<channel …>…</channel>"
+// 包装的 user 记录（CC channel 协议原生格式）。这是真实对话输入（web/API 用户、
+// Discord 用户、agent↔agent），不解包的话历史 API 里看不到任何用户消息，web 端
+// 回合结构也随之丢失（连续 assistant 记录跨回合粘连成巨型气泡）。
+const CHANNEL_WRAP_RE = /^\s*<channel\s+([^>]*)>\r?\n?([\s\S]*?)\r?\n?<\/channel>\s*$/;
+
+/**
+ * [fork] 剥掉 bridge renderContentForLocal 注入的 framing header：正文开头的
+ * [🌐 …] / [🤖 …] 方括号块是给 agent 的路由/行为指示，不是用户输入。header 内可能
+ * 出现 "]"（如 [DIRECT] 标记），所以用 "]\n\n" 或行尾 "]" + 空行做块边界，而不是
+ * 第一个 "]"。没匹配到已知 emoji 开头就原样保留（不误伤以 [ 开头的真实输入）。
+ */
+function stripChannelHeader(body: string): string {
+  if (!/^\[(🌐|🤖|📢|📣)/.test(body)) return body;
+  const end = body.indexOf("]\n\n");
+  if (end === -1) return body;
+  return body.slice(end + 3).trim();
+}
+
+/**
+ * [fork] 解包一条 <channel> 入站消息：返回 { text, from }；不是 channel 包装
+ * （caveat / local-command 等真 meta）返回 null。
+ */
+export function unwrapChannelMessage(raw: string): { text: string; from?: string } | null {
+  const m = raw.match(CHANNEL_WRAP_RE);
+  if (!m) return null;
+  const from = /(?:^|\s)user="([^"]*)"/.exec(m[1])?.[1] || undefined;
+  const text = stripChannelHeader(m[2].trim()).trim();
+  if (!text) return null;
+  return { text, from };
 }
 
 function summarize(sessionId: string, source: "live" | "archive", path: string): SessionSummary | null {
@@ -188,7 +229,6 @@ export async function readSessionHistory(
     }
 
     if (rec.type === "user") {
-      if (rec.isMeta === true) continue;
       const c = rec.message?.content;
       const text =
         typeof c === "string"
@@ -196,6 +236,16 @@ export async function readSessionHistory(
           : Array.isArray(c)
             ? c.filter((b: any) => b?.type === "text").map((b: any) => b.text || "").join("\n")
             : "";
+      if (rec.isMeta === true) {
+        // [fork] isMeta + <channel> 包装 = channel 送达的真实入站消息，解包进历史；
+        // 其余 isMeta（caveat / local-command 输出等）照旧过滤
+        const un = unwrapChannelMessage(text);
+        if (!un) continue;
+        const msg: HistoryMessage = { seq: i, ts, role: "user", text: un.text };
+        if (un.from) msg.from = un.from;
+        all.push(msg);
+        continue;
+      }
       if (!text.trim()) continue; // 纯 tool_result 载荷
       const msg: HistoryMessage = { seq: i, ts, role: "user", text };
       if (rec.isCompactSummary === true) msg.compactSummary = true;
@@ -207,13 +257,24 @@ export async function readSessionHistory(
       const content = rec.message?.content;
       if (!Array.isArray(content)) continue;
       const texts: string[] = [];
+      const replyTexts: string[] = [];
       const tools: HistoryToolCall[] = [];
       for (const b of content) {
         if (b?.type === "text" && b.text?.trim()) texts.push(b.text);
-        else if (b?.type === "tool_use" && b.name) tools.push({ name: b.name, summary: fmt(b.name, b.input) });
+        else if (b?.type === "tool_use" && b.name) {
+          // [fork] reply() 的正文是「发给用户的消息」，不是工具动作——提取成文本，别当
+          // 工具卡（否则 formatTool 只剩「🔧 <server>/reply」，回复内容在历史里蒸发，
+          // 直播能看到、进历史就没了）。这样历史与直播都渲染同一份 reply。
+          if (isReplyTool(b.name) && typeof b.input?.text === "string" && b.input.text.trim()) {
+            replyTexts.push(b.input.text);
+          } else {
+            tools.push({ name: b.name, summary: fmt(b.name, b.input) });
+          }
+        }
       }
-      if (!texts.length && !tools.length) continue;
+      if (!texts.length && !replyTexts.length && !tools.length) continue;
       const msg: HistoryMessage = { seq: i, ts, role: "assistant", text: texts.join("\n") };
+      if (replyTexts.length) msg.replyText = replyTexts.join("\n");
       if (tools.length) msg.tools = tools;
       if (typeof rec.message?.model === "string") msg.model = rec.message.model;
       all.push(msg);

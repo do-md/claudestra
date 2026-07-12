@@ -323,11 +323,14 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
           // 渲染完跳过本 assistant entry 的其他处理（不进 textQueue / tools），由
           // AUQ 自己的交互回路驱动。
           try {
-            const { detectAskUserQuestion, postAskUserQuestionMessage, auqStates } =
+            const { detectAskUserQuestion, postAskUserQuestionMessage, registerAuqState, auqStates } =
               await import("./ask-user-question.js");
             const questions = detectAskUserQuestion(content);
             if (questions && !auqStates.has(state.channelId)) {
               const tmuxTarget = `master:${state.agentName}`;
+              // [fork] 先注册状态（与 Discord 渲染解耦）：web-only / Discord post 失败时
+              // /api/v1 answer 端点也能拿到 AuqState 下键。post 成功只回填 messageId。
+              registerAuqState(state.channelId, tmuxTarget, questions);
               postAskUserQuestionMessage(discord, state.channelId, tmuxTarget, questions)
                 .catch((e) => console.error("AUQ post 失败:", e));
               console.log(`🎛 检测到 AskUserQuestion (${questions.length} 问) → posted Discord components for ${state.agentName}`);

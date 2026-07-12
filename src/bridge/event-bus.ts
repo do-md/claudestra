@@ -19,6 +19,9 @@ export type BridgeEventType =
   | "agent_status"
   | "auto_deny"
   | "question"
+  // [fork] AUQ 已应答/取消（Discord 按钮或 /api/v1 answer 端点触发），web 前端
+  // 收到后收起交互卡。additive-only 合同允许加类型；upstream 落地同类事件后切换。
+  | "question_cleared"
   | "chat_message"
   // v2.7+ 会话对账异常：bg 分身出现 / 链路掉线 / 收编与清理结果（agents 模式适配）
   | "session_anomaly"
@@ -60,6 +63,13 @@ let nextSeq = 1;
 const subscribers = new Set<Subscriber>();
 /** agent → 该 agent 最近 RING_LIMIT 条事件（seq 升序） */
 const rings = new Map<string, BridgeEvent[]>();
+/**
+ * [fork] agent → 最近一次 agent_status（"thinking"=回合进行中 / "done"=已收尾）。
+ * O(1) 查询「该 agent 此刻是否在回合中」，供刷新/迟到订阅者（web composer 的
+ * 暂停态、SSE 连流时补拉）判断——不必扫 ring（status 事件稀疏但仍可能被挤出）。
+ * bridge 重启清零（同 ring 的 R6 限制：权威回合边界靠 Stop hook 的 done 事件）。
+ */
+const agentStatuses = new Map<string, "thinking" | "done">();
 
 function matches(evt: BridgeEvent, filter: EventFilter): boolean {
   if (filter.agent && evt.agent !== filter.agent) return false;
@@ -89,6 +99,12 @@ export function emitEvent(
   }
   ring.push(full);
   if (ring.length > RING_LIMIT) ring.splice(0, ring.length - RING_LIMIT);
+
+  // [fork] 追踪回合进行态（O(1) 查询锚点）。
+  if (full.type === "agent_status") {
+    const st = (full.data as { status?: unknown }).status;
+    if (st === "thinking" || st === "done") agentStatuses.set(full.agent, st);
+  }
 
   for (const sub of subscribers) {
     if (!matches(full, sub.filter)) continue;
@@ -136,9 +152,18 @@ export function subscriberCount(): number {
   return subscribers.size;
 }
 
+/**
+ * [fork] 该 agent 当前的回合态（最近一次 agent_status）。undefined = bridge 启动后
+ * 该 agent 尚无任何 status 事件（视为空闲）。用于 web composer 刷新后同步暂停态。
+ */
+export function getAgentStatus(agent: string): "thinking" | "done" | undefined {
+  return agentStatuses.get(agent);
+}
+
 /** 测试专用：清空总线状态 */
 export function __resetEventBusForTest(): void {
   nextSeq = 1;
   subscribers.clear();
   rings.clear();
+  agentStatuses.clear();
 }

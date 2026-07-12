@@ -65,6 +65,30 @@ export interface AuqState {
 export const auqStates = new Map<string, AuqState>();
 
 /**
+ * [fork] 注册 AUQ 状态，与 Discord 渲染解耦。
+ *
+ * Web-only 模式（或 Discord post 失败）下也必须有 AuqState，否则
+ * POST /api/v1/agents/:name/answer 无从下键。watcher 检测到 AUQ 先调这里，
+ * 再尝试 postAskUserQuestionMessage（成功时只回填 messageId）。
+ */
+export function registerAuqState(
+  channelId: string,
+  tmuxTarget: string,
+  questions: AuqQuestion[],
+): AuqState {
+  const state: AuqState = {
+    channelId,
+    questions,
+    selections: questions.map(() => []),
+    messageId: "",
+    tmuxTarget,
+    ts: Date.now(),
+  };
+  auqStates.set(channelId, state);
+  return state;
+}
+
+/**
  * 从 assistant content blocks 里查 AskUserQuestion tool_use。返回 questions
  * 数组，没有返回 null。watcher 拿到 questions 之后调 postAskUserQuestionMessage
  * 渲染 Discord 组件。
@@ -160,14 +184,20 @@ export async function postAskUserQuestionMessage(
 
     const msg = await textCh.send({ content: body, components: rows });
 
-    auqStates.set(channelId, {
-      channelId,
-      questions,
-      selections: questions.map(() => []),
-      messageId: msg.id,
-      tmuxTarget,
-      ts: Date.now(),
-    });
+    // [fork] 状态可能已由 registerAuqState 预注册（web-only 回路），只回填 messageId
+    const existing = auqStates.get(channelId);
+    if (existing) {
+      existing.messageId = msg.id;
+    } else {
+      auqStates.set(channelId, {
+        channelId,
+        questions,
+        selections: questions.map(() => []),
+        messageId: msg.id,
+        tmuxTarget,
+        ts: Date.now(),
+      });
+    }
 
     return msg.id;
   } catch (e) {

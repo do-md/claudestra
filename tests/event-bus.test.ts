@@ -7,6 +7,7 @@ import {
   subscribeEvents,
   replayEventsSince,
   subscriberCount,
+  getAgentStatus,
   RING_LIMIT,
   __resetEventBusForTest,
   type BridgeEvent,
@@ -108,5 +109,42 @@ describe("replayEventsSince", () => {
     mk("small");
     expect(replayEventsSince(0, { agent: "small" }).length).toBe(1);
     expect(replayEventsSince(0, { agent: "big" }).length).toBe(RING_LIMIT);
+  });
+});
+
+describe("getAgentStatus（[fork] 回合进行态追踪，web composer 刷新同步用）", () => {
+  test("无事件 → undefined", () => {
+    expect(getAgentStatus("nobody")).toBeUndefined();
+  });
+
+  test("thinking / done 事件更新状态，最后一次为准", () => {
+    mk("a", "agent_status", { status: "thinking" });
+    expect(getAgentStatus("a")).toBe("thinking");
+    mk("a", "agent_status", { status: "done" });
+    expect(getAgentStatus("a")).toBe("done");
+    mk("a", "agent_status", { status: "thinking" });
+    expect(getAgentStatus("a")).toBe("thinking");
+  });
+
+  test("非 agent_status 事件不影响状态", () => {
+    mk("b", "agent_status", { status: "thinking" });
+    mk("b", "assistant_text", { text: "hi" });
+    mk("b", "tool_start", { name: "Read" });
+    expect(getAgentStatus("b")).toBe("thinking");
+  });
+
+  test("未知 status 值被忽略（只认 thinking/done）", () => {
+    mk("c", "agent_status", { status: "thinking" });
+    mk("c", "agent_status", { status: "weird" });
+    expect(getAgentStatus("c")).toBe("thinking");
+  });
+
+  test("跨 agent 互不干扰 + reset 清空", () => {
+    mk("x", "agent_status", { status: "thinking" });
+    mk("y", "agent_status", { status: "done" });
+    expect(getAgentStatus("x")).toBe("thinking");
+    expect(getAgentStatus("y")).toBe("done");
+    __resetEventBusForTest();
+    expect(getAgentStatus("x")).toBeUndefined();
   });
 });

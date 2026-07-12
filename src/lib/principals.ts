@@ -109,7 +109,10 @@ export function findToken(file: PrincipalsFile, idOrName: string): Principal | n
  */
 export function agentInScope(p: Principal, agentName: string): boolean {
   if (p.disabled) return false;
-  const isMaster = agentName === "master";
+  // [fork] "agent-master" 变体也按 master 处理：API 端点对 agent 名双查
+  // 裸名 + agent- 前缀变体，若只认 "master" 本名，"*" token 会经
+  // agentInScope(p, "agent-master") 绕过 master 排除（R1 guard 漏洞）。
+  const isMaster = agentName === "master" || agentName === "agent-master";
   for (const a of p.agents) {
     if (a === "*") {
       if (!isMaster) return true;

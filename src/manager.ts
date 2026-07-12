@@ -2415,6 +2415,18 @@ async function cmdTokenAdd(name: string, agentsCsv: string, force: boolean, noMi
       warnings.push(`"*" scope：所有普通 agent 都对此 token 可见`);
       continue;
     }
+    // [fork] "master" 是特殊 scope 值（大总管不在 registry）：显式列出 + --force 才放行
+    if (a === "master") {
+      if (!force) {
+        output({
+          ok: false,
+          error: `--agents 含 "master" 会把大总管开放给这个 token（上下文最敏感，R1）。确认请加 --force。`,
+        });
+        return;
+      }
+      warnings.push(`"master" scope：大总管对此 token 可见`);
+      continue;
+    }
     const info = reg.agents[a] || reg.agents[`agent-${a}`];
     if (!info) {
       output({ ok: false, error: `agent "${a}" 不存在（registry 里没有 ${a} / agent-${a}）` });
@@ -2940,6 +2952,37 @@ switch (cmd) {
     const r = await archiveSession(tmuxName, info.cwd, info.sessionId);
     const all = await listArchivedSessions(tmuxName);
     output({ ok: r.ok, note: r.note, archived: r.archived, sessions: all });
+    break;
+  }
+
+  // [fork] set-session：把 agent 的官方 sessionId 切到新值（先归档旧会话）。
+  // 供 bridge 的 clear 端点用：TUI 里 /clear 会轮转 sessionId，registry 若不跟着
+  // 换，jsonl-watcher 会盯死文件。registry 写入必须经 manager（唯一写者不变式）。
+  case "set-session": {
+    const [name, newSid] = args;
+    if (!name || !newSid) {
+      output({ ok: false, error: "用法: set-session <name> <sessionId>" });
+      break;
+    }
+    if (!/^[0-9a-f-]{8,64}$/i.test(newSid)) {
+      output({ ok: false, error: `sessionId 形状非法: ${newSid}` });
+      break;
+    }
+    const tmuxName = normalizeName(name);
+    const reg = await loadRegistry();
+    const info = reg.agents[tmuxName];
+    if (!info) {
+      output({ ok: false, error: `${tmuxName} 不在 registry` });
+      break;
+    }
+    const oldSid = info.sessionId || null;
+    // 旧会话退役 → 归档快照（对齐 kill/fork 轮转的退役语义）
+    if (oldSid && oldSid !== newSid) {
+      await archiveSession(tmuxName, info.cwd, oldSid).catch(() => {});
+    }
+    info.sessionId = newSid;
+    await saveRegistry(reg);
+    output({ ok: true, name: tmuxName, sessionId: newSid, previousSessionId: oldSid });
     break;
   }
 

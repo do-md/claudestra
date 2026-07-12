@@ -10,8 +10,8 @@
  * 其余依赖（manager 调用、principals、session-history……）都是无状态模块，直接 import。
  */
 
-import { existsSync } from "fs";
-import { TMP_DIR } from "./config.js";
+import { existsSync, readdirSync, statSync } from "fs";
+import { TMP_DIR, MASTER_DIR } from "./config.js";
 import {
   readPrincipals,
   findByBearer,
@@ -23,10 +23,49 @@ import {
 import { runManager } from "./management.js";
 import { collectSessions } from "./sessions-inventory.js";
 import { cleanupBgJob } from "../lib/bg-jobs.js";
-import { emitEvent, type EventFilter } from "./event-bus.js";
+import { emitEvent, getAgentStatus, type EventFilter } from "./event-bus.js";
 import { listAgentSessions, readSessionHistory, isValidSessionId, isValidSubagentId } from "../lib/session-history.js";
-import { formatTool } from "./jsonl-watcher.js";
+import { formatTool, agentNameForChannel } from "./jsonl-watcher.js";
 import { newThreadId, type Envelope, type ApiUserEndpoint } from "./router.js";
+// [fork] additive 端点（interrupt/clear/answer/pending/create/lifecycle）复用的共享 helper。
+// 绝大多数是平台无关模块，直接 import；仅 scheduleClearRotation 依赖 bridge 本地
+// 的 discord/startWatching，走 initApiRoutes 注入。
+import {
+  tmuxRaw,
+  tmuxCapture,
+  tmuxSendLine,
+  paneLooksIdle,
+  windowTarget,
+  detectRuntimePermissionPrompt,
+  MASTER_SESSION,
+} from "../lib/tmux-helper.js";
+import { stopTyping } from "./components.js";
+import { clearSafetyTimer } from "./discord-adapter.js";
+import { recordMetric } from "../lib/metrics.js";
+import { projectsSlug } from "../lib/jsonl-cost.js";
+
+// [fork] master 不在 registry，从 env 读其控制频道 id（各端点的 master 特判用）
+const CONTROL_CHANNEL_ID = process.env.CONTROL_CHANNEL_ID || "";
+
+/**
+ * [fork] master 的最新 session id：master 不在 registry，从其 cwd 的
+ * ~/.claude/projects/<slug>/ 目录里 probe mtime 最新的 jsonl。
+ * bridge.ts 的 scheduleClearRotation 也 import 它（clear 轮转判重用）。
+ */
+export function latestSessionIdForCwd(cwd: string): string | undefined {
+  try {
+    const dir = `${process.env.HOME}/.claude/projects/${projectsSlug(cwd)}`;
+    let best: { sid: string; mtime: number } | null = null;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".jsonl")) continue;
+      const st = statSync(`${dir}/${f}`);
+      if (!best || st.mtimeMs > best.mtime) best = { sid: f.slice(0, -".jsonl".length), mtime: st.mtimeMs };
+    }
+    return best?.sid;
+  } catch {
+    return undefined;
+  }
+}
 
 // ── API 会话状态（v2.6.0+，原 bridge.ts Phase B 区块） ──────────────────
 
@@ -102,6 +141,8 @@ export interface ApiDeps {
   /** 完成通知抑制：API 触发的 turn 不 @ owner */
   lastMessageSource: Map<string, string>;
   handleEventsRequest: (req: Request, extraFilter?: EventFilter) => Response;
+  // [fork] clear 端点的后台会话轮转收尾（依赖 bridge 本地 discord/startWatching，注入）
+  scheduleClearRotation: (agentName: string, channelId: string, cwd: string, oldSid?: string) => void;
 }
 
 let deps: ApiDeps | null = null;
@@ -145,6 +186,22 @@ async function authApi(req: Request, url: URL): Promise<Principal | Response> {
 
 /** registry 名双向兼容（"worker" ↔ "agent-worker"），返回 manager list 里的条目 */
 async function findApiAgent(name: string): Promise<{ name: string; channelId: string; idle?: boolean; status?: string; purpose?: string; cwd?: string; sessionId?: string } | null> {
+  // [fork] master 特判：master 不在 registry。channelId = CONTROL_CHANNEL_ID，
+  // cwd 优先取 channel-server 注册信息（在线时准确），离线回退 MASTER_DIR；
+  // sessionId probe 该 cwd 下最新 jsonl（历史 API 用）。scope 把关在各端点的
+  // agentInScope（master 必须显式列入 token scope，"*" 不含 master）。
+  if (name === "master" && CONTROL_CHANNEL_ID) {
+    const client = deps?.clients.get(CONTROL_CHANNEL_ID);
+    const cwd = client?.cwd || MASTER_DIR;
+    return {
+      name: "master",
+      channelId: CONTROL_CHANNEL_ID,
+      status: client ? "active" : "stopped",
+      purpose: "master orchestrator (大总管)",
+      cwd,
+      sessionId: latestSessionIdForCwd(cwd),
+    };
+  }
   try {
     const listResult = await runManager("list");
     const agents = (listResult.agents || []) as any[];
@@ -171,6 +228,26 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
       const agents = ((listResult.agents || []) as any[])
         .filter((a) => agentInScope(principal, a.name))
         .map((a) => ({ name: a.name, status: a.status, idle: a.idle, purpose: a.purpose }));
+      // [fork] ?include=stopped：registry 里已停止的 agent 也入列（additive；
+      // web 侧栏保留 stopped 会话入口，其历史经归档仍可读——正是归档的意义）。
+      if (url.searchParams.get("include") === "stopped") {
+        const { readRegistryAgents } = await import("../lib/registry.js");
+        const listed = new Set(agents.map((a) => a.name));
+        for (const r of await readRegistryAgents()) {
+          if (listed.has(r.name) || !agentInScope(principal, r.name)) continue;
+          agents.push({ name: r.name, status: "stopped", idle: undefined, purpose: r.purpose });
+        }
+      }
+      // [fork] master 入列（token scope 显式含 "master" 才可见，"*" 不含）。
+      // web 前端的「大总管」置顶入口靠它。
+      if (CONTROL_CHANNEL_ID && agentInScope(principal, "master")) {
+        agents.unshift({
+          name: "master",
+          status: deps.clients.has(CONTROL_CHANNEL_ID) ? "active" : "stopped",
+          idle: undefined,
+          purpose: "master orchestrator (大总管)",
+        });
+      }
       return apiJson(200, { ok: true, agents });
     } catch (e) {
       return apiJson(500, { ok: false, error: (e as Error).message });
@@ -461,6 +538,224 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
       return apiJson(202, { ok: true, accepted: true, timedOut: true, threadId, agent: agent.name, hint: `poll GET /api/v1/threads/${threadId}` });
     }
     return apiJson(200, { ok: true, ...result });
+  }
+
+  // ============================================================
+  // [fork] 以下为 fork 侧 additive 端点（upstream /api/v1 无对应能力）。
+  // 全部遵守 upstream 合同：Bearer + agentInScope、additive-only、复用
+  // Discord 按钮同款 tmux keystroke 逻辑（buildAuqKeystrokes / 权限 keySeqMap
+  // + 发键前 tmuxCapture 重验）。
+  //   POST /agents/:name/interrupt       一键中断（tmux C-c）
+  //   POST /agents/:name/clear           远程原生 /clear + 后台会话轮转
+  //   POST /agents/:name/answer          AUQ / 权限弹窗回传（tmux 键序列）
+  //   GET  /agents/:name/pending         当前挂起交互 + thinking 态（SSE 迟到订阅者补发）
+  //   POST /agents                       create（仅全权 token）
+  //   POST /agents/:name/kill|restart    生命周期（仅全权 token）
+  // ============================================================
+
+  // [fork] POST /api/v1/agents/:name/interrupt —— 复刻 Discord ⚡ 打断按钮
+  const interruptMatch = path.match(/^\/agents\/([^/]+)\/interrupt$/);
+  if (interruptMatch && req.method === "POST") {
+    const agentParam = decodeURIComponent(interruptMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const targetWindow = agent.name === "master" ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
+    try {
+      await tmuxRaw(["send-keys", "-t", targetWindow, "C-c"]);
+    } catch (e) {
+      return apiJson(500, { ok: false, error: `tmux send-keys 失败: ${(e as Error).message}` });
+    }
+    recordMetric("agent_interrupt", { channelId: agent.channelId, agent: agent.name, meta: { trigger: "api" } });
+    stopTyping(agent.channelId);
+    clearSafetyTimer(agent.channelId);
+    console.log(`⚡ [api] C-c 已发送给 ${agent.name} (token=${tokenId})`);
+    return apiJson(200, { ok: true, agent: agent.name });
+  }
+
+  // [fork] POST /api/v1/agents/:name/clear —— 远程调用 CC 原生 /clear（清上下文）。
+  // 语义分层（owner 哲学对齐）：本端点只做「打 /clear + 会话轮转收尾」这件原生事；
+  // clear 后要不要发开机指令、发什么，是前端（用户层）的事，这里零感知。
+  // master：/clear 后 CLAUDE.md 人设自动重载，且不在 registry、无 watcher —— 只发键。
+  const clearMatch = path.match(/^\/agents\/([^/]+)\/clear$/);
+  if (clearMatch && req.method === "POST") {
+    const agentParam = decodeURIComponent(clearMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const isMasterClear = agent.name === "master";
+    const targetWindow = isMasterClear ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
+    // 回合进行中打 /clear 会插进对话流 → 先验 idle（与权限按钮同款防误击思路）
+    let pane = "";
+    try {
+      pane = await tmuxCapture(targetWindow, 40);
+    } catch (e) {
+      return apiJson(502, { ok: false, error: `tmux 不可达: ${(e as Error).message}` });
+    }
+    if (!paneLooksIdle(pane)) {
+      return apiJson(409, { ok: false, error: "agent 正在回合中，先停止（interrupt）再 clear" });
+    }
+    try {
+      await tmuxSendLine(targetWindow, "/clear");
+    } catch (e) {
+      return apiJson(500, { ok: false, error: `tmux 发送失败: ${(e as Error).message}` });
+    }
+    recordMetric("agent_clear", { channelId: agent.channelId, agent: agent.name, meta: { trigger: "api" } });
+    console.log(`🧹 [api] /clear 已发送给 ${agent.name} (token=${tokenId})`);
+    if (isMasterClear) {
+      return apiJson(200, { ok: true, agent: "master" });
+    }
+    // 会话轮转收尾在后台跑（新 jsonl 可能等首条消息才出现）
+    if (agent.cwd) {
+      deps.scheduleClearRotation(agent.name, agent.channelId, agent.cwd, agent.sessionId);
+    }
+    return apiJson(202, {
+      ok: true,
+      accepted: true,
+      agent: agent.name,
+      hint: "session rotation completes in background; watcher rebinds when the new session jsonl appears",
+    });
+  }
+
+  // [fork] POST /api/v1/agents/:name/answer —— 交互卡回传。
+  // body {kind:"auq", action:"submit"|"cancel", selections?: number[][]}
+  //   或 {kind:"permission", action:"allow"|"allow_session"|"deny"}
+  const answerMatch = path.match(/^\/agents\/([^/]+)\/answer$/);
+  if (answerMatch && req.method === "POST") {
+    const agentParam = decodeURIComponent(answerMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return apiJson(400, { ok: false, error: "invalid JSON body" });
+    }
+    const kind = String(body?.kind || "");
+
+    if (kind === "auq") {
+      const { auqStates, buildAuqKeystrokes, clearAuqState } = await import("./ask-user-question.js");
+      const state = auqStates.get(agent.channelId);
+      if (!state) return apiJson(404, { ok: false, error: "no pending AskUserQuestion for this agent" });
+      const action = String(body?.action || "submit");
+      if (action === "cancel") {
+        try {
+          await tmuxRaw(["send-keys", "-t", state.tmuxTarget, "Escape"]);
+        } catch { /* non-critical：状态照清 */ }
+        clearAuqState(agent.channelId);
+        recordMetric("auq_cancel", { channelId: agent.channelId, meta: { trigger: "api" } });
+        emitEvent({ agent: agent.name, chatId: agent.channelId, type: "question_cleared", data: { reason: "cancel", via: "api" } });
+        return apiJson(200, { ok: true, cancelled: true });
+      }
+      // submit：body.selections 覆盖状态（web 前端一次性提交所有选择）
+      if (Array.isArray(body?.selections)) {
+        state.selections = state.questions.map((q, i) => {
+          const sel = Array.isArray(body.selections[i]) ? body.selections[i] : [];
+          return sel
+            .map((n: unknown) => Number(n))
+            .filter((n: number) => Number.isInteger(n) && n >= 0 && n < q.options.length);
+        });
+      }
+      const keys = buildAuqKeystrokes(state);
+      try {
+        if (keys.length > 0) await tmuxRaw(["send-keys", "-t", state.tmuxTarget, ...keys]);
+      } catch (e) {
+        return apiJson(500, { ok: false, error: `tmux send-keys 失败: ${(e as Error).message}` });
+      }
+      clearAuqState(agent.channelId);
+      recordMetric("auq_submit", { channelId: agent.channelId, meta: { trigger: "api", questions: String(state.questions.length) } });
+      emitEvent({ agent: agent.name, chatId: agent.channelId, type: "question_cleared", data: { reason: "submit", via: "api" } });
+      return apiJson(200, { ok: true, keys: keys.length });
+    }
+
+    if (kind === "permission") {
+      const action = String(body?.action || "");
+      const keySeqMap: Record<string, string[]> = {
+        allow: ["1", "Enter"],
+        allow_session: ["2", "Enter"],
+        deny: ["3", "Enter"],
+      };
+      const keySeq = keySeqMap[action];
+      if (!keySeq) return apiJson(400, { ok: false, error: 'action must be "allow" | "allow_session" | "deny"' });
+      const targetWindow = agent.name === "master" ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
+      // 发键前确认弹窗还在（与 Discord 按钮同款防误击：digit+Enter 别当普通输入提交）
+      const pane = await tmuxCapture(targetWindow, 30);
+      if (detectRuntimePermissionPrompt(pane) === null) {
+        return apiJson(409, { ok: false, error: "permission dialog no longer active" });
+      }
+      try {
+        await tmuxRaw(["send-keys", "-t", targetWindow, ...keySeq]);
+      } catch (e) {
+        return apiJson(500, { ok: false, error: `tmux send-keys 失败: ${(e as Error).message}` });
+      }
+      return apiJson(200, { ok: true });
+    }
+
+    return apiJson(400, { ok: false, error: 'kind must be "auq" or "permission"' });
+  }
+
+  // [fork] GET /api/v1/agents/:name/pending —— 当前挂起的交互卡 + thinking 态。
+  // SSE 的 question 事件可能在前端连流之前发出（切会话/刷新/回前台），
+  // 前端连流后调这里补拉（对应旧 web-hub 的 pendingInteraction replay）。
+  const pendingMatch = path.match(/^\/agents\/([^/]+)\/pending$/);
+  if (pendingMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(pendingMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const { auqStates } = await import("./ask-user-question.js");
+    const auq = auqStates.get(agent.channelId);
+    // [fork] thinking：该 agent 此刻是否在回合中（最近一次 agent_status=thinking）。
+    // web 前端刷新/切回/回前台后连流时读它，同步 composer「暂停」态。同键：done 事件在
+    // Stop hook 用 agentNameForChannel(channelId)（master 回退 CONTROL_CHANNEL_ID）落键。
+    const evAgent = agentNameForChannel(agent.channelId) || (agent.channelId === CONTROL_CHANNEL_ID ? "master" : "?");
+    const status = getAgentStatus(evAgent) ?? getAgentStatus(agent.name);
+    return apiJson(200, {
+      ok: true,
+      agent: agent.name,
+      question: auq ? { questions: auq.questions, ts: auq.ts } : null,
+      thinking: status === "thinking",
+    });
+  }
+
+  // [fork] POST /api/v1/agents —— create（仅全权 token；复用 manager CLI）
+  if (path === "/agents" && req.method === "POST") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: "create requires a full-scope token" });
+    }
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return apiJson(400, { ok: false, error: "invalid JSON body" });
+    }
+    const name = String(body?.name || "").trim();
+    const dir = String(body?.dir || "").trim();
+    const purpose = String(body?.purpose || "").trim();
+    if (!name || !dir) return apiJson(400, { ok: false, error: 'body must be {"name", "dir", "purpose"?}' });
+    const r = await runManager(...(purpose ? ["create", name, dir, purpose] : ["create", name, dir]));
+    return apiJson(r?.ok ? 200 : 500, r ?? { ok: false, error: "manager create failed" });
+  }
+
+  // [fork] POST /api/v1/agents/:name/kill | /restart —— 生命周期（仅全权 token）
+  const lifecycleMatch = path.match(/^\/agents\/([^/]+)\/(kill|restart)$/);
+  if (lifecycleMatch && req.method === "POST") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: `${lifecycleMatch[2]} requires a full-scope token` });
+    }
+    const agentParam = decodeURIComponent(lifecycleMatch[1]);
+    if (agentParam === "master") return apiJson(400, { ok: false, error: "master lifecycle is managed by the launcher" });
+    const r = await runManager(lifecycleMatch[2], agentParam);
+    return apiJson(r?.ok ? 200 : 500, r ?? { ok: false, error: `manager ${lifecycleMatch[2]} failed` });
   }
 
   return apiJson(404, { ok: false, error: "unknown endpoint" });

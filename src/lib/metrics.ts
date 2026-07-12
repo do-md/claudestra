@@ -23,6 +23,9 @@ export type MetricEvent =
   | "modal_button"      // TUI modal 按钮点击
   | "agent_completed"   // Stop hook 触发
   | "agent_interrupt"   // Ctrl+C 发出
+  | "agent_clear"       // 远程 /clear 清空会话
+  | "auq_submit"        // AskUserQuestion 回传（提交）
+  | "auq_cancel"        // AskUserQuestion 回传（取消）
   | "agent_wedged"      // wedge watcher 报警
   | "error"
   | "cron_run";

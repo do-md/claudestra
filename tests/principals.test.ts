@@ -83,6 +83,14 @@ describe("agentInScope", () => {
     expect(agentInScope(p, "master")).toBe(true);
   });
 
+  // [fork] agent-master 变体也按 master 处理（堵 "*" token 经前缀变体绕过的 R1 漏洞）
+  test('[fork] "agent-master" 变体不被 "*" 覆盖，显式 master 才放行', () => {
+    const p = newTokenPrincipal("t", ["*"]);
+    expect(agentInScope(p, "agent-master")).toBe(false);
+    const p2 = newTokenPrincipal("t", ["*", "master"]);
+    expect(agentInScope(p2, "agent-master")).toBe(true);
+  });
+
   test("disabled 一律拒", () => {
     const p = { ...newTokenPrincipal("t", ["*"]), disabled: true };
     expect(agentInScope(p, "agent-x")).toBe(false);

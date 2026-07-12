@@ -23,7 +23,9 @@ import {
 } from "discord.js";
 import type { ServerWebSocket } from "bun";
 
-import { DISCORD_TOKEN, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK } from "./bridge/config.js";
+import { DISCORD_TOKEN, WEB_ONLY, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK, MASTER_DIR } from "./bridge/config.js";
+// [fork:web-only] 无 Discord 模式的会话地址供给 + 出站落空 adapter
+import { createLocalChatAdapter } from "./bridge/local-adapter.js";
 import {
   startTyping,
   stopTyping,
@@ -50,15 +52,19 @@ import {
 import { tmuxScreenshot } from "./bridge/screenshot.js";
 import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel, formatTool } from "./bridge/jsonl-watcher.js";
 import { listAgentSessions, readSessionHistory, isValidSessionId, isValidSubagentId } from "./lib/session-history.js";
-import { existsSync } from "fs";
+import { existsSync, readdirSync, statSync } from "fs";
+// [fork] master 历史 probe 用（master 不在 registry，sessionId 从 projects slug 目录取最新）
+import { projectsSlug } from "./lib/jsonl-cost.js";
 // v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
-import { emitEvent, subscribeEvents, replayEventsSince, type EventFilter } from "./bridge/event-bus.js";
+import { emitEvent, subscribeEvents, replayEventsSince, getAgentStatus, type EventFilter } from "./bridge/event-bus.js";
 // v2.7+ Claude Code agents 模式适配：中性会话清单 + bg job 清理 + 分身对账
 import { collectSessions } from "./bridge/sessions-inventory.js";
 import { cleanupBgJob } from "./lib/bg-jobs.js";
 import { startSessionReconciler } from "./bridge/session-reconciler.js";
 import { startBgActivityWatcher } from "./bridge/bg-activity-watcher.js";
 import { startArchiveSweeper } from "./bridge/archive-sweeper.js";
+// [fork] Web 远程终端（PTY attach → SSE；见 web-terminal.ts 头注释）
+import { handleTerminalApi, sweepStaleTerminalSessions } from "./bridge/web-terminal.js";
 import {
   initApiRoutes,
   handleApiRequest,
@@ -67,6 +73,8 @@ import {
   apiThreadResults,
   apiFiles,
   apiReqKey,
+  // [fork] master session probe（scheduleClearRotation 复用；定义随 /api/v1 路由块一起落 api-routes.ts）
+  latestSessionIdForCwd,
   type PendingApiRequest,
   type ApiReplyResult,
 } from "./bridge/api-routes.js";
@@ -123,6 +131,7 @@ import {
   detectSessionIdlePrompt,
   tmuxSendLine,
   tmuxRaw,
+  paneLooksIdle,
   parseModalOptions,
   detectArrowNavModal,
   detectPermissionMode,
@@ -979,6 +988,9 @@ const discord = new Client({
 // 里，本来就是 Discord 专属职责。send 时 discord client 已 ready（消息只会在
 // ready 后流动）。
 registerAdapter(createDiscordChatAdapter(discord));
+// [fork:web-only] local adapter 常驻注册：Discord 模式下没有 local-* 地址流通，
+// 不会被命中；Web-only 模式下承接会话地址供给（create_channel）与出站落空。
+registerAdapter(createLocalChatAdapter());
 
 discord.once("ready", async () => {
   setBotUserId(discord.user?.id || "");
@@ -2789,6 +2801,8 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
             }).catch(() => {});
             recordMetric("auq_submit", { channelId: auqChannel, meta: { questions: String(state.questions.length) } });
             clearAuqState(auqChannel);
+            // [fork] 同步收掉 web 端的交互卡
+            emitEvent({ agent: agentNameForChannel(auqChannel) || "master", chatId: auqChannel, type: "question_cleared", data: { reason: "submit", via: "discord" } });
           } else if (action === "cancel") {
             await tmuxRaw(["send-keys", "-t", state.tmuxTarget, "Escape"]);
             await interaction.editReply({
@@ -2797,6 +2811,8 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
             }).catch(() => {});
             recordMetric("auq_cancel", { channelId: auqChannel });
             clearAuqState(auqChannel);
+            // [fork] 同步收掉 web 端的交互卡
+            emitEvent({ agent: agentNameForChannel(auqChannel) || "master", chatId: auqChannel, type: "question_cleared", data: { reason: "cancel", via: "discord" } });
           }
         } catch (e) {
           console.error("AUQ button 处理异常:", e);
@@ -3093,7 +3109,9 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { messageIds: ids } }));
 
         // v2.6.0+ 事件埋点：agent 的正式回复镜像（out）
-        {
+        // [fork] api: 目的地跳过——deliverToApi 已统一埋点（带 threadId/api 标记），
+        // 这里再发就是同一条回复的重复事件（web 前端会渲染两遍）。
+        if (parseChatId(msg.chatId).transport !== "api") {
           const evAgent = agentLabelForChannel(fromChannelId);
           emitEvent({ agent: evAgent, chatId: msg.chatId, type: "chat_message", data: { direction: "out", from: evAgent, text, threadId: env.meta.threadId } });
         }
@@ -3216,8 +3234,9 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
       try {
         // v2.6.0+ C2-5：会话地址供给走 adapter（ws 消息类型保留老名字做协议兼容）。
         // 将来纯 API agent = 换一个 provisioner，manager create 流程零改动。
-        const adapter = adapterFor("discord");
-        if (!adapter?.provisionConversation) throw new Error("discord adapter 不支持 provisionConversation");
+        // [fork:web-only] 无 Discord 时由 local adapter 供给 local-* 合成地址
+        const adapter = adapterFor(WEB_ONLY ? "local" : "discord");
+        if (!adapter?.provisionConversation) throw new Error("adapter 不支持 provisionConversation");
         const { chatId: channelId } = await adapter.provisionConversation(msg.name, { category: msg.category });
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { channelId } }));
       } catch (err) {
@@ -3228,7 +3247,10 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "delete_channel": {
       try {
-        await discordDeleteChannel(discord, msg.channelId);
+        // [fork:web-only] local-* 合成地址没有平台面，删除是 no-op
+        if (!String(msg.channelId || "").startsWith("local-")) {
+          await discordDeleteChannel(discord, msg.channelId);
+        }
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
       } catch (err) {
         ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, error: (err as Error).message }));
@@ -3238,6 +3260,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 
     case "rename_channel": {
       try {
+        // [fork:web-only] local-* 合成地址没有平台面，重命名是 no-op
+        if (String(msg.channelId || "").startsWith("local-")) {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true } }));
+          break;
+        }
         const ch = await discord.channels.fetch(msg.channelId);
         if (!ch || !("setName" in ch)) throw new Error("channel 不存在或不可重命名");
         await (ch as TextChannel).setName(msg.name);
@@ -3257,6 +3284,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
       try {
         const annChannelId = msg.channelId as string;
         const annAgentName = msg.agentName as string;
+        // [fork:web-only] local-* 地址没有 Discord 频道，公告是 no-op
+        if (annChannelId.startsWith("local-")) {
+          ws.send(JSON.stringify({ type: "response", requestId: msg.requestId, result: { ok: true, messageId: "" } }));
+          break;
+        }
         const ids = await discordReply(
           discord,
           annChannelId,
@@ -4615,13 +4647,19 @@ function handleEventsRequest(req: Request, extraFilter?: EventFilter): Response 
           cleanup(); // controller 已关（客户端断开），停止推送
         }
       };
+      // [fork] 立即发首包注释：flush 响应头 + 重置 Bun 的连接空闲计时。
+      // Bun.serve 默认 HTTP idleTimeout ≈10s——不发任何字节的空闲 SSE 连接
+      // 会在 ~10s 被掐（实测 10.7s close），30s ping 根本活不到第一轮。
+      try { controller.enqueue(enc.encode(`: connected\n\n`)); } catch { cleanup(); }
       if (Number.isFinite(since)) {
         for (const evt of replayEventsSince(since, filter)) send(evt);
       }
       unsub = subscribeEvents(filter, send);
+      // [fork] ping 30s→5s：必须小于 Bun.serve 默认 idleTimeout（~10s），
+      // 否则事件间隙超过 10s 的订阅者会被静默断开（web 前端首当其冲）。
       ping = setInterval(() => {
         try { controller.enqueue(enc.encode(`: ping\n\n`)); } catch { cleanup(); }
-      }, 30_000);
+      }, 5_000);
     },
     cancel() { cleanup(); },
   });
@@ -4643,10 +4681,53 @@ initApiRoutes({
   startTypingWithSafety,
   lastMessageSource,
   handleEventsRequest,
+  // [fork] clear 端点后台轮转收尾（依赖 bridge 本地的 discord/startWatching，注入）
+  scheduleClearRotation,
 });
 
 const CORS_ORIGIN_SETTING = process.env.BRIDGE_CORS_ORIGIN || "";
 const STATIC_DIR = process.env.BRIDGE_STATIC_DIR || "";
+
+/**
+ * [fork] clear 后的会话轮转收尾（后台异步）。
+ *
+ * TUI 里 /clear 会轮转 sessionId，但新 session 的 jsonl 往往要等**首条消息**
+ * 才落盘——所以 clear 端点先返回 202，这里每 1.5s poll cwd 的 projects slug
+ * 目录，见到「不属于任何其他 agent 的新 jsonl」就：
+ *   manager set-session（归档旧会话 + registry 切换，保持 manager 唯一写者）
+ *   -> stopWatchingByChannel + startWatching 重绑 jsonl-watcher（否则盯死文件，工具流断掉）。
+ * 超时（2min，比如该 CC 版本 /clear 不轮转 session）则放弃，watcher 维持原样。
+ * 同 cwd 可能有多个 agent —— probe 到的 sid 若是别的 agent 的官方 session 则跳过。
+ * latestSessionIdForCwd 随 /api/v1 路由块迁到 api-routes.ts，这里 import 复用。
+ */
+function scheduleClearRotation(agentName: string, channelId: string, cwd: string, oldSid?: string) {
+  const deadline = Date.now() + 120_000;
+  const tick = async () => {
+    try {
+      const sid = latestSessionIdForCwd(cwd);
+      if (sid && sid !== oldSid) {
+        const listResult = await runManager("list");
+        const ownedByOther = ((listResult.agents || []) as any[]).some(
+          (a) => a.name !== agentName && a.sessionId === sid,
+        );
+        if (!ownedByOther) {
+          const r = await runManager("set-session", agentName, sid);
+          if (r?.ok) {
+            stopWatchingByChannel(channelId);
+            startWatching(agentName, cwd, sid, channelId, discord);
+            console.log(`\U0001F9F9 clear 轮转完成 agent=${agentName} ${oldSid?.slice(0, 8) ?? "?"}->${sid.slice(0, 8)}`);
+          } else {
+            console.error(`\U0001F9F9 clear 轮转 set-session 失败 agent=${agentName}:`, r?.error);
+          }
+          return;
+        }
+      }
+    } catch { /* 下一轮重试 */ }
+    if (Date.now() < deadline) setTimeout(tick, 1500);
+    else console.warn(`\U0001F9F9 clear 轮转超时 agent=${agentName}（未见新 session jsonl，watcher 维持原 session）`);
+  };
+  setTimeout(tick, 1200);
+}
 
 async function handleHttpRoutes(req: Request, url: URL): Promise<Response> {
     if (url.pathname === "/hook" && req.method === "POST") {
@@ -4665,6 +4746,10 @@ async function handleHttpRoutes(req: Request, url: URL): Promise<Response> {
 
     // v2.6.0+ token 鉴权的入站 API（多前端架构 Phase B）
     if (url.pathname.startsWith("/api/v1/")) {
+      // [fork] Web 远程终端 3 端点先行匹配（不走 30req/min 限流——逐键输入秒超；
+      // 鉴权在 web-terminal.ts：Bearer + agentInScope + termId 属主校验）
+      const termRes = await handleTerminalApi(req, url);
+      if (termRes) return termRes;
       return handleApiRequest(req, url);
     }
 
@@ -4863,9 +4948,26 @@ const server = Bun.serve({
 
 console.log(`🚀 Bridge WebSocket 启动: ws://localhost:${BRIDGE_PORT}`);
 
-if (!DISCORD_TOKEN) {
-  console.error("❌ 请设置 DISCORD_BOT_TOKEN");
-  process.exit(1);
-}
+// [fork] 清扫上次崩溃/被杀残留的 webterm-* viewer session（grouped session 视图，
+// kill 不伤 master 本体）。Discord 与 Web-only 模式都需要。
+sweepStaleTerminalSessions().catch(() => {});
 
-discord.login(DISCORD_TOKEN);
+// [fork:web-only] 无 DISCORD_BOT_TOKEN → Web-only 模式：不连 Discord，只跑与
+// 平台无关的初始化子集。HTTP/ws/api/事件流在上面 Bun.serve 时已就绪。
+// 跳过的 Discord 专属项：cleanupStaleThinkingMessages / initStatsDashboard /
+// registerSlashCommands / startPermissionWatcher / startWedgeWatcher /
+// startSessionReconciler / gateway 看门狗（它们的告警面/交互面都是 Discord）。
+if (WEB_ONLY) {
+  console.log("🕸️ Web-only 模式：未设 DISCORD_BOT_TOKEN，跳过 Discord 登录");
+  // v2.8+ bg 活动追踪 — provisionThread 走 local adapter（落空），bg_task_* 事件照发
+  startBgActivityWatcher();
+  // v2.9+ 归档每日兜底 — 纯文件系统操作，历史 API 依赖它
+  startArchiveSweeper();
+  recordMetric("bridge_start", { meta: { channels: clients.size, webOnly: true } });
+} else {
+  if (!DISCORD_TOKEN) {
+    console.error("❌ 请设置 DISCORD_BOT_TOKEN");
+    process.exit(1);
+  }
+  discord.login(DISCORD_TOKEN);
+}
