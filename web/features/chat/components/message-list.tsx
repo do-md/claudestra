@@ -218,14 +218,11 @@ function Message({
   streaming,
   isLast,
   awaiting,
-  replyInteractive,
 }: {
   m: ChatMessage;
   streaming: boolean;
   isLast: boolean;
   awaiting: boolean;
-  /** 该气泡的 reply 按钮是否可点：用户在这条 reply 之后还没发过消息才算未作答。 */
-  replyInteractive: boolean;
 }) {
   if (m.role === "user") {
     const atts = m.attachments ?? [];
@@ -254,9 +251,7 @@ function Message({
         <ToolCallsBlock tools={m.toolCalls} streamingLast={streamingLast} />
       )}
       <AssistantBody m={m} liveEmpty={liveEmpty} />
-      {!!m.replyComponents?.length && (
-        <ReplyComponents m={m} interactive={replyInteractive} />
-      )}
+      {!!m.replyComponents?.length && <ReplyComponents m={m} />}
     </div>
   );
 }
@@ -327,13 +322,6 @@ export function MessageList() {
   const standaloneThinking =
     awaiting && !(last && last.role === "assistant" && last.streamed);
 
-  // reply 按钮的「未作答」判定：该 reply 之后用户还没发过消息才可点。用户在其后发过
-  // 消息（说明已翻篇）→ 禁用整组，防刷新后误点历史里的老确认按钮（如过去的 Push/Release）。
-  let lastUserIdx = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") { lastUserIdx = i; break; }
-  }
-
   return (
     <div ref={scrollerRef} className="flex-1 overflow-y-auto">
       {/* 横向留白对齐 claude-os thread（px-7=28px + 居中限宽），手机端稍收到 24px，
@@ -357,7 +345,6 @@ export function MessageList() {
             streaming={streaming}
             isLast={i === messages.length - 1}
             awaiting={awaiting}
-            replyInteractive={i > lastUserIdx}
           />
         ))}
         <BgTaskPanel />

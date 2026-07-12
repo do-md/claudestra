@@ -41,9 +41,28 @@ const SELF_FROM = new Set(["web-ui"]);
  * 同一个气泡。这里让历史对齐实时：连续的 assistant 记录累积进一个气泡（text 用
  * 空行拼接、工具按序收集），遇到 user / system 分隔线 / compact 边界就断开分组。
  */
+/** 在带组件的气泡里找该点击对应的 choiceId（不在组里返回 null）。 */
+function matchClickedChoice(
+  bubble: ChatMessage,
+  btnId: string | null,
+  selId: string | null,
+  selValue: string | null
+): string | null {
+  for (const row of bubble.replyComponents ?? []) {
+    if (row.type === "buttons" && btnId && row.buttons.some((b) => b.id === btnId)) return btnId;
+    if (row.type === "select" && selId && row.id === selId && selValue && row.options.some((o) => o.value === selValue)) {
+      return `${selId}:${selValue}`;
+    }
+  }
+  return null;
+}
+
 function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
   const out: ChatMessage[] = [];
   let group: ChatMessage | null = null; // 当前正在累积的 assistant 回合气泡
+  // 最近一条带组件的 assistant 气泡：后续 user 的按钮点击 payload 命中其组件
+  // → 标 replyClickedId（刷新后「已答」态不丢，禁用+高亮所选，对齐直播行为）
+  let lastWithComponents: ChatMessage | null = null;
 
   for (const m of items) {
     // compact 生成的长摘要不是真实用户输入（guide §6 建议默认折叠），v1 先不展示
@@ -76,9 +95,19 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
         continue;
       }
       const from = m.from && !SELF_FROM.has(m.from) ? m.from : undefined;
-      // 按钮/选单点击的机器 payload → 友好化（live 时显示的是 label，历史里只有 id）
+      // 按钮/选单点击的机器 payload → 友好化（live 时显示的是 label，历史里只有 id），
+      // 并回填最近那条带组件气泡的 replyClickedId（已答态跨刷新持久）
       const btnMatch = (m.text || "").match(/^\[button:([\w-]+)\]$/);
       const selMatch = (m.text || "").match(/^\[select:([\w-]+):(.+)\]$/);
+      if ((btnMatch || selMatch) && lastWithComponents && !lastWithComponents.replyClickedId) {
+        const clicked = matchClickedChoice(
+          lastWithComponents,
+          btnMatch?.[1] ?? null,
+          selMatch?.[1] ?? null,
+          selMatch?.[2] ?? null
+        );
+        if (clicked) lastWithComponents.replyClickedId = clicked;
+      }
       const content = btnMatch ? `🔘 ${btnMatch[1]}` : selMatch ? `🔘 ${selMatch[2]}` : m.text || "";
       out.push({ id: `h${m.seq}`, role: "user", content, ts: m.ts, from });
       continue;
@@ -97,6 +126,7 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
       // 同一回合多条 reply 的组件累积（通常只一组）
       if (m.replyComponents?.length) group.replyComponents = [...(group.replyComponents ?? []), ...m.replyComponents];
     }
+    if (group.replyComponents?.length) lastWithComponents = group;
   }
   return out;
 }

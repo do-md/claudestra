@@ -18,21 +18,15 @@ const BTN_STYLE: Record<string, string> = {
 };
 const btnClass = (style?: string) => BTN_STYLE[style ?? "secondary"] ?? BTN_STYLE.secondary;
 
-export function ReplyComponents({
-  m,
-  interactive = true,
-}: {
-  m: ChatMessage;
-  /** false = 历史里已翻篇的旧按钮：显示但禁用，防误点（如过去的 Push/Release 确认）。 */
-  interactive?: boolean;
-}) {
+export function ReplyComponents({ m }: { m: ChatMessage }) {
   const store = useChatStoreApi();
   const rows = m.replyComponents;
   const [busy, setBusy] = useState("");
   if (!rows || rows.length === 0) return null;
-  // 已点过、或本条已翻篇（用户在其后发过消息）→ 整组禁用
-  const answered = !!m.replyClickedId;
-  const disabled = answered || !interactive;
+  // Discord 同款语义：没点过的按钮一直可点（用户习惯隔几条消息再回来点），
+  // 只有点过的那组禁用+高亮所选。曾试过「翻篇即禁用」防误点旧确认按钮——真机
+  // 反馈跟实际工作流冲突（2026-07-12），回滚；stale 点击由 agent 凭上下文兜底。
+  const disabled = !!m.replyClickedId;
 
   const choose = async (choiceId: string, label: string, wire: string) => {
     if (disabled || busy) return;
