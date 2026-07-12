@@ -9,13 +9,15 @@ const SESSION_DAYS = 7;
 
 // ---- SSH/PAM authentication ----
 // 通过连接本机 SSH 服务校验账号密码（等价 PAM）。成功即视为鉴权通过。
+//
+// 目标 host/port **硬编码为本机**，绝不取自请求：否则未认证请求可把 host 指向
+// 攻击者自控的 sshd（接受任意密码）来伪造"登录成功"、拿到合法会话，本机 PAM
+// 门禁形同虚设，且 host/port 可任意 → 内网端口扫描 SSRF。若真有非本机 PAM 需求，
+// 用服务端 env 白名单，绝不接受客户端传入。
+const SSH_HOST = "127.0.0.1";
+const SSH_PORT = 22;
 
-export function verifySSH(
-  username: string,
-  password: string,
-  host = "127.0.0.1",
-  port = 22
-): Promise<boolean> {
+export function verifySSH(username: string, password: string): Promise<boolean> {
   return new Promise((resolve) => {
     const conn = new Client();
     conn
@@ -27,8 +29,8 @@ export function verifySSH(
         resolve(false);
       })
       .connect({
-        host,
-        port,
+        host: SSH_HOST,
+        port: SSH_PORT,
         username,
         password,
         readyTimeout: 5000,
@@ -37,13 +39,29 @@ export function verifySSH(
 }
 
 // ---- Rate limiting (in-memory) ----
+//
+// key 由调用方按客户端 IP 派生（见 login route），不是纯 username——否则换 username
+// 即换桶，密码喷洒 / SSRF 探测不受限。Map 有界并惰性清扫过期项，防未认证请求用海量
+// 一次性 key 撑爆内存。
 
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const MAX_ATTEMPTS = 5;
 const WINDOW_MS = 60 * 1000;
+const MAX_KEYS = 10_000;
+
+function sweepExpired(now: number): void {
+  for (const [k, v] of loginAttempts) {
+    if (now > v.resetAt) loginAttempts.delete(k);
+  }
+}
 
 export function checkRateLimit(key: string): boolean {
   const now = Date.now();
+  // 有界兜底：逼近上限先清过期项；清完仍满则拒绝（未认证内存膨胀防护）
+  if (loginAttempts.size >= MAX_KEYS) {
+    sweepExpired(now);
+    if (loginAttempts.size >= MAX_KEYS) return false;
+  }
   const entry = loginAttempts.get(key);
   if (!entry || now > entry.resetAt) {
     loginAttempts.set(key, { count: 1, resetAt: now + WINDOW_MS });

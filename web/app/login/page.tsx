@@ -6,9 +6,6 @@ import { useRouter } from "next/navigation";
 export default function LoginPage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [host, setHost] = useState("localhost");
-  const [port, setPort] = useState("22");
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const router = useRouter();
@@ -21,7 +18,7 @@ export default function LoginPage() {
     const res = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password, host, port }),
+      body: JSON.stringify({ username, password }),
     });
     const json = await res.json();
     setLoading(false);
@@ -66,40 +63,6 @@ export default function LoginPage() {
                 autoComplete="current-password"
               />
             </label>
-
-            {/* Advanced: Host & Port */}
-            <button
-              type="button"
-              className="text-xs text-base-content/40 hover:text-base-content/60"
-              onClick={() => setShowAdvanced(!showAdvanced)}
-            >
-              {showAdvanced ? "▾ 收起" : "▸ SSH 主机设置"}
-            </button>
-
-            {showAdvanced && (
-              <div className="flex gap-2">
-                <label className="form-control flex-1">
-                  <span className="label-text text-xs mb-1">Host</span>
-                  <input
-                    type="text"
-                    className="input input-bordered input-sm w-full"
-                    value={host}
-                    onChange={(e) => setHost(e.target.value)}
-                    placeholder="localhost"
-                  />
-                </label>
-                <label className="form-control w-20">
-                  <span className="label-text text-xs mb-1">Port</span>
-                  <input
-                    type="text"
-                    className="input input-bordered input-sm w-full"
-                    value={port}
-                    onChange={(e) => setPort(e.target.value)}
-                    placeholder="22"
-                  />
-                </label>
-              </div>
-            )}
 
             {error && (
               <div className="alert alert-error alert-sm text-sm py-2">
