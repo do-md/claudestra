@@ -12,8 +12,12 @@ export async function GET(request: Request) {
   if (!(await isAuthed(request))) {
     return NextResponse.json({ error: "未登录" }, { status: 401 });
   }
+  // ?refresh=1：强制重抓账号 gauge（bridge force 路径最长 ~20s,超时给足 30s）
+  const force = new URL(request.url).searchParams.get("refresh") === "1";
   try {
-    const res = await fetch(`${BRIDGE}/stats`, { signal: AbortSignal.timeout(8000) });
+    const res = force
+      ? await fetch(`${BRIDGE}/stats/refresh`, { method: "POST", signal: AbortSignal.timeout(30_000) })
+      : await fetch(`${BRIDGE}/stats`, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return NextResponse.json(await res.json());
   } catch (e) {

@@ -46,13 +46,21 @@ function fmtRel(ts?: number | null): string {
 export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const agents = useChatStore((s) => s.state.agents);
   const [g, setG] = useState<GlobalStats | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const load = (force: boolean) => {
+    if (force) setRefreshing(true);
+    fetch(force ? "/api/stats?refresh=1" : "/api/stats")
+      .then((r) => r.json())
+      .then((j: { global?: GlobalStats }) => setG(j.global ?? null))
+      .catch(() => {})
+      .finally(() => setRefreshing(false));
+  };
 
   useEffect(() => {
     if (!open) return;
-    fetch("/api/stats")
-      .then((r) => r.json())
-      .then((j: { global?: GlobalStats }) => setG(j.global ?? null))
-      .catch(() => setG(null));
+    load(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   if (!open) return null;
@@ -67,8 +75,17 @@ export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => vo
         className="flex max-h-[85dvh] w-full max-w-md flex-col rounded-2xl bg-base-100 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-5 pb-2 pt-4">
+        <div className="flex items-center px-5 pb-2 pt-4">
           <span className="text-base font-semibold">用量看板</span>
+          <button
+            className="btn btn-ghost btn-sm ml-auto"
+            aria-label="强制刷新账号用量"
+            title="强制重抓账号用量（最长约 20 秒）"
+            disabled={refreshing}
+            onClick={() => load(true)}
+          >
+            {refreshing ? <span className="loading loading-spinner loading-xs" /> : "🔄"}
+          </button>
           <button className="btn btn-ghost btn-sm" aria-label="关闭" onClick={onClose}>
             ✕
           </button>

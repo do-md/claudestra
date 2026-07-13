@@ -4763,6 +4763,12 @@ async function handleHttpRoutes(req: Request, url: URL): Promise<Response> {
       return handleStatsRequest();
     }
 
+    // [fork] Web 看板强制刷新（同 Discord 🔄 按钮语义,force 抓取最长 ~20s）
+    if (url.pathname === "/stats/refresh" && req.method === "POST") {
+      const { handleStatsRefreshRequest } = await import("./bridge/stats-dashboard.js");
+      return handleStatsRefreshRequest();
+    }
+
     // v2.6.0+ 结构化事件流（SSE，本机免鉴权版；token 版挂 /api/v1/events）
     if (url.pathname === "/events" && req.method === "GET") {
       return handleEventsRequest(req);
