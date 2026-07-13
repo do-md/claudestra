@@ -224,6 +224,32 @@ function ReplyDivider() {
   );
 }
 
+/** 叙述/回复的文本块：点击显示**该段自己**的秒级时间（不是整个回合的开场时间——
+ *  长回合一个气泡跨一小时，整体时间对「这句话什么时候说的」没意义）。 */
+function TextBlock({
+  text,
+  ts,
+  streamed,
+}: {
+  text: string;
+  ts?: string;
+  streamed?: boolean;
+}) {
+  const [showTs, setShowTs] = useState(false);
+  return (
+    <div className="cursor-pointer" onClick={() => setShowTs((v) => !v)}>
+      {streamed ? (
+        <div className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]">{text}</div>
+      ) : (
+        <Domd initMd={text} bodyClassName="chat-domd" />
+      )}
+      {showTs && ts && (
+        <div className="mt-0.5 font-mono text-[10px] tabular-nums opacity-40">{fmtTs(ts)}</div>
+      )}
+    </div>
+  );
+}
+
 /**
  * 助手正文：过程叙述 + 最终回复（replyText）分区渲染，中间淡分隔线。
  * 有 segments（叙述/工具的真实交错序）时按段渲染——修「工具全堆气泡顶部、
@@ -234,13 +260,10 @@ function AssistantBody({
   m,
   liveEmpty,
   streamingLast,
-  onToggleTs,
 }: {
   m: ChatMessage;
   liveEmpty: boolean;
   streamingLast: boolean;
-  /** 点击叙述/回复正文 → 切换本条消息的秒级时间显示。 */
-  onToggleTs?: () => void;
 }) {
   const segs = m.segments;
   const hasSegs = !!segs && segs.length > 0;
@@ -250,26 +273,11 @@ function AssistantBody({
   if (m.streamed && liveEmpty && !hasReply && !hasSegs) return <ThinkingDots />;
   if (!hasNarration && !hasReply) return null;
 
-  const renderText = (text: string, key: number | string) =>
-    m.streamed ? (
-      <div
-        key={key}
-        className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]"
-        onClick={onToggleTs}
-      >
-        {text}
-      </div>
-    ) : (
-      <div key={key} onClick={onToggleTs}>
-        <Domd initMd={text} bodyClassName="chat-domd" />
-      </div>
-    );
-
   const narration = hasSegs ? (
     <>
       {segs!.map((seg: AssistantSegment, i) =>
         seg.kind === "text" ? (
-          renderText(seg.text, i)
+          <TextBlock key={i} text={seg.text} ts={seg.ts ?? m.ts} streamed={m.streamed} />
         ) : (
           <div key={i} className="my-2 space-y-1">
             {seg.tools.map((t, j) =>
@@ -288,7 +296,7 @@ function AssistantBody({
       )}
     </>
   ) : hasNarration ? (
-    renderText(m.content, "legacy")
+    <TextBlock text={m.content} ts={m.ts} streamed={m.streamed} />
   ) : null;
 
   return (
@@ -297,18 +305,7 @@ function AssistantBody({
       {hasReply && (
         <>
           {hasNarration && <ReplyDivider />}
-          {m.streamed ? (
-            <div
-              className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]"
-              onClick={onToggleTs}
-            >
-              {m.replyText}
-            </div>
-          ) : (
-            <div onClick={onToggleTs}>
-              <Domd initMd={m.replyText!} bodyClassName="chat-domd" />
-            </div>
-          )}
+          <TextBlock text={m.replyText!} ts={m.replyTs ?? m.ts} streamed={m.streamed} />
         </>
       )}
     </>
@@ -371,12 +368,7 @@ function Message({
       {!hasSegs && !!m.toolCalls?.length && (
         <ToolCallsBlock tools={m.toolCalls} streamingLast={streamingLast} />
       )}
-      <AssistantBody
-        m={m}
-        liveEmpty={liveEmpty}
-        streamingLast={streamingLast}
-        onToggleTs={() => setShowTs((v) => !v)}
-      />
+      <AssistantBody m={m} liveEmpty={liveEmpty} streamingLast={streamingLast} />
       {!!m.replyComponents?.length && <ReplyComponents m={m} />}
     </div>
   );

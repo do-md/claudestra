@@ -504,7 +504,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         last.segments = last.segments ?? [];
         const tail = last.segments[last.segments.length - 1];
         if (tail?.kind === "text") tail.text += text;
-        else last.segments.push({ kind: "text", text });
+        else last.segments.push({ kind: "text", text, ts: new Date().toISOString() });
       }
       s.awaitingChunk = false;
     });
@@ -527,6 +527,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       this.produce((s) => {
         const m = s.messages[s.messages.length - 1];
         m.replyText = m.replyText ? `${m.replyText}\n${text}` : text;
+        m.replyTs = m.replyTs ?? new Date().toISOString();
         // 组件挂到承载 reply 的气泡；一条 reply 多段拼接时后到的组件覆盖（通常只一组）
         if (hasComp) m.replyComponents = components;
         s.awaitingChunk = false;
@@ -539,6 +540,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           role: "assistant",
           content: "",
           replyText: text,
+          replyTs: new Date().toISOString(),
           ...(hasComp ? { replyComponents: components } : {}),
           streamed,
           ts: new Date().toISOString(),

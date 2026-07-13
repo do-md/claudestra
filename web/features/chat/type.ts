@@ -10,7 +10,12 @@ export interface ToolCallView {
 
 /** assistant 气泡内的交错段——叙述与工具按真实时间顺序排列（修「工具全堆气泡顶部」）。 */
 export type AssistantSegment =
-  | { kind: "text"; text: string }
+  | {
+      kind: "text";
+      text: string;
+      /** 该段开始时间（历史=首条 jsonl 记录 ts，直播=前端 stamp）。点击该段显示。 */
+      ts?: string;
+    }
   | { kind: "tools"; tools: ToolCallView[] };
 
 /** 待处理的权限 / session-idle 卡（一个会话同时最多一张）。 */
@@ -60,6 +65,8 @@ export interface ChatMessage {
   /** [fork] assistant 的「最终回复」（reply() 正文）——与过程叙述 content 分区渲染，
    *  中间用淡分隔线隔开。历史来自 jsonl 的 reply tool_use，直播来自 chat_message(out)。 */
   replyText?: string;
+  /** replyText 的时间（与气泡 ts 分开——长回合里回复比开场晚得多）。点击回复正文显示。 */
+  replyTs?: string;
   /** reply 附带的交互组件（按钮/选单）。点击回投 [button:<id>] / [select:<id>:<value>]。 */
   replyComponents?: WebComponentRow[];
   /** 已点击的按钮/选项 id —— 点后禁用整组，高亮所选（一条 reply 只作答一次）。 */

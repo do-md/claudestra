@@ -130,11 +130,13 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
       // 同一回合多条 reply 的组件累积（通常只一组）
       if (m.replyComponents?.length) group.replyComponents = [...(group.replyComponents ?? []), ...m.replyComponents];
     }
+    // reply 的时间与气泡开场 ts 分开记（长回合里回复晚得多），取首条 reply 记录的 ts
+    if (m.replyText && !group.replyTs && m.ts) group.replyTs = m.ts;
     const segs = group.segments as AssistantSegment[];
     if (m.text) {
       const tail = segs[segs.length - 1];
       if (tail?.kind === "text") tail.text += `\n\n${m.text}`;
-      else segs.push({ kind: "text", text: m.text });
+      else segs.push({ kind: "text", text: m.text, ts: m.ts });
     }
     if (toolCalls) {
       const tail = segs[segs.length - 1];
