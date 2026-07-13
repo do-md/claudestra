@@ -339,14 +339,25 @@ const TextBlock = memo(function TextBlock({
   text,
   ts,
   streamed,
+  muted,
 }: {
   text: string;
   ts?: string;
   streamed?: boolean;
+  /** 过程叙述（工具间碎碎念）弱化成「旁白」：左竖线+淡色+略小字号，与 reply
+   *  正文拉开格式差（owner 2026-07-14:分不清哪些是正文哪些是 console 碎碎念）。 */
+  muted?: boolean;
 }) {
   const [showTs, setShowTs] = useState(false);
   return (
-    <div className="cursor-pointer" onClick={() => setShowTs((v) => !v)}>
+    <div
+      className={`cursor-pointer ${
+        muted
+          ? "border-l-2 border-base-content/15 pl-2.5 text-[13px] leading-relaxed text-base-content/60"
+          : ""
+      }`}
+      onClick={() => setShowTs((v) => !v)}
+    >
       {streamed ? (
         // 生长中的段也实时富文本（2026-07-14 owner「边输出边渲染」）：DOMD 只读
         // 一次 → 用 key 按内容长度强制重挂,每次 80ms 合批后重新解析整段。段落
@@ -398,6 +409,7 @@ function AssistantBody({
             text={seg.text}
             ts={seg.ts ?? m.ts}
             streamed={m.streamed && i === segs!.length - 1}
+            muted
           />
         ) : seg.kind === "reply" ? (
           <div key={i}>
@@ -423,7 +435,7 @@ function AssistantBody({
       )}
     </>
   ) : hasNarration ? (
-    <TextBlock text={m.content} ts={m.ts} streamed={m.streamed} />
+    <TextBlock text={m.content} ts={m.ts} streamed={m.streamed} muted />
   ) : null;
 
   return (
