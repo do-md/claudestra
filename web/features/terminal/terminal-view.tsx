@@ -55,6 +55,15 @@ export function TerminalView({
   // 画布只有 window 那么高,下方空白需要「有解释」而不是像没加载完）
   const [mirror, setMirror] = useState<{ cols: number; rows: number } | null>(null);
 
+  // 断连/结束时收起软键盘：xterm 隐藏 textarea 仍持焦点会让 iOS 键盘赖着不走,
+  // 且键盘弹着时点「重新连接」的首个 tap 会被 blur→键盘收起→布局重排吃掉
+  // （点了没反应,2026-07-13 真机截图）。
+  useEffect(() => {
+    if (status === "exited" || status === "error") {
+      (document.activeElement as HTMLElement | null)?.blur?.();
+    }
+  }, [status]);
+
   /** 上行：微批 + 串行链（字节序！）。ControlBar 也走这里。 */
   const queueInput = (data: string) => {
     if (!data) return;
@@ -415,9 +424,11 @@ export function TerminalView({
                 <span className="text-sm text-[#cdd6f4]/70">
                   {status === "exited" ? "终端会话已结束" : errMsg || "连接出错"}
                 </span>
+                {/* pointerup 而非 click：键盘尚未收完时布局还在重排,click 的
+                    press-release 配对会因元素位移被 iOS 判废,pointerup 不受影响 */}
                 <button
                   className="btn btn-sm"
-                  onClick={() => setConnectSeq((n) => n + 1)}
+                  onPointerUp={() => setConnectSeq((n) => n + 1)}
                 >
                   重新连接
                 </button>
