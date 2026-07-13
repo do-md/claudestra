@@ -463,7 +463,13 @@ export function TerminalView({
           style={{ touchAction: "none" }}
         />
         {status !== "connected" && (
-          <div className="absolute inset-0 grid place-items-center bg-[#1e1e2e]/70">
+          // onPointerDown preventDefault：断连遮罩区域内的任何触点都不许改焦点
+          // （否则点偏一点就聚焦到输入通道弹键盘,重连按钮跟着位移点不中,
+          // 2026-07-13 真机）;按钮走 pointerup,不受影响
+          <div
+            className="absolute inset-0 grid place-items-center bg-[#1e1e2e]/70"
+            onPointerDown={(e) => e.preventDefault()}
+          >
             {status === "connecting" && (
               <span className="flex items-center gap-2 text-sm text-[#cdd6f4]/70">
                 <span className="loading loading-spinner loading-sm" />
