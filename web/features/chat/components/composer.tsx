@@ -122,6 +122,22 @@ function RemoveBtn({ onClick }: { onClick: () => void }) {
   );
 }
 
+/** Slash 命令（bridge /skills 端点形状）。web 无 Discord 的 100 命令上限/描述截断。 */
+interface SlashCmd {
+  name: string;
+  invokeName: string;
+  description: string;
+  scope: string;
+  argHint?: string;
+}
+const SCOPE_LABEL: Record<string, string> = {
+  builtin: "内建",
+  native: "CC",
+  plugin: "插件",
+  user: "技能",
+  project: "项目",
+};
+
 export function Composer() {
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -144,6 +160,55 @@ export function Composer() {
     ctxTokens >= 170_000 &&
     ctxDismissedFor !== active &&
     (!reqAt || Date.now() - reqAt > 10 * 60_000);
+
+  // ── Slash 命令面板（owner 2026-07-14:skills 适配 web,比 Discord 强——
+  // 全量列表+即时模糊搜索+描述全文+按 agent 精准过滤）。输入以 "/" 开头
+  // (无换行)即弹;点选/Enter 填入,发送时 bridge 识别并 tmux 原生注入。──
+  const [skills, setSkills] = useState<SlashCmd[]>([]);
+  const skillsCacheRef = useRef<Record<string, SlashCmd[]>>({});
+  const [slashSel, setSlashSel] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  useEffect(() => {
+    if (!active) {
+      setSkills([]);
+      return;
+    }
+    const hit = skillsCacheRef.current[active];
+    if (hit) {
+      setSkills(hit);
+      return;
+    }
+    setSkills([]);
+    let dead = false;
+    fetch(`/api/chat/skills?agent=${encodeURIComponent(active)}`)
+      .then((r) => r.json())
+      .then((j: { commands?: SlashCmd[] }) => {
+        if (dead) return;
+        const cmds = Array.isArray(j.commands) ? j.commands : [];
+        skillsCacheRef.current[active] = cmds;
+        setSkills(cmds);
+      })
+      .catch(() => {});
+    return () => {
+      dead = true;
+    };
+  }, [active]);
+  useEffect(() => {
+    setSlashSel(0);
+    setSlashDismissed(false);
+  }, [text]);
+  const slashQ = text.startsWith("/") && !text.includes("\n") ? text.slice(1).toLowerCase() : null;
+  const slashItems =
+    slashQ !== null && skills.length
+      ? skills
+          .filter((c) => c.name.toLowerCase().includes(slashQ) || c.description.toLowerCase().includes(slashQ))
+          .slice(0, 40)
+      : [];
+  const slashOpen = !slashDismissed && slashItems.length > 0;
+  const pickSlash = (c: SlashCmd) => {
+    setText(`/${c.name} `);
+    taRef.current?.focus();
+  };
 
   const disabled = !active;
   const hasContent = !!text.trim() || files.length > 0;
@@ -388,6 +453,29 @@ export function Composer() {
     typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // 命令面板打开时接管导航键（桌面）：↑↓ 移动、Enter/Tab 填入、Esc 关闭
+    if (slashOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashSel((v) => Math.min(v + 1, slashItems.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashSel((v) => Math.max(v - 1, 0));
+        return;
+      }
+      if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+        e.preventDefault();
+        pickSlash(slashItems[Math.min(slashSel, slashItems.length - 1)]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSlashDismissed(true);
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey && !coarse) {
       e.preventDefault();
       submit();
@@ -424,6 +512,35 @@ export function Composer() {
             >
               ✕
             </button>
+          </div>
+        )}
+
+        {/* Slash 命令面板:输入 / 即弹,即时模糊过滤。onPointerDown preventDefault
+            防抢走 textarea 焦点收键盘(control-bar 同款) */}
+        {slashOpen && (
+          <div className="mb-1.5 max-h-[42dvh] touch-pan-y overflow-y-auto overscroll-contain rounded-xl border border-base-content/10 bg-base-100 shadow-lg">
+            {slashItems.map((c, i) => (
+              <button
+                key={c.name}
+                type="button"
+                className={`flex w-full items-baseline gap-2 px-3.5 py-2 text-left ${
+                  i === slashSel ? "bg-base-200" : ""
+                }`}
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => pickSlash(c)}
+              >
+                <span className="shrink-0 font-mono text-[13.5px] font-semibold">/{c.name}</span>
+                {c.argHint && (
+                  <span className="shrink-0 font-mono text-[11px] text-base-content/35">{c.argHint}</span>
+                )}
+                <span className="min-w-0 flex-1 truncate text-xs text-base-content/50">
+                  {c.description}
+                </span>
+                <span className="shrink-0 rounded bg-base-200 px-1.5 py-0.5 text-[10px] text-base-content/45">
+                  {SCOPE_LABEL[c.scope] || c.scope}
+                </span>
+              </button>
+            ))}
           </div>
         )}
         <div

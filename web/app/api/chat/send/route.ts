@@ -53,12 +53,13 @@ export async function POST(request: Request) {
   }
 
   try {
-    await bridgePost(
+    const r = await bridgePost<{ ok: boolean; slash?: boolean; ccText?: string }>(
       `/agents/${encodeURIComponent(apiAgentName(agent))}/messages`,
       { text: finalText, wait: 0 },
       { timeoutMs: 15_000 }
     );
-    return NextResponse.json({ data: { ok: true } });
+    // slash: bridge 走了 tmux 直通（CC 原生解释,无常规回合）——前端据此不进「正在回复」态
+    return NextResponse.json({ data: { ok: true, slash: !!r.slash, ccText: r.ccText } });
   } catch (e) {
     return NextResponse.json(
       { error: `发送失败: ${(e as Error).message}` },

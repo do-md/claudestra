@@ -162,6 +162,58 @@ export function isProjectSkillForOtherAgent(discordName: string, agentName: stri
   return null;
 }
 
+/**
+ * [fork] Web 命令面板数据源：某 agent 可用的全部命令
+ * （builtin + 全局 skill + 该 agent 的项目 skill），去重优先级同
+ * allRegistrableCommands。Web 没有 Discord 的 100 命令上限/描述截断，
+ * 全量返回,前端做即时模糊搜索。
+ */
+export interface AgentCommandInfo {
+  /** 用户输入形态（discordName，`:` → `-`） */
+  name: string;
+  /** CC 里真正的调用名 */
+  invokeName: string;
+  description: string;
+  scope: string;
+  /** builtin 的参数提示（如 "<action> [args]"） */
+  argHint?: string;
+}
+export function commandsForAgent(agentName: string | null): AgentCommandInfo[] {
+  const seen = new Set<string>();
+  const out: AgentCommandInfo[] = [];
+  for (const cmd of state.builtins.values()) {
+    if (seen.has(cmd.name)) continue;
+    seen.add(cmd.name);
+    out.push({
+      name: cmd.name,
+      invokeName: cmd.invokeName,
+      description: cmd.description,
+      scope: "builtin",
+      argHint: cmd.options?.length
+        ? cmd.options.map((o) => (o.required ? `<${o.name}>` : `[${o.name}]`)).join(" ")
+        : undefined,
+    });
+  }
+  const srcs: Array<Iterable<SkillDef>> = [
+    state.nativeSkills.values(),
+    state.pluginSkills.values(),
+    state.userSkills.values(),
+  ];
+  if (agentName) {
+    const proj = state.projectSkills.get(agentName);
+    if (proj) srcs.push(proj.values());
+  }
+  for (const src of srcs) {
+    for (const s of src) {
+      if (seen.has(s.discordName)) continue;
+      seen.add(s.discordName);
+      out.push({ name: s.discordName, invokeName: s.invokeName, description: s.description, scope: s.scope });
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
 /** 快速 dump（调试用） */
 export function debugSnapshot() {
   return {

@@ -42,6 +42,7 @@ import {
 import { stopTyping } from "./components.js";
 import { clearSafetyTimer } from "./discord-adapter.js";
 import { recordMetric } from "../lib/metrics.js";
+import { commandsForAgent, resolveInvocation, isProjectSkillForOtherAgent } from "./slash-registry.js";
 import { projectsSlug } from "../lib/jsonl-cost.js";
 
 // [fork] master 不在 registry，从 env 读其控制频道 id（各端点的 master 特判用）
@@ -616,6 +617,34 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     }
     waitSec = Math.min(Math.max(waitSec, 0), 300);
 
+    // [fork] Web slash 直通：文本形如 "/cmd [args]" 且命中注册表 → tmux 字面注入
+    // （CC 原生解释，与 Discord slash 同款 tmuxSendLine 路径）。未命中注册表的
+    // "/xxx" 落回普通消息——用户可能真想发以 / 开头的文本。TUI 类命令没有回合，
+    // 响应带 slash:true 让前端不进「正在回复」态。
+    const slashM = attachments.length === 0 ? text.trim().match(/^\/([\w:-]+)(?:\s+([\s\S]+))?$/) : null;
+    if (slashM) {
+      const regName = agent.name === "master" ? null : agent.name;
+      const resolved = resolveInvocation(slashM[1], regName, { args: slashM[2] || "" });
+      if (resolved.ok) {
+        const win = agent.name === "master" ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
+        try {
+          await tmuxSendLine(win, resolved.ccText);
+        } catch (e) {
+          return apiJson(500, { ok: false, error: `tmux 注入失败: ${(e as Error).message}` });
+        }
+        const tn = principal.name || tokenId;
+        deps.mirrorApiExchange({ kind: "api", tokenId, name: tn }, agent.channelId, `[🌐 API←${tn}] ${text}`).catch(() => {});
+        recordMetric("api_slash", { channelId: agent.channelId, agent: agent.name, meta: { cmd: slashM[1] } });
+        console.log(`⚡ [api] slash 注入 ${agent.name}: ${resolved.ccText}`);
+        return apiJson(202, { ok: true, accepted: true, slash: true, ccText: resolved.ccText, agent: agent.name });
+      }
+      const other = isProjectSkillForOtherAgent(slashM[1], regName);
+      if (other) {
+        return apiJson(409, { ok: false, error: `/${slashM[1]} 是 ${other.replace(/^agent-/, "")} 的项目技能，当前 agent 不可用` });
+      }
+      // 不是已知命令 → 继续按普通消息投递
+    }
+
     const tokenName = principal.name || tokenId;
     const threadId = newThreadId();
     const env: Envelope = {
@@ -689,6 +718,20 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
   //   POST /agents                       create（仅全权 token）
   //   POST /agents/:name/kill|restart    生命周期（仅全权 token）
   // ============================================================
+
+  // [fork] GET /api/v1/agents/:name/skills —— Web 命令面板数据源：该 agent
+  // 可用的全部 slash 命令（builtin + 全局 skill + 本 agent 项目 skill）。
+  const skillsMatch = path.match(/^\/agents\/([^/]+)\/skills$/);
+  if (skillsMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(skillsMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    const commands = commandsForAgent(agent.name === "master" ? null : agent.name);
+    return apiJson(200, { ok: true, agent: agent.name, commands });
+  }
 
   // [fork] POST /api/v1/agents/:name/interrupt —— 复刻 Discord ⚡ 打断按钮
   const interruptMatch = path.match(/^\/agents\/([^/]+)\/interrupt$/);

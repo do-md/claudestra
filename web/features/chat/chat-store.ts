@@ -518,7 +518,26 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           });
         });
       }
-      // 成功：输出经已打开的持久流回来，这里不读响应体
+      else {
+        // slash 直通（/compact、/context 这类 CC 原生命令走 tmux 注入）：没有常规
+        // 回合,不会有 done 事件——立即解除「正在回复」,并插一条系统线告知已注入。
+        const j = (await res.json().catch(() => ({}))) as {
+          data?: { slash?: boolean; ccText?: string };
+        };
+        if (j.data?.slash) {
+          this.produce((s) => {
+            s.streaming = false;
+            s.awaitingChunk = false;
+            s.messages.push({
+              id: this.nextId(),
+              role: "system",
+              content: `⚡ 已注入 ${j.data?.ccText || "命令"} — 由 Claude Code 原生执行`,
+              ts: new Date().toISOString(),
+            });
+          });
+        }
+        // 普通消息：输出经已打开的持久流回来
+      }
     } catch (e) {
       this.produce((s) => {
         s.streaming = false;
