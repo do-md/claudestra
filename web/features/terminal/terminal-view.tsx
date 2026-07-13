@@ -87,7 +87,18 @@ export function TerminalView({
     setErrMsg("");
     termIdRef.current = null;
 
+    // [mobile] 初始就按容器宽估 cols（xterm 默认 80×24 在手机上横向溢出一半），
+    // 行数按视口粗估——连上后 open 帧会立刻校正成 window 实际尺寸。
+    let initCols: number | undefined;
+    let initRows: number | undefined;
+    if (mobile) {
+      const w = container.clientWidth || 360;
+      const h = (window.visualViewport?.height ?? window.innerHeight) - 230;
+      initCols = Math.max(20, Math.floor((w - 2) / (13 * 0.62)));
+      initRows = Math.max(8, Math.floor(h / (13 * 1.25)));
+    }
     const term = new Terminal({
+      ...(mobile ? { cols: initCols, rows: initRows } : {}),
       cursorBlink: true,
       scrollback: 2000,
       fontSize: 13,
@@ -125,9 +136,36 @@ export function TerminalView({
       })();
     }
 
-    fit.fit();
+    // [mobile] 不用 fit：PTY 尺寸由 tmux window 决定（完整镜像），手机只负责
+    // 显示缩放——fit 会把 rows 撑到视口高，被后端 clamp 后画布上方 23 行、
+    // 下方半屏留白（2026-07-13 真机「大量留白」）。桌面 modal 照旧 fit。
+    if (!mobile) fit.fit();
     const cols = term.cols;
     const rows = term.rows;
+
+    // [mobile] 字号自适应：window 的完整列数正好铺满容器宽（iTerm 镜像的
+    // window 常比手机视口宽——缩字号而不是裁内容）。measureText 估 cell 宽，
+    // floor 保守取整；rAF 后校验一轮，字体舍入导致溢出就再缩 1px。
+    const adaptFontSize = (cc: number) => {
+      if (!mobile || !cc) return;
+      const avail = container.clientWidth;
+      if (!avail) return;
+      const fs0 = term.options.fontSize ?? 13;
+      const ctx = document.createElement("canvas").getContext("2d");
+      if (!ctx) return;
+      ctx.font = `${fs0}px ${term.options.fontFamily}`;
+      const ratio = ctx.measureText("W").width / fs0;
+      if (!ratio || !isFinite(ratio)) return;
+      const fs = Math.max(8, Math.min(16, Math.floor((avail - 2) / cc / ratio)));
+      if (fs !== fs0) term.options.fontSize = fs;
+      requestAnimationFrame(() => {
+        if (disposed) return;
+        const screen = container.querySelector(".xterm-screen") as HTMLElement | null;
+        if (screen && screen.offsetWidth > avail && (term.options.fontSize ?? 8) > 8) {
+          term.options.fontSize = (term.options.fontSize ?? 9) - 1;
+        }
+      });
+    };
 
     term.onData((data) => queueInputRef.current(data));
     term.onBinary((data) => queueInputRef.current(data));
@@ -176,7 +214,7 @@ export function TerminalView({
               .filter((l) => l.startsWith("data:"))
               .map((l) => l.slice(5).trimStart());
             if (dataLines.length === 0) continue; // 心跳注释
-            let evt: { t: string; d?: string; id?: string; cols?: number; rows?: number };
+            let evt: { t: string; d?: string; id?: string; cols?: number; rows?: number; wcols?: number; wrows?: number };
             try {
               evt = JSON.parse(dataLines.join("\n"));
             } catch {
@@ -187,9 +225,32 @@ export function TerminalView({
             } else if (evt.t === "open" && evt.id) {
               termIdRef.current = evt.id;
               // 后端把 PTY clamp 到 tmux window 实际尺寸（被 iTerm 钳住时 < 视口）
-              // ——xterm 同步到实际值,视口=window 就没有 tmux 填充点区域,
-              // 空余部分留终端背景色(比一屏点好看多了)。
-              if (evt.cols && evt.rows && (term.cols !== evt.cols || term.rows !== evt.rows)) {
+              // ——xterm 同步到实际值,视口=window 就没有 tmux 填充点区域。
+              // [mobile] 完整镜像：window 比初始请求宽时把 PTY 提到 window 尺寸
+              // （wcols/wrows），字号按屏宽自适应——不裁内容、不残留半屏空白。
+              const wc = evt.wcols ?? evt.cols;
+              const wr = evt.wrows ?? evt.rows;
+              if (mobile && evt.cols && evt.rows && wc && wr) {
+                const apply = (c: number, r: number) => {
+                  if (disposed) return;
+                  if (term.cols !== c || term.rows !== r) term.resize(c, r);
+                  lastCols = c;
+                  lastRows = r;
+                  adaptFontSize(c);
+                };
+                if (wc !== evt.cols || wr !== evt.rows) {
+                  fetch("/api/terminal/resize", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ id: evt.id, cols: wc, rows: wr }),
+                  })
+                    .then((r) => r.json())
+                    .then((j: { cols?: number; rows?: number }) => apply(j.cols ?? wc, j.rows ?? wr))
+                    .catch(() => apply(evt.cols!, evt.rows!));
+                } else {
+                  apply(evt.cols, evt.rows);
+                }
+              } else if (evt.cols && evt.rows && (term.cols !== evt.cols || term.rows !== evt.rows)) {
                 term.resize(evt.cols, evt.rows);
               }
               if (!disposed) setStatus("connected");
@@ -217,6 +278,12 @@ export function TerminalView({
       resizeTimer = window.setTimeout(() => {
         resizeTimer = null;
         if (disposed) return;
+        // [mobile] PTY 尺寸 = window 尺寸（不跟手机容器走）；容器宽变
+        // （旋转/字号自适应回流）只需重算字号，幂等收敛不 POST。
+        if (mobile) {
+          adaptFontSize(term.cols);
+          return;
+        }
         try {
           fit.fit();
         } catch {
@@ -309,12 +376,15 @@ export function TerminalView({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-[#1e1e2e]">
-      <div className="relative min-h-0 flex-1 px-2 pt-2">
+      {/* [mobile] 容器高 = 画布自然高（window 行数 × 行高），ControlBar 紧贴
+          其下，剩余空白由底部 spacer 沉底——修「画布 23 行 + 控制条钉屏底，
+          中间半屏留白」；且总高变小后 iOS 键盘弹出多数不再需要平移页面。 */}
+      <div className={mobile ? "relative shrink-0 px-2 pt-2" : "relative min-h-0 flex-1 px-2 pt-2"}>
         {/* touchAction:none —— 触摸手势全归我们处理（合成 wheel 滚动），
             iOS 才不会在 preventDefault 前先把首个 move 吃成原生滚动/橡皮筋 */}
         <div
           ref={containerRef}
-          className="h-full w-full"
+          className={mobile ? "w-full" : "h-full w-full"}
           style={{ touchAction: "none" }}
         />
         {status !== "connected" && (
@@ -347,6 +417,7 @@ export function TerminalView({
         disabled={status !== "connected"}
         mobile={mobile}
       />
+      {mobile && <div className="min-h-0 flex-1" />}
     </div>
   );
 }

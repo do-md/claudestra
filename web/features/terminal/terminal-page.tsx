@@ -41,14 +41,20 @@ export function TerminalPage({
     const vv = window.visualViewport;
     if (!vv) return;
     const update = () => {
-      const keyboardUp = window.innerHeight - vv.height > 40;
+      // iOS 露出 focused input 时有两条路：平移 visualViewport（offsetTop>0）
+      // 或直接滚 document（scrollY>0，fixed 层跟着被顶出屏）。document 滚动
+      // 强制归零（页面本无可滚内容），vv 平移用 offsetTop 钉层补偿。
+      if ((window.scrollY || 0) > 0) window.scrollTo(0, 0);
+      const keyboardUp = window.innerHeight - vv.height > 40 || vv.offsetTop > 1;
       setVp(keyboardUp ? { h: vv.height, top: vv.offsetTop } : null);
     };
     vv.addEventListener("resize", update);
     vv.addEventListener("scroll", update);
+    window.addEventListener("scroll", update);
     return () => {
       vv.removeEventListener("resize", update);
       vv.removeEventListener("scroll", update);
+      window.removeEventListener("scroll", update);
     };
   }, []);
 

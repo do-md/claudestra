@@ -172,11 +172,14 @@ export async function handleTerminalApi(req: Request, url: URL): Promise<Respons
     if (!cols || !rows) return json(400, { ok: false, error: "missing/invalid cols,rows" });
     await tmuxRun(["resize-window", "-t", `${sess.viewerSession}:9`, "-x", String(cols), "-y", String(rows)]).catch(() => {});
     let effCols = cols, effRows = rows;
+    let winCols = cols, winRows = rows;
     const actual = await tmuxRun(["display-message", "-p", "-t", `${sess.viewerSession}:9`, "#{window_width}x#{window_height}"]);
     const m = /^(\d+)x(\d+)$/.exec(actual.out.trim());
     if (actual.code === 0 && m) {
-      effCols = Math.min(cols, parseInt(m[1], 10));
-      effRows = Math.min(rows, parseInt(m[2], 10));
+      winCols = parseInt(m[1], 10);
+      winRows = parseInt(m[2], 10);
+      effCols = Math.min(cols, winCols);
+      effRows = Math.min(rows, winRows);
     }
     try {
       sess.term.resize(effCols, effRows);
@@ -185,7 +188,9 @@ export async function handleTerminalApi(req: Request, url: URL): Promise<Respons
     } catch (e) {
       return json(500, { ok: false, error: `resize failed: ${(e as Error).message}` });
     }
-    return json(200, { ok: true, cols: effCols, rows: effRows });
+    // wcols/wrows = window 实际尺寸——移动端用它做「完整镜像」目标（PTY 提到
+    // window 尺寸,字号再按屏宽自适应,不然 window 比手机视口宽时内容被裁）
+    return json(200, { ok: true, cols: effCols, rows: effRows, wcols: winCols, wrows: winRows });
   }
 
   return null;
@@ -260,11 +265,14 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
   await tmuxRun(["resize-window", "-t", `${viewerSession}:9`, "-x", String(cols), "-y", String(rows)]);
   const actual = await tmuxRun(["display-message", "-p", "-t", `${viewerSession}:9`, "#{window_width}x#{window_height}"]);
   let effCols = cols, effRows = rows;
+  let winCols = cols, winRows = rows;
   {
     const m = /^(\d+)x(\d+)$/.exec(actual.out.trim());
     if (actual.code === 0 && m) {
-      effCols = Math.min(cols, parseInt(m[1], 10));
-      effRows = Math.min(rows, parseInt(m[2], 10));
+      winCols = parseInt(m[1], 10);
+      winRows = parseInt(m[2], 10);
+      effCols = Math.min(cols, winCols);
+      effRows = Math.min(rows, winRows);
     }
   }
   // 滚动支持：CC TUI 在 alternate screen（无滚动缓冲），滚轮要靠 tmux 的
@@ -341,7 +349,8 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
 
       // 首包立即 flush（Bun idleTimeout 坑）+ 告知前端 termId（input/resize 用）
       send(`: connected\n\n`);
-      send(`data: {"t":"open","id":"${termId}","cols":${effCols},"rows":${effRows}}\n\n`);
+      // wcols/wrows = window 实际尺寸——移动端据此把 PTY 提到 window 大小做完整镜像
+      send(`data: {"t":"open","id":"${termId}","cols":${effCols},"rows":${effRows},"wcols":${winCols},"wrows":${winRows}}\n\n`);
       ping = setInterval(() => send(`: ping\n\n`), 5_000);
 
       // PTY 进程退出（window 被 kill / tmux server 重启）→ 通知前端并收尾
