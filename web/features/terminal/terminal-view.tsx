@@ -349,9 +349,45 @@ export function TerminalView({
     //    手指下拉 = 看更早历史（wheel up），上推 = 回到最新。[fork]
     const screenEl = container.querySelector(".xterm-screen") as HTMLElement | null;
     let touchY: number | null = null;
+    let lastMoveTs = 0;
+    let velocity = 0; // px/ms（平滑估计，touchend 后惯性滑行用）
+    let pendingDy = 0; // rAF 帧内合并的手指位移
+    let wheelRaf: number | null = null;
+    let inertiaRaf: number | null = null;
     const WHEEL_FACTOR = 2.2; // 手指位移 → 滚轮像素放大系数（真机手感可调）
+    const dispatchWheel = (dyPx: number) => {
+      (screenEl ?? container).dispatchEvent(
+        new WheelEvent("wheel", {
+          deltaY: -dyPx * WHEEL_FACTOR, // 下拉(dy>0) → deltaY<0 → wheel up → 看更早
+          deltaMode: 0, // DOM_DELTA_PIXEL
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+    };
+    // 帧内合并：touchmove 在 iOS 上每秒 60-120 发，逐发合成滚轮 = 每步一个
+    // 「上行→tmux 重绘→SSE 回显」远端往返，快滑一屏几十个来回，渲染跟不上
+    // 手指（2026-07-13 真机「滑动卡卡的」）。一帧最多一发、位移累积，xterm 把
+    // 大 delta 一次编码成整批滚轮报告 → 一个 POST 一次重绘。
+    const flushWheel = () => {
+      wheelRaf = null;
+      if (pendingDy !== 0) {
+        const d = pendingDy;
+        pendingDy = 0;
+        dispatchWheel(d);
+      }
+    };
+    const stopInertia = () => {
+      if (inertiaRaf !== null) {
+        cancelAnimationFrame(inertiaRaf);
+        inertiaRaf = null;
+      }
+    };
     const onTouchStart = (e: TouchEvent) => {
+      stopInertia();
       touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
+      velocity = 0;
+      lastMoveTs = e.timeStamp;
     };
     const onTouchMove = (e: TouchEvent) => {
       if (touchY === null || e.touches.length !== 1) return;
@@ -360,17 +396,30 @@ export function TerminalView({
       touchY = y;
       if (dy === 0) return;
       e.preventDefault(); // 吃掉原生滚动/橡皮筋，交给 xterm
-      (screenEl ?? container).dispatchEvent(
-        new WheelEvent("wheel", {
-          deltaY: -dy * WHEEL_FACTOR, // 下拉(dy>0) → deltaY<0 → wheel up → 看更早
-          deltaMode: 0, // DOM_DELTA_PIXEL
-          bubbles: true,
-          cancelable: true,
-        })
-      );
+      const dt = Math.max(1, e.timeStamp - lastMoveTs);
+      lastMoveTs = e.timeStamp;
+      velocity = 0.8 * velocity + 0.2 * (dy / dt);
+      pendingDy += dy;
+      if (wheelRaf === null) wheelRaf = requestAnimationFrame(flushWheel);
     };
     const onTouchEnd = () => {
       touchY = null;
+      // 轻惯性：按抬手速度衰减滑行——远端回显本就有 RTT，没有惯性会
+      // 「手一停画面立刻钉死」，显得格外卡。上限防 copy-mode 滚飞。
+      let v = velocity * 16; // px/帧（≈16ms）
+      velocity = 0;
+      if (Math.abs(v) < 4) return;
+      const MAX_GLIDE = 2000;
+      let glided = 0;
+      const step = () => {
+        inertiaRaf = null;
+        v *= 0.93;
+        if (Math.abs(v) < 2 || glided > MAX_GLIDE) return;
+        glided += Math.abs(v);
+        dispatchWheel(v);
+        inertiaRaf = requestAnimationFrame(step);
+      };
+      inertiaRaf = requestAnimationFrame(step);
     };
     container.addEventListener("touchstart", onTouchStart, { passive: true });
     container.addEventListener("touchmove", onTouchMove, { passive: false });
@@ -385,6 +434,8 @@ export function TerminalView({
       container.removeEventListener("touchmove", onTouchMove);
       container.removeEventListener("touchend", onTouchEnd);
       container.removeEventListener("touchcancel", onTouchEnd);
+      if (wheelRaf !== null) cancelAnimationFrame(wheelRaf);
+      stopInertia();
       if (resizeTimer !== null) clearTimeout(resizeTimer);
       if (flushTimerRef.current !== null) {
         clearTimeout(flushTimerRef.current);
