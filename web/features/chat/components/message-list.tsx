@@ -59,6 +59,8 @@ function TsBadge({ ts, shown }: { ts?: string; shown: boolean }) {
 }
 
 /** 流式期间的工具行：紧凑单行，最后一个转圈。点击显示秒级时间。
+ *  带边框卡片样式与定稿态/bg 任务卡统一——无边框会和正文混在一起
+ *  （2026-07-13 owner 拍板）。
  *  memo：immer 结构共享下旧 tool 对象引用稳定，流式长回合几百张工具卡
  *  只有最新一张需要重渲染（2026-07-13 性能刀）。 */
 const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: ToolCallView; active: boolean }) {
@@ -66,7 +68,7 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
   const [showTs, setShowTs] = useState(false);
   return (
     <div
-      className="flex cursor-pointer items-center gap-1.5 py-0.5 font-mono text-xs"
+      className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-info/25 bg-info/[0.06] px-2.5 py-1.5 font-mono text-xs"
       onClick={() => setShowTs((v) => !v)}
     >
       {active && tool.state === "running" ? (
@@ -88,15 +90,14 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
 });
 
 /** 历史 / 定稿后的工具行：可展开看完整摘要。
- *  外观与流式的 ActiveToolRow 同款紧凑行（无边框）——此前定稿带边框卡片，
- *  回合一结束同一批工具行样式突变,被用户当成 bug（2026-07-13）；展开的
- *  详情区给淡背景区分。 */
+ *  带边框卡片样式,与流式态/bg 任务卡统一（2026-07-13 owner 拍板:无边框
+ *  和正文混在一起;此前「去边框统一」方向反了）。 */
 const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallView }) {
   const summary = cleanSummary(tool.summary);
   return (
-    <details className="group [&>summary]:list-none">
-      <summary className="flex cursor-pointer select-none items-center gap-1.5 py-0.5 font-mono text-xs">
-        <span className="shrink-0 opacity-60">
+    <details className="group rounded-lg border border-info/25 bg-info/[0.06] [&>summary]:list-none">
+      <summary className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs">
+        <span className="shrink-0 opacity-70">
           {tool.state === "error" ? "❌" : toolIcon(tool.name)}
         </span>
         <span className="font-semibold text-info">{tool.name}</span>
@@ -109,7 +110,7 @@ const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallVi
           ›
         </span>
       </summary>
-      <div className="mb-1 mt-0.5 rounded-lg bg-base-content/[0.04] px-2.5 py-2">
+      <div className="px-2.5 pb-2 pt-0.5">
         {tool.ts && (
           <div className="pb-1 font-mono text-[10px] tabular-nums opacity-40">
             🕐 {fmtTs(tool.ts)}
