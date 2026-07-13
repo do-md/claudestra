@@ -1,6 +1,6 @@
 "use client";
 import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { useChatStore } from "../chat-store";
+import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { ChatMessage, ChatAttachmentView, ToolCallView, AssistantSegment } from "../type";
 import { Domd } from "@/components/domd";
 import { PermissionCard } from "./permission-card";
@@ -396,7 +396,9 @@ export function MessageList() {
   const awaiting = useChatStore((s) => s.state.awaitingChunk);
   const streaming = useChatStore((s) => s.state.streaming);
   const loadingHistory = useChatStore((s) => s.state.loadingHistory);
+  const historyError = useChatStore((s) => s.state.historyError);
   const active = useChatStore((s) => s.state.activeAgent);
+  const store = useChatStoreApi();
   const pendingPermission = useChatStore((s) => s.state.pendingPermission);
   const pendingAsk = useChatStore((s) => s.state.pendingAsk);
   const bgTaskCount = useChatStore((s) => s.state.bgTasks.length);
@@ -432,6 +434,10 @@ export function MessageList() {
   }, [extraVisible]);
 
   useEffect(() => {
+    // 用户上翻阅读时不强拉回底（follow=false）——之前每来一条新消息/卡片都
+    // smooth 滚底并强置 follow=true，流式期间用户「滑不动」的元凶之一
+    // （2026-07-13 真机）。awaiting=true 是自己刚发送 → 仍然滚底。
+    if (!followRef.current && !awaiting) return;
     const el = scrollerRef.current;
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     followRef.current = true;
@@ -441,12 +447,20 @@ export function MessageList() {
     const el = scrollerRef.current;
     const inner = el?.firstElementChild;
     if (!el || !inner) return;
+    let lastTop = el.scrollTop;
     const onScroll = () => {
-      followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+      // 向上滑立即退出吸底（不等离底 >90px）——流式内容持续长高时，90px 缓冲区
+      // 内的每次 resize 吸底都会把刚起步的上滑手势拽回去，手感就是「滑不动」
+      const up = el.scrollTop < lastTop;
+      lastTop = el.scrollTop;
+      followRef.current = !up && el.scrollHeight - el.scrollTop - el.clientHeight < 90;
     };
     el.addEventListener("scroll", onScroll);
     const ro = new ResizeObserver(() => {
-      if (followRef.current) el.scrollTop = el.scrollHeight;
+      if (followRef.current) {
+        el.scrollTop = el.scrollHeight;
+        lastTop = el.scrollTop; // 吸底自身的位移不算「用户上滑」
+      }
     });
     ro.observe(inner);
     return () => {
@@ -477,7 +491,21 @@ export function MessageList() {
   const hiddenCount = messages.length - visible.length;
 
   return (
-    <div ref={scrollerRef} className="flex-1 overflow-y-auto">
+    // touch-pan-y + overscroll-contain：到边界时滚动链穿透到不可滚的应用壳被
+    // 橡皮筋吃手势（同 sidebar 修法）。onTouchStart 收键盘：iOS 在 transform
+    // 祖先下滚动聚焦中的输入框，光标会脱离输入框画在消息区里（2026-07-13 截图）
+    // ——触摸消息区即 blur，与主流聊天 App 行为一致。
+    <div
+      ref={scrollerRef}
+      className="flex-1 touch-pan-y overflow-y-auto overscroll-contain"
+      style={{ WebkitOverflowScrolling: "touch" }}
+      onTouchStart={() => {
+        const ae = document.activeElement;
+        if (ae instanceof HTMLElement && (ae.tagName === "TEXTAREA" || ae.tagName === "INPUT")) {
+          ae.blur();
+        }
+      }}
+    >
       {/* 横向留白对齐 claude-os thread（px-7=28px + 居中限宽），手机端稍收到 24px，
           原 px-4(16px) 太满不透气（owner 反馈）。滚动条落在最外层边缘更干净。 */}
       <div className="mx-auto flex max-w-3xl flex-col px-6 pb-4 pt-6 sm:px-7">
@@ -487,7 +515,15 @@ export function MessageList() {
             加载历史消息…
           </div>
         )}
-        {!loadingHistory && messages.length === 0 && (
+        {!loadingHistory && messages.length === 0 && historyError && (
+          <div className="flex flex-col items-center gap-2 py-8 text-sm opacity-60">
+            <span>历史加载失败</span>
+            <button className="btn btn-sm" onClick={() => store.reloadHistory()}>
+              重试
+            </button>
+          </div>
+        )}
+        {!loadingHistory && messages.length === 0 && !historyError && (
           <div className="py-8 text-center text-sm opacity-40">
             向 {active} 发送第一条消息
           </div>

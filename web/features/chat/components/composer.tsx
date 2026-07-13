@@ -151,9 +151,13 @@ export function Composer() {
     }
   };
 
+  // 触屏设备（pointer: coarse）：Enter/换行键 = 换行，发送只走按钮——手机键盘的
+  // 「换行」键就该换行（2026-07-13 owner）。桌面保持 Enter 发送、Shift+Enter 换行。
+  const coarse =
+    typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Enter 发送，Shift+Enter 换行
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && !coarse) {
       e.preventDefault();
       submit();
     }
@@ -214,8 +218,12 @@ export function Composer() {
               disabled
                 ? "先选择一个会话…"
                 : streaming
-                  ? "继续输入，随时插话…（Enter 发送）"
-                  : `发消息给 ${active}（Enter 发送）`
+                  ? coarse
+                    ? "继续输入，随时插话…"
+                    : "继续输入，随时插话…（Enter 发送）"
+                  : coarse
+                    ? `发消息给 ${active}`
+                    : `发消息给 ${active}（Enter 发送）`
             }
             value={text}
             disabled={disabled}

@@ -27,6 +27,8 @@ interface ChatState {
   /** agents 首拉是否已完成（成败均置 true）。false = 入场期，Splash 在场，
    *  侧栏不许显示「暂无会话」（SSR 首帧就渲染空态是 2026-07-13 的观感 bug）。 */
   agentsReady: boolean;
+  /** 历史加载失败且当前无内容可显示 → 渲染「加载失败·重试」而非空会话。 */
+  historyError: boolean;
   /** 当前打开的 agent 名（""=未选） */
   activeAgent: string;
   messages: ChatMessage[];
@@ -82,6 +84,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       activeAgent: "",
       messages: [],
       loadingHistory: false,
+      historyError: false,
       streaming: false,
       awaitingChunk: false,
       pendingPermission: null,
@@ -235,6 +238,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       // 有缓存=先秒开上次那份（无 loading 闪烁），拉回最新后整体替换
       s.messages = cached ?? [];
       s.loadingHistory = !cached;
+      s.historyError = false;
       s.streaming = false;
       s.awaitingChunk = false;
       // 交互卡是 per-session 的：切走先清空，新流连上后 bridge 会 replay 当前 pending。
@@ -261,27 +265,42 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     this.produce((s) => {
       s.messages = [];
       s.loadingHistory = true;
+      s.historyError = false;
     });
     await this.loadMessages(name, gen);
   }
 
-  /** 拉某 agent 的历史消息（读 CC session jsonl）。gen 守卫防切换竞态。 */
-  private async loadMessages(name: string, gen: number) {
+  /** 拉某 agent 的历史消息（读 CC session jsonl）。gen 守卫防切换竞态。
+   *  失败（Bridge 限流 429→502 等）**不清空当前视图**：有缓存快照就继续显示，
+   *  什么都没有才标 historyError（渲染「加载失败·重试」而不是空会话——
+   *  2026-07-13「切回来完全没有聊天记录」）。失败自动重试一次（1.5s 后）。 */
+  private async loadMessages(name: string, gen: number, attempt = 0) {
     try {
       const res = await fetch(
         `/api/chat/history?agent=${encodeURIComponent(name)}`
       );
       if (res.status === 401) return this.gotoLogin();
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = (await res.json()) as { data?: ChatMessage[] };
       if (gen !== this.openGen) return; // 已切走，丢弃
       this.produce((s) => {
         s.messages = json.data ?? [];
         s.loadingHistory = false;
+        s.historyError = false;
       });
     } catch {
       if (gen !== this.openGen) return;
+      if (attempt < 1) {
+        // 瞬时失败（限流窗口/竞态）自动重试一次；保持 loading 态不闪空
+        setTimeout(() => {
+          if (gen === this.openGen) void this.loadMessages(name, gen, attempt + 1);
+        }, 1500);
+        return;
+      }
       this.produce((s) => {
         s.loadingHistory = false;
+        // 有缓存快照在显示就不打扰；空视图才亮错误态
+        s.historyError = s.messages.length === 0;
       });
     }
   }
