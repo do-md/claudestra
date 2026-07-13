@@ -25,6 +25,25 @@ function PaperclipIcon() {
   );
 }
 
+function MicIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" x2="12" y1="19" y2="22" />
+    </svg>
+  );
+}
+
 function SendIcon() {
   return (
     <svg
@@ -150,6 +169,72 @@ export function Composer() {
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, active]);
+
+  // ── 语音输入（2026-07-14 owner：应用内录音 → Groq 转写,根治输入法跳 App）──
+  const [recState, setRecState] = useState<"idle" | "recording" | "busy">("idle");
+  const [recErr, setRecErr] = useState("");
+  const recRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const flashRecErr = (msg: string) => {
+    setRecErr(msg);
+    setTimeout(() => setRecErr(""), 4000);
+  };
+  const toggleRec = async () => {
+    if (recState === "busy") return;
+    if (recState === "recording") {
+      recRef.current?.stop(); // onstop 里收尾
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // iOS Safari 只支持 mp4/AAC;桌面 Chrome 用 webm/opus
+      const mime =
+        ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find((t) =>
+          typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(t)
+        ) || "";
+      const mr = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      chunksRef.current = [];
+      mr.ondataavailable = (e) => {
+        if (e.data.size) chunksRef.current.push(e.data);
+      };
+      mr.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setRecState("busy");
+        try {
+          const type = mr.mimeType || "audio/mp4";
+          const blob = new Blob(chunksRef.current, { type });
+          if (blob.size < 1000) return; // 误触的空录音不上传
+          const fd = new FormData();
+          fd.append("audio", blob, `rec.${type.includes("mp4") ? "m4a" : "webm"}`);
+          const res = await fetch("/api/chat/transcribe", { method: "POST", body: fd });
+          const j = (await res.json().catch(() => ({}))) as { text?: string; error?: string };
+          if (res.ok && j.text) {
+            setText((prev) => (prev ? `${prev}${j.text}` : j.text!));
+          } else {
+            flashRecErr(j.error || "识别失败");
+          }
+        } catch {
+          flashRecErr("识别请求失败");
+        } finally {
+          setRecState("idle");
+        }
+      };
+      mr.start();
+      recRef.current = mr;
+      setRecState("recording");
+    } catch {
+      // 主屏 PWA 的录音权限在部分 iOS 版本受限——提示换浏览器标签页用
+      flashRecErr("无法访问麦克风（权限被拒,或当前模式不支持录音）");
+    }
+  };
+  // 卸载/切会话时若还在录,收掉麦克风
+  useEffect(() => {
+    return () => {
+      try {
+        recRef.current?.stream.getTracks().forEach((t) => t.stop());
+      } catch { /* 已停止 */ }
+    };
+  }, [active]);
 
   // textarea 自适应高度
   useEffect(() => {
@@ -280,6 +365,32 @@ export function Composer() {
             >
               <PaperclipIcon />
             </button>
+            <button
+              onClick={toggleRec}
+              title={recState === "recording" ? "停止并转文字" : "语音输入"}
+              aria-label="语音输入"
+              disabled={disabled || recState === "busy"}
+              className={`flex size-8 items-center justify-center rounded-[9px] transition-colors disabled:opacity-30 ${
+                recState === "recording"
+                  ? "bg-error/15 text-error"
+                  : "text-base-content/60 hover:bg-base-content/[0.06] hover:text-base-content"
+              }`}
+            >
+              {recState === "busy" ? (
+                <span className="loading loading-spinner loading-xs" />
+              ) : recState === "recording" ? (
+                <span className="relative flex items-center justify-center">
+                  <span className="animate-cstra-breathe absolute inline-flex size-4 rounded-full bg-error/40" />
+                  <MicIcon />
+                </span>
+              ) : (
+                <MicIcon />
+              )}
+            </button>
+            {recState === "recording" && (
+              <span className="text-[11px] font-medium text-error/80">录音中…点 🎤 结束</span>
+            )}
+            {recErr && <span className="truncate text-[11px] text-error/70">{recErr}</span>}
 
             <div className="ml-auto flex items-center gap-1.5">
               {/* 流式期间：暂停与发送并列（不互斥替换）——可一边看回复一边输入插话 */}
