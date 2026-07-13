@@ -51,6 +51,9 @@ export function TerminalView({
   const [errMsg, setErrMsg] = useState("");
   // 手动重连计数：+1 触发 effect 重跑（销毁旧 PTY、建新的）
   const [connectSeq, setConnectSeq] = useState(0);
+  // [mobile] 当前镜像尺寸——留白区显示一行说明（视口高被桌面端 iTerm 钳住时,
+  // 画布只有 window 那么高,下方空白需要「有解释」而不是像没加载完）
+  const [mirror, setMirror] = useState<{ cols: number; rows: number } | null>(null);
 
   /** 上行：微批 + 串行链（字节序！）。ControlBar 也走这里。 */
   const queueInput = (data: string) => {
@@ -237,6 +240,7 @@ export function TerminalView({
                   lastCols = c;
                   lastRows = r;
                   adaptFontSize(c);
+                  setMirror({ cols: c, rows: r });
                 };
                 if (wc !== evt.cols || wr !== evt.rows) {
                   fetch("/api/terminal/resize", {
@@ -417,7 +421,15 @@ export function TerminalView({
         disabled={status !== "connected"}
         mobile={mobile}
       />
-      {mobile && <div className="min-h-0 flex-1" />}
+      {mobile && (
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {status === "connected" && mirror && (
+            <p className="pt-3 text-center font-mono text-[10px] text-[#cdd6f4]/25">
+              {mirror.cols}×{mirror.rows} · 跟随桌面端窗口尺寸
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
