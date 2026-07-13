@@ -295,3 +295,18 @@ html.canvas-list {
     font-weight: 650;
     background: color-mix(in srgb, currentColor 6%, transparent);
 }
+
+/*
+ * ── 旁白弱化（.narration-muted，owner 2026-07-14） ──────────────────
+ * 过程叙述(工具间碎碎念)与 reply 正文的格式区分。DOMD 组件经
+ * adoptedStyleSheets 给 .DOMD-Root 钉了 16px + 深色 —— wrapper 上的
+ * Tailwind 字号/颜色被打断,普通继承穿不进正文元素。这里用更高
+ * specificity(document 样式与 adopted 同源,specificity 高者胜)把
+ * 字号/颜色强制跟随 wrapper(12.5px + 45% 灰)。code/pre 不动,
+ * 保留代码块自己的排版。
+ */
+.narration-muted .DOMD-Root,
+.narration-muted .DOMD-Root :is(p, li, td, th, blockquote, strong, em, a, h1, h2, h3, h4) {
+    font-size: inherit;
+    color: inherit;
+}

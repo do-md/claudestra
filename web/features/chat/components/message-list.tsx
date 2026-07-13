@@ -353,7 +353,11 @@ const TextBlock = memo(function TextBlock({
     <div
       className={`cursor-pointer ${
         muted
-          ? "border-l-2 border-base-content/15 pl-2.5 text-[13px] leading-relaxed text-base-content/60"
+          ? // 首版 13px/60% 被 owner 打回「区分不够」——真因是 DOMD 组件用
+            // adoptedStyleSheets 给 .DOMD-Root 钉 16px/深色,wrapper 的字号颜色
+            // 根本穿不进去。narration-muted(globals.css)按 specificity 打穿,
+            // 这里的 12.5px + 45% 灰才真正落到正文元素上。
+            "narration-muted border-l-2 border-base-content/20 pl-2.5 text-[12.5px] leading-snug text-base-content/45"
           : ""
       }`}
       onClick={() => setShowTs((v) => !v)}
