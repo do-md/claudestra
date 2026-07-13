@@ -83,6 +83,9 @@ export interface ChatMessage {
   attachments?: ChatAttachmentView[];
   /** 入站消息来源标签（Discord 用户名 / 来源 agent；自己发的不带）。 */
   from?: string;
+  /** 本端乐观发送、尚未在历史(jsonl)中确认——历史重拉时保留不吞
+   *  （agent 忙时消息在服务端排队,送达前不进 jsonl）。 */
+  local?: boolean;
 }
 
 export interface AgentSession {

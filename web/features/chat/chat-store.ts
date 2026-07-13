@@ -289,7 +289,27 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       const json = (await res.json()) as { data?: ChatMessage[] };
       if (gen !== this.openGen) return; // 已切走，丢弃
       this.produce((s) => {
-        s.messages = json.data ?? [];
+        const history = json.data ?? [];
+        // 乐观消息保全:agent 忙时连发的消息在服务端排队,送达前不进 jsonl——
+        // 历史整体替换会把它们从视图「吞掉」(2026-07-14 真机:连发多条 UI 上
+        // 消失,消息本身没丢)。把尚未在历史尾部出现的本地消息接回视图尾;
+        // 逐条消费匹配(同文本连发两条也各自对账),30 分钟后不再保全。
+        const tail = history.slice(-80);
+        const used = new Set<number>();
+        const pending = s.messages.filter((m) => {
+          if (!m.local || m.role !== "user") return false;
+          if (m.ts && Date.now() - Date.parse(m.ts) > 30 * 60_000) return false;
+          const t = m.content.trim();
+          const idx = tail.findIndex(
+            (h, i) => !used.has(i) && h.role === "user" && h.content.trim() === t
+          );
+          if (idx >= 0) {
+            used.add(idx);
+            return false; // 已进历史,不再需要本地副本
+          }
+          return true;
+        });
+        s.messages = [...history, ...pending];
         s.loadingHistory = false;
         s.historyError = false;
       });
@@ -442,6 +462,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         content: display,
         ts: new Date().toISOString(),
         attachments,
+        local: true, // 历史确认前保留(见 loadMessages 的乐观消息保全)
       });
       s.streaming = true;
       s.awaitingChunk = true;
