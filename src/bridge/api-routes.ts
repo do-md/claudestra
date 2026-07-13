@@ -196,7 +196,10 @@ async function authApi(req: Request, url: URL): Promise<Principal | Response> {
   const tid = tokenIdOf(p);
   let limiter = apiLimiters.get(tid);
   if (!limiter) {
-    limiter = new SlidingWindowLimiter();
+    // 120/min:默认 30 在 web 重度使用下会被打爆——SSE 重连风暴(每次重连烧
+    // 连流+历史+列表轮询+pending 一整套)循环触发 429 → 直播流死掉 → 「收不到
+    // 回复/没有思考中」(2026-07-14 真机)。个人部署,提额比精打细算更实际。
+    limiter = new SlidingWindowLimiter(120);
     apiLimiters.set(tid, limiter);
   }
   if (!limiter.tryAcquire()) return apiJson(429, { ok: false, error: "rate limit exceeded (30 req/min)" });
