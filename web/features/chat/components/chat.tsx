@@ -15,6 +15,7 @@ import { Composer } from "./composer";
 import { Splash } from "./splash";
 import { AgentActions } from "./agent-actions";
 import { TerminalButton } from "../../terminal/terminal-button";
+import { ManagePanel } from "./manage-panel";
 
 /** 「会话内容」页的 hash 锚点：存在即处于内容视图，移动端横滑到内容栏 */
 const CONTENT_HASH = "#chat";
@@ -31,6 +32,8 @@ function TopBar() {
   const agents = useChatStore((s) => s.state.agents);
   const nav = useChatNav();
   const info = agents.find((a) => a.name === active);
+  // 大总管「聊天 + UI」双轨(2026-07-14 owner):生命周期操作不必经过 LLM
+  const [showManage, setShowManage] = useState(false);
   return (
     // 安全区顶部由面板自己垫（bg=base-100，条带与内容同色无缝）
     <header
@@ -76,10 +79,20 @@ function TopBar() {
           语义），终端按钮会浮到中间。内层残留的 ml-auto 无自由空间，无害。 */}
       {info && (
         <span className="ml-auto flex shrink-0 items-center gap-0.5">
+          {info.pinnedMaster && (
+            <button
+              className="btn btn-ghost btn-sm px-2 text-[13px]"
+              title="Agent 管理(生命周期操作,不经过 LLM)"
+              onClick={() => setShowManage(true)}
+            >
+              管理
+            </button>
+          )}
           <TerminalButton agent={info} />
           <AgentActions agent={info} />
         </span>
       )}
+      <ManagePanel open={showManage} onClose={() => setShowManage(false)} />
     </header>
   );
 }

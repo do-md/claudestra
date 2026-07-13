@@ -142,6 +142,16 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       if (res.status === 401) return;
       const json = (await res.json()) as { data?: AgentSession[] };
       const next = json.data ?? [];
+      // 会话态校准(2026-07-14 owner:agent 忙不忙是服务端事实,别只依赖流):
+      // 活跃会话在服务端是 busy(hook 真值)而本地没在 streaming → 补锁。
+      // 反向(busy=false 解锁)不做——15s 轮询粒度粗,会误杀刚起步的回合;
+      // 解锁交给 done 事件与断流 5s 兜底。
+      const cur = next.find((a) => a.name === this.state.activeAgent);
+      if (cur?.status === "active" && cur.busy && !this.state.streaming) {
+        this.produce((s) => {
+          s.streaming = true;
+        });
+      }
       if (agentsSignature(next) === agentsSignature(this.state.agents)) return;
       this.produce((s) => {
         s.agents = next;
