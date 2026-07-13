@@ -1,4 +1,5 @@
 "use client";
+import { useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
 
@@ -107,6 +108,12 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const ready = useChatStore((s) => s.state.agentsReady);
   const active = useChatStore((s) => s.state.activeAgent);
   const streaming = useChatStore((s) => s.state.streaming);
+  // agent 搜索（2026-07-13 owner）：名称/用途 大小写不敏感即时过滤，纯前端
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? agents.filter((a) => `${a.displayName} ${a.name} ${a.purpose}`.toLowerCase().includes(q))
+    : agents;
 
   return (
     <aside className="flex w-full shrink-0 flex-col border-r border-base-300 bg-base-200 sm:w-64">
@@ -114,10 +121,38 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
           刷新按钮已移除（列表由 15s 轮询 + 回前台重连自动感知 roster 变化）；
           新建会话统一走大总管对话，Web 侧不再单独提供入口。 */}
       <div
-        className="flex items-center px-4 pb-3"
+        className="px-4 pb-2"
         style={{ paddingTop: "calc(env(safe-area-inset-top) + 0.75rem)" }}
       >
-        <span className="font-semibold">会话</span>
+        <div className="flex items-center pb-2.5">
+          <span className="font-semibold">会话</span>
+        </div>
+        <label className="flex items-center gap-2 rounded-lg bg-base-300/60 px-2.5 py-1.5">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" className="shrink-0 opacity-40">
+            <circle cx="11" cy="11" r="7" />
+            <path d="M21 21l-4.3-4.3" />
+          </svg>
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索会话…"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            className="w-full min-w-0 bg-transparent text-sm outline-none placeholder:text-base-content/35 [&::-webkit-search-cancel-button]:hidden"
+          />
+          {query && (
+            <button
+              className="shrink-0 text-xs text-base-content/40"
+              aria-label="清除搜索"
+              onClick={() => setQuery("")}
+            >
+              ✕
+            </button>
+          )}
+        </label>
       </div>
 
       {/* touch-pan-y + overscroll-contain：iOS 到边界时滚动链会穿透到不可滚的
@@ -134,11 +169,14 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
         {ready && !loading && agents.length === 0 && (
           <div className="px-2 py-4 text-sm opacity-50">暂无会话</div>
         )}
+        {agents.length > 0 && filtered.length === 0 && (
+          <div className="px-2 py-4 text-sm opacity-50">没有匹配「{query.trim()}」的会话</div>
+        )}
         {/* 不用 daisyUI menu 类——它给每行自带 :hover/:active 按压高亮，iOS 上
             手指一碰就闪（滑动时「一直触发 hover 特效」，2026-07-13 真机）；
             行样式本来就是自定义的。 */}
         <ul className="flex w-full list-none flex-col gap-0.5 p-0">
-          {agents.map((a) => (
+          {filtered.map((a) => (
             <AgentRow
               key={a.name}
               a={a}
