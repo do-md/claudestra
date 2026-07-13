@@ -7,7 +7,13 @@ const nextConfig: NextConfig = {
   // 跨源 _next 请求告警，未来版本会直接拦）。手机走 Tailscale 测网页版时用得上。
   // 127.0.0.1：本机 Playwright 自动化测试——不在列表里 HMR websocket 握手会一直失败，
   // dev 页面周期性整页 reload（store 重挂、视图闪回空白），肉眼看着像灵异 bug。
-  allowedDevOrigins: ["100.120.71.107", "192.168.3.168", "127.0.0.1"],
+  allowedDevOrigins: [
+    "100.120.71.107",
+    "192.168.3.168",
+    "127.0.0.1",
+    // tailscale serve 的 HTTPS 域名（getUserMedia 需要安全上下文,2026-07-14 语音输入）
+    "mac-mini-jp.tailfdc471.ts.net",
+  ],
 };
 
 export default nextConfig;
