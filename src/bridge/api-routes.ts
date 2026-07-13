@@ -230,6 +230,57 @@ async function findApiAgent(name: string): Promise<{ name: string; channelId: st
   }
 }
 
+/**
+ * [fork] 会话文件里最后一条真实对话记录（user/assistant，带 timestamp）的时间。
+ *
+ * 不能用文件 mtime 当「最近对话时间」：CC 会持续原地更新状态类记录
+ * （last-prompt / mode / file-history-snapshot 等）——空闲 agent 的 mtime
+ * 也一直在刷新，列表排序就出现「没动静的 agent 莫名顶到最前」
+ * （2026-07-13 真机实锤：router 尾部内容停在 07-12，mtime 却是当下）。
+ * tail 256KB 逆序找；找不到（超大 tool_result 把对话挤出窗口）退回 mtime。
+ * 按 (path, mtimeMs) 缓存——mtime 没变不重读。
+ */
+const lastConvCache = new Map<string, { mtimeMs: number; ts: number | null }>();
+async function lastConversationTs(path: string): Promise<number | null> {
+  try {
+    const st = statSync(path);
+    const hit = lastConvCache.get(path);
+    if (hit && hit.mtimeMs === st.mtimeMs) return hit.ts;
+    const start = Math.max(0, st.size - 262144);
+    const text = await Bun.file(path).slice(start, st.size).text();
+    const lines = text.split("\n");
+    let ts: number | null = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const rec = JSON.parse(line);
+        if ((rec.type === "user" || rec.type === "assistant") && typeof rec.timestamp === "string") {
+          // TUI 命令记录（批量 /model 之类）不算对话——不跳过的话一次批量维护
+          // 会让全部 agent 的「最后对话」并列在同一时刻
+          if (rec.type === "user") {
+            const c = rec.message?.content;
+            const text = typeof c === "string" ? c : "";
+            if (/^\s*<(command-name|command-message|local-command-stdout|local-command-caveat)/.test(text)) continue;
+          }
+          const t = Date.parse(rec.timestamp);
+          if (Number.isFinite(t)) {
+            ts = t;
+            break;
+          }
+        }
+      } catch {
+        /* tail 起点切到半行 */
+      }
+    }
+    ts = ts ?? st.mtimeMs;
+    lastConvCache.set(path, { mtimeMs: st.mtimeMs, ts });
+    return ts;
+  } catch {
+    return null;
+  }
+}
+
 // ── 路由分发 ────────────────────────────────────────────────────────────
 
 export async function handleApiRequest(req: Request, url: URL): Promise<Response> {
@@ -254,18 +305,16 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
         const st = getAgentStatus(a.name) ?? getAgentStatus(String(a.name).replace(/^agent-/, ""));
         a.busy = st === "thinking" || a.idle === false;
       }
-      // [fork] lastActivityTs：agent 当前 session jsonl 的 mtime（ms epoch）——
-      // 前端「按最近活跃排序」的数据源。registry 读 cwd/sessionId，stat 失败给 null。
+      // [fork] lastActivityTs：agent 最后一条真实对话的时间（不是 mtime——见
+      // lastConversationTs 注释）。前端「按最近对话排序 + 行尾时间标签」的数据源。
       {
         const { readRegistryAgents } = await import("../lib/registry.js");
         const { projectJsonlPath } = await import("../lib/jsonl-cost.js");
-        const { statSync } = await import("fs");
         const bySessions = new Map<string, number>();
         for (const r of await readRegistryAgents()) {
           if (!r.cwd || !r.sessionId) continue;
-          try {
-            bySessions.set(r.name, statSync(projectJsonlPath(r.cwd, r.sessionId)).mtimeMs);
-          } catch { /* session 文件不在（已清理/未落盘）→ 无时间戳 */ }
+          const ts = await lastConversationTs(projectJsonlPath(r.cwd, r.sessionId));
+          if (ts !== null) bySessions.set(r.name, ts);
         }
         for (const a of agents) (a as any).lastActivityTs = bySessions.get(a.name) ?? null;
       }
@@ -274,13 +323,12 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
       if (url.searchParams.get("include") === "stopped") {
         const { readRegistryAgents } = await import("../lib/registry.js");
         const { projectJsonlPath } = await import("../lib/jsonl-cost.js");
-        const { statSync } = await import("fs");
         const listed = new Set(agents.map((a) => a.name));
         for (const r of await readRegistryAgents()) {
           if (listed.has(r.name) || !agentInScope(principal, r.name)) continue;
           let ts: number | null = null;
           if (r.cwd && r.sessionId) {
-            try { ts = statSync(projectJsonlPath(r.cwd, r.sessionId)).mtimeMs; } catch { /* 同上 */ }
+            ts = await lastConversationTs(projectJsonlPath(r.cwd, r.sessionId));
           }
           agents.push({ name: r.name, status: "stopped", idle: undefined, purpose: r.purpose, lastActivityTs: ts } as any);
         }
