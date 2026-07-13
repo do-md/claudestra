@@ -360,10 +360,19 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         (this.state.streaming || this.state.awaitingChunk)
       ) {
         this.flushPendingText(); // 流断在缓冲窗口内的文本别丢
-        this.produce((s) => {
-          s.streaming = false;
-          s.awaitingChunk = false;
-        });
+        // 不立即解锁:iOS 系统弹框(摇一摇撤销等)会让页面瞬时挂起、SSE 瞬断,
+        // 回合其实还在继续——立即置 streaming=false 会让「思考中/停止按钮」
+        // 凭空消失(2026-07-14 真机)。5s 后仍是当前代际(重连成功会自增代际,
+        // 由连流后的 /pending 校准真实 thinking 态)才解锁,防 done 丢失锁死。
+        setTimeout(() => {
+          if (gen !== this.streamGen) return; // 已重连,新流说了算
+          if (this.state.streaming || this.state.awaitingChunk) {
+            this.produce((s) => {
+              s.streaming = false;
+              s.awaitingChunk = false;
+            });
+          }
+        }, 5_000);
       }
       // [fork] 断流自动重连：bridge 重启 / 网络抖动会掐 SSE。此前只有「回前台」
       // 触发 maybeReconnect，页面一直在前台就永远断着——断流期间 agent 的过程

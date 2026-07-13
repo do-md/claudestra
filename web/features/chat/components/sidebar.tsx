@@ -4,6 +4,7 @@ import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
 import { SettingsModal } from "./settings-modal";
 import { InstallBanner } from "./install-banner";
+import { StatsPanel } from "./stats-panel";
 
 function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: boolean }) {
   if (status === "active") {
@@ -113,6 +114,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   // agent 搜索（2026-07-13 owner）：名称/用途 大小写不敏感即时过滤，纯前端
   const [query, setQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [showStats, setShowStats] = useState(false);
   const q = query.trim().toLowerCase();
   const filtered = q
     ? agents.filter((a) => `${a.displayName} ${a.name} ${a.purpose}`.toLowerCase().includes(q))
@@ -131,6 +133,19 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
           <span className="font-semibold">会话</span>
           <button
             className="ml-auto flex size-7 items-center justify-center rounded-lg text-base-content/50 transition-colors hover:bg-base-300 hover:text-base-content"
+            title="用量看板"
+            aria-label="用量看板"
+            onClick={() => setShowStats(true)}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 3v16a2 2 0 0 0 2 2h16" />
+              <path d="M7 13v4" />
+              <path d="M12 9v8" />
+              <path d="M17 5v12" />
+            </svg>
+          </button>
+          <button
+            className="flex size-7 items-center justify-center rounded-lg text-base-content/50 transition-colors hover:bg-base-300 hover:text-base-content"
             title="设置"
             aria-label="设置"
             onClick={() => setShowSettings(true)}
@@ -213,6 +228,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
         Claudestra Web
       </div>
       <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
+      <StatsPanel open={showStats} onClose={() => setShowStats(false)} />
     </aside>
   );
 }

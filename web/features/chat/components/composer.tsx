@@ -129,7 +129,13 @@ export function Composer() {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const active = useChatStore((s) => s.state.activeAgent);
   const streaming = useChatStore((s) => s.state.streaming);
+  const agents = useChatStore((s) => s.state.agents);
   const store = useChatStoreApi();
+  // 上下文超标警示(2026-07-14 owner:到限制要在聊天界面提醒)。每会话可关闭。
+  const [ctxDismissedFor, setCtxDismissedFor] = useState("");
+  const agentInfo = agents.find((a) => a.name === active);
+  const ctxTokens = typeof agentInfo?.contextTokens === "number" ? agentInfo.contextTokens : 0;
+  const showCtxWarn = ctxTokens >= 170_000 && ctxDismissedFor !== active;
 
   const disabled = !active;
   const hasContent = !!text.trim() || files.length > 0;
@@ -384,6 +390,28 @@ export function Composer() {
       style={{ paddingBottom: "max(env(safe-area-inset-bottom), 0.75rem)" }}
     >
       <div className="mx-auto max-w-3xl">
+        {showCtxWarn && (
+          <div className="mb-1.5 flex items-center gap-2 rounded-xl border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs">
+            <span className="min-w-0 truncate">
+              ⚠️ 上下文已 {Math.round(ctxTokens / 1000)}k，建议压缩以保持质量
+            </span>
+            <button
+              className="btn btn-warning btn-xs ml-auto shrink-0"
+              onClick={() =>
+                store.send("上下文占用已经很高了，请执行 /save-compact：先抢救关键记忆，然后压缩上下文。")
+              }
+            >
+              请求压缩
+            </button>
+            <button
+              className="shrink-0 px-1 opacity-40 hover:opacity-80"
+              aria-label="本会话不再提示"
+              onClick={() => setCtxDismissedFor(active)}
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <div
           className={`overflow-hidden rounded-2xl border bg-base-200 transition-colors ${
             streaming
