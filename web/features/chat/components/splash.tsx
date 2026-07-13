@@ -19,6 +19,21 @@ export function Splash() {
   const mountedAt = useRef(Date.now());
   const [fading, setFading] = useState(false);
   const [gone, setGone] = useState(false);
+  // 底部署名:版本 + commit id（owner:不一定每次改动都发版,commit 才定位得准）
+  const [ver, setVer] = useState<{ version: string; commit: string } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/version")
+      .then((r) => r.json())
+      .then((j: { version?: string; commit?: string }) => {
+        if (alive && (j.version || j.commit)) setVer({ version: j.version ?? "", commit: j.commit ?? "" });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!ready || fading || gone) return;
@@ -62,6 +77,16 @@ export function Splash() {
           ))}
         </div>
       </div>
+      {ver && (
+        <div
+          className="absolute inset-x-0 text-center font-mono text-[11px] tabular-nums text-base-content/30"
+          style={{ bottom: "max(env(safe-area-inset-bottom), 16px)" }}
+        >
+          {ver.version && `v${ver.version}`}
+          {ver.version && ver.commit && " · "}
+          {ver.commit}
+        </div>
+      )}
     </div>
   );
 }
