@@ -195,6 +195,13 @@ function ChatInner() {
       if (document.visibilityState === "visible") {
         store.maybeReconnect();
         store.refreshAgents();
+        // iOS PWA 从后台回来偶发合成层黑屏（GPU 层被回收后未重绘,2026-07-13
+        // 真机）——同步 display 切换强制整树重排重绘,单帧内完成无闪烁
+        requestAnimationFrame(() => {
+          document.body.style.display = "none";
+          void document.body.offsetHeight;
+          document.body.style.display = "";
+        });
       }
     };
     document.addEventListener("visibilitychange", onVisible);

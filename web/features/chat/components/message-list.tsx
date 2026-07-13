@@ -87,13 +87,16 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
   );
 });
 
-/** 历史 / 定稿后的工具行：可展开看完整摘要。 */
+/** 历史 / 定稿后的工具行：可展开看完整摘要。
+ *  外观与流式的 ActiveToolRow 同款紧凑行（无边框）——此前定稿带边框卡片，
+ *  回合一结束同一批工具行样式突变,被用户当成 bug（2026-07-13）；展开的
+ *  详情区给淡背景区分。 */
 const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallView }) {
   const summary = cleanSummary(tool.summary);
   return (
-    <details className="group rounded-lg border border-info/25 bg-info/[0.06] [&>summary]:list-none">
-      <summary className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs">
-        <span className="shrink-0 opacity-70">
+    <details className="group [&>summary]:list-none">
+      <summary className="flex cursor-pointer select-none items-center gap-1.5 py-0.5 font-mono text-xs">
+        <span className="shrink-0 opacity-60">
           {tool.state === "error" ? "❌" : toolIcon(tool.name)}
         </span>
         <span className="font-semibold text-info">{tool.name}</span>
@@ -106,7 +109,7 @@ const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallVi
           ›
         </span>
       </summary>
-      <div className="px-2.5 pb-2 pt-0.5">
+      <div className="mb-1 mt-0.5 rounded-lg bg-base-content/[0.04] px-2.5 py-2">
         {tool.ts && (
           <div className="pb-1 font-mono text-[10px] tabular-nums opacity-40">
             🕐 {fmtTs(tool.ts)}

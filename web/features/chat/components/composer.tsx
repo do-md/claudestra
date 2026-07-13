@@ -117,6 +117,40 @@ export function Composer() {
   // 流式中也可发（插入会话）——不再要求 !streaming。
   const canSend = !disabled && hasContent;
 
+  // ── 草稿持久化（2026-07-13 owner）：未发送文字按 agent 存 localStorage，
+  //    切走会话 / 退出 App 再回来原样恢复；发送成功即清。 ──
+  const draftKey = (a: string) => `cstra_draft_${a}`;
+  const textRef = useRef(text);
+  textRef.current = text;
+  const saveDraft = (agent: string, value: string) => {
+    try {
+      if (value.trim()) localStorage.setItem(draftKey(agent), value);
+      else localStorage.removeItem(draftKey(agent));
+    } catch { /* 隐私模式等 */ }
+  };
+  // 切会话：cleanup 把旧 agent 的当前输入存盘，effect 载入新 agent 草稿；
+  // App 退后台（iOS 可能直接回收进程）立即存盘。
+  useEffect(() => {
+    if (!active) return;
+    try { setText(localStorage.getItem(draftKey(active)) || ""); } catch { /* 同上 */ }
+    const onHide = () => {
+      if (document.visibilityState === "hidden") saveDraft(active, textRef.current);
+    };
+    document.addEventListener("visibilitychange", onHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      saveDraft(active, textRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active]);
+  // 随打随存（防进程被杀丢最后几秒输入）：300ms debounce
+  useEffect(() => {
+    if (!active) return;
+    const t = setTimeout(() => saveDraft(active, text), 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text, active]);
+
   // textarea 自适应高度
   useEffect(() => {
     const ta = taRef.current;
@@ -130,6 +164,9 @@ export function Composer() {
     store.send(text, files.length ? files : undefined);
     setText("");
     setFiles([]);
+    if (active) {
+      try { localStorage.removeItem(draftKey(active)); } catch { /* 忽略 */ }
+    }
   };
 
   const addFiles = (picked: File[]) => {
