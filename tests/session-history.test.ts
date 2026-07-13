@@ -144,6 +144,9 @@ describe("readSessionHistory", () => {
       { type: "user", timestamp: "2026-07-01T00:00:02Z", message: { content: "<command-message>save-compact</command-message>\n<command-name>/save-compact</command-name>" } },
       // 空 stdout → 整条过滤
       { type: "user", timestamp: "2026-07-01T00:00:03Z", message: { content: "<local-command-stdout>(no content)</local-command-stdout>" } },
+      // 队列回放的裸斜杠命令（tmux 注入 /compact 的额外纯文本记录）→ 跳过，
+      // 否则与后续 <command-name> 记录渲染成双份
+      { type: "user", timestamp: "2026-07-01T00:00:03Z", message: { content: "/compact" } },
       // 真实用户输入不受影响
       { type: "user", timestamp: "2026-07-01T00:00:04Z", message: { content: "正常消息" } },
     ]);

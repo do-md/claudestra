@@ -322,6 +322,11 @@ export async function readSessionHistory(
         all.push({ seq: i, ts, role: "system", text: body.length > 200 ? body.slice(0, 200) + "…" : body });
         continue;
       }
+      // [fork] 队列回放的裸斜杠命令：tmux 注入的 /compact 等经 CC 队列会额外落一条
+      // 纯文本 user 记录，紧接着还有 <command-name> 记录 → 不跳过就同一命令渲染成
+      // 「用户气泡 + 分隔条」双份（2026-07-13）。channel 入站消息是 isMeta 包装，
+      // TUI 直敲的合法命令只落 <command-name> 记录，都不走这条路径。
+      if (/^\/[\w:-]+$/.test(trimmed)) continue;
       const msg: HistoryMessage = { seq: i, ts, role: "user", text };
       if (rec.isCompactSummary === true) msg.compactSummary = true;
       all.push(msg);
