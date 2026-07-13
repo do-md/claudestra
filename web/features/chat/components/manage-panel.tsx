@@ -5,10 +5,14 @@ import { useChatStore, useChatStoreApi } from "../chat-store";
 import { NewAgentModal } from "./new-agent-modal";
 
 /**
- * Agent 管理面板（2026-07-14 owner：大总管做成「聊天 + UI」双轨——能点按钮
+ * Agent 管理页（2026-07-14 owner：大总管做成「聊天 + UI」双轨——能点按钮
  * 解决的生命周期操作不必经过 LLM）。大总管会话顶栏「管理」进入。
  * 复用 store 的 createAgent/restartAgent/killAgent(本就是 LLM-free 的 BFF 直调);
  * 破坏性操作用行内二次确认(点一下变「确认?」,3s 复原),不弹系统框。
+ *
+ * 形态：全屏独立页,不是居中弹框（owner 2026-07-14 截图实锤:iOS 视口缩放/平移
+ * 下居中 modal 整体歪出屏幕右缘）。fixed inset-0 不透明底 + 自垫安全区,与
+ * terminal-page 同一套治法;窄屏由 chat.tsx 配 #manage hash 伪路由,左滑/返回键退出。
  */
 export function ManagePanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const agents = useChatStore((s) => s.state.agents);
@@ -38,26 +42,32 @@ export function ManagePanel({ open, onClose }: { open: boolean; onClose: () => v
   const rows = agents.filter((a) => !a.pinnedMaster);
 
   return createPortal(
-    <div className="fixed inset-0 z-[80] grid place-items-center bg-black/50 p-4" onClick={onClose}>
-      <div
-        className="flex max-h-[85dvh] w-full max-w-md flex-col rounded-2xl bg-base-100 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
+    <div className="fixed inset-0 z-[80] flex flex-col bg-base-100">
+      {/* 顶栏与会话页 TopBar 同构:安全区自垫、返回箭头走 onClose(窄屏= history.back) */}
+      <header
+        className="flex min-h-12 shrink-0 items-center gap-1 border-b border-base-300 bg-base-100 px-3"
+        style={{ paddingTop: "env(safe-area-inset-top)" }}
       >
-        <div className="flex items-center justify-between px-5 pb-2 pt-4">
-          <span className="text-base font-semibold">Agent 管理</span>
-          <div className="flex items-center gap-2">
-            <button className="btn btn-primary btn-sm" onClick={() => setShowNew(true)}>
-              ＋ 新建
-            </button>
-            <button className="btn btn-ghost btn-sm" aria-label="关闭" onClick={onClose}>
-              ✕
-            </button>
-          </div>
-        </div>
-        {msg && <div className="px-5 pb-1 text-xs text-base-content/60">{msg}</div>}
+        <button className="btn btn-ghost btn-sm -ml-1 px-2" aria-label="返回" onClick={onClose}>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M15 18l-6-6 6-6" />
+          </svg>
+        </button>
+        <span className="truncate font-semibold">Agent 管理</span>
+        <button className="btn btn-primary btn-sm ml-auto" onClick={() => setShowNew(true)}>
+          ＋ 新建
+        </button>
+      </header>
+      {msg && <div className="px-4 pt-2 text-xs text-base-content/60">{msg}</div>}
 
-        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5">
-          <ul className="space-y-1">
+      <div
+        className="min-h-0 flex-1 touch-pan-y overflow-y-auto overscroll-contain px-3 pt-2"
+        style={{
+          WebkitOverflowScrolling: "touch",
+          paddingBottom: "max(env(safe-area-inset-bottom), 1rem)",
+        }}
+      >
+        <ul className="mx-auto w-full max-w-2xl space-y-1">
             {rows.map((a) => {
               const rk = `restart:${a.name}`;
               const kk = `kill:${a.name}`;
@@ -110,8 +120,7 @@ export function ManagePanel({ open, onClose }: { open: boolean; onClose: () => v
                 </li>
               );
             })}
-          </ul>
-        </div>
+        </ul>
       </div>
       <NewAgentModal open={showNew} onClose={() => setShowNew(false)} />
     </div>,

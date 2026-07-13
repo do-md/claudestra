@@ -27,13 +27,36 @@ const isNarrow = () =>
   typeof window !== "undefined" &&
   window.matchMedia("(max-width: 639.98px)").matches;
 
+/** Agent 管理页 hash（窄屏伪路由,左滑/返回键退出,同 #terminal 一套导航栈） */
+const MANAGE_HASH = "#manage";
+const isManageHash = () =>
+  typeof window !== "undefined" &&
+  window.location.hash.split("?")[0] === MANAGE_HASH;
+
 function TopBar() {
   const active = useChatStore((s) => s.state.activeAgent);
   const agents = useChatStore((s) => s.state.agents);
   const nav = useChatNav();
   const info = agents.find((a) => a.name === active);
-  // 大总管「聊天 + UI」双轨(2026-07-14 owner):生命周期操作不必经过 LLM
+  // 大总管「聊天 + UI」双轨(2026-07-14 owner):生命周期操作不必经过 LLM。
+  // 全屏独立页(不再是居中弹框);窄屏配 #manage hash,系统返回/左滑即退出。
   const [showManage, setShowManage] = useState(false);
+  useEffect(() => {
+    if (!showManage) return;
+    const onPop = () => {
+      if (!isManageHash()) setShowManage(false);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [showManage]);
+  const openManage = () => {
+    if (isNarrow() && !isManageHash()) window.history.pushState(null, "", MANAGE_HASH);
+    setShowManage(true);
+  };
+  const closeManage = () => {
+    if (isManageHash()) window.history.back();
+    else setShowManage(false);
+  };
   return (
     // 安全区顶部由面板自己垫（bg=base-100，条带与内容同色无缝）
     <header
@@ -83,7 +106,7 @@ function TopBar() {
             <button
               className="btn btn-ghost btn-sm px-2 text-[13px]"
               title="Agent 管理(生命周期操作,不经过 LLM)"
-              onClick={() => setShowManage(true)}
+              onClick={openManage}
             >
               管理
             </button>
@@ -92,7 +115,7 @@ function TopBar() {
           <AgentActions agent={info} />
         </span>
       )}
-      <ManagePanel open={showManage} onClose={() => setShowManage(false)} />
+      <ManagePanel open={showManage} onClose={closeManage} />
     </header>
   );
 }
@@ -113,9 +136,9 @@ function ChatInner() {
 
   // 首帧按当前 hash 初始化定位，随后开启过渡
   useLayoutEffect(() => {
-    // 带 #terminal 刷新进入：终端页状态不可恢复（termId 已随连接销毁），
-    // 降级回会话内容页（#chat），避免 hash 悬空
-    if (window.location.hash.split("?")[0] === "#terminal") {
+    // 带 #terminal / #manage 刷新进入：页面态不可恢复（termId 已随连接销毁 /
+    // showManage 初始 false），降级回会话内容页（#chat），避免 hash 悬空
+    if (["#terminal", "#manage"].includes(window.location.hash.split("?")[0])) {
       window.history.replaceState(null, "", "#chat");
     }
     setShowContent(isContentHash());
