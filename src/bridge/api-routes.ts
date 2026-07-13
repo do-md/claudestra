@@ -243,42 +243,55 @@ async function findApiAgent(name: string): Promise<{ name: string; channelId: st
  * tail 256KB 逆序找；找不到（超大 tool_result 把对话挤出窗口）退回 mtime。
  * 按 (path, mtimeMs) 缓存——mtime 没变不重读。
  */
-const lastConvCache = new Map<string, { mtimeMs: number; ts: number | null }>();
-async function lastConversationTs(path: string): Promise<number | null> {
+interface SessionTailInfo {
+  /** 最后一条真实对话(user/assistant)的时间,找不到退 mtime */
+  convTs: number | null;
+  /** 最近一条 assistant 的 usage 合计 ≈ 当前上下文占用 token 数 */
+  ctxTokens: number | null;
+}
+const tailInfoCache = new Map<string, { mtimeMs: number; info: SessionTailInfo }>();
+async function sessionTailInfo(path: string): Promise<SessionTailInfo | null> {
   try {
     const st = statSync(path);
-    const hit = lastConvCache.get(path);
-    if (hit && hit.mtimeMs === st.mtimeMs) return hit.ts;
+    const hit = tailInfoCache.get(path);
+    if (hit && hit.mtimeMs === st.mtimeMs) return hit.info;
     const start = Math.max(0, st.size - 262144);
     const text = await Bun.file(path).slice(start, st.size).text();
     const lines = text.split("\n");
-    let ts: number | null = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
+    let convTs: number | null = null;
+    let ctxTokens: number | null = null;
+    for (let i = lines.length - 1; i >= 0 && (convTs === null || ctxTokens === null); i--) {
       const line = lines[i].trim();
       if (!line) continue;
       try {
         const rec = JSON.parse(line);
-        if ((rec.type === "user" || rec.type === "assistant") && typeof rec.timestamp === "string") {
+        // 上下文占用:最近一条带 usage 的 assistant——input + cache 读写就是
+        // 本轮进模型的全部上下文(web 端「context 快满」指示的数据源)
+        if (ctxTokens === null && rec.type === "assistant") {
+          const u = rec.message?.usage;
+          if (u && typeof u.input_tokens === "number") {
+            ctxTokens =
+              u.input_tokens + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+          }
+        }
+        if (convTs === null && (rec.type === "user" || rec.type === "assistant") && typeof rec.timestamp === "string") {
           // TUI 命令记录（批量 /model 之类）不算对话——不跳过的话一次批量维护
           // 会让全部 agent 的「最后对话」并列在同一时刻
           if (rec.type === "user") {
             const c = rec.message?.content;
-            const text = typeof c === "string" ? c : "";
-            if (/^\s*<(command-name|command-message|local-command-stdout|local-command-caveat)/.test(text)) continue;
+            const body = typeof c === "string" ? c : "";
+            if (/^\s*<(command-name|command-message|local-command-stdout|local-command-caveat)/.test(body)) continue;
           }
           const t = Date.parse(rec.timestamp);
-          if (Number.isFinite(t)) {
-            ts = t;
-            break;
-          }
+          if (Number.isFinite(t)) convTs = t;
         }
       } catch {
         /* tail 起点切到半行 */
       }
     }
-    ts = ts ?? st.mtimeMs;
-    lastConvCache.set(path, { mtimeMs: st.mtimeMs, ts });
-    return ts;
+    const info: SessionTailInfo = { convTs: convTs ?? st.mtimeMs, ctxTokens };
+    tailInfoCache.set(path, { mtimeMs: st.mtimeMs, info });
+    return info;
   } catch {
     return null;
   }
@@ -309,17 +322,21 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
         a.busy = st === "thinking" || a.idle === false;
       }
       // [fork] lastActivityTs：agent 最后一条真实对话的时间（不是 mtime——见
-      // lastConversationTs 注释）。前端「按最近对话排序 + 行尾时间标签」的数据源。
+      // sessionTailInfo 注释）。contextTokens:当前上下文占用(web 端超标提示)。
       {
         const { readRegistryAgents } = await import("../lib/registry.js");
         const { projectJsonlPath } = await import("../lib/jsonl-cost.js");
-        const bySessions = new Map<string, number>();
+        const bySessions = new Map<string, SessionTailInfo>();
         for (const r of await readRegistryAgents()) {
           if (!r.cwd || !r.sessionId) continue;
-          const ts = await lastConversationTs(projectJsonlPath(r.cwd, r.sessionId));
-          if (ts !== null) bySessions.set(r.name, ts);
+          const info = await sessionTailInfo(projectJsonlPath(r.cwd, r.sessionId));
+          if (info) bySessions.set(r.name, info);
         }
-        for (const a of agents) (a as any).lastActivityTs = bySessions.get(a.name) ?? null;
+        for (const a of agents) {
+          const info = bySessions.get(a.name);
+          (a as any).lastActivityTs = info?.convTs ?? null;
+          (a as any).contextTokens = info?.ctxTokens ?? null;
+        }
       }
       // [fork] ?include=stopped：registry 里已停止的 agent 也入列（additive；
       // web 侧栏保留 stopped 会话入口，其历史经归档仍可读——正是归档的意义）。
@@ -331,7 +348,7 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
           if (listed.has(r.name) || !agentInScope(principal, r.name)) continue;
           let ts: number | null = null;
           if (r.cwd && r.sessionId) {
-            ts = await lastConversationTs(projectJsonlPath(r.cwd, r.sessionId));
+            ts = (await sessionTailInfo(projectJsonlPath(r.cwd, r.sessionId)))?.convTs ?? null;
           }
           agents.push({ name: r.name, status: "stopped", idle: undefined, purpose: r.purpose, lastActivityTs: ts } as any);
         }

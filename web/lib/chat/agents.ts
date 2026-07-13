@@ -24,6 +24,8 @@ export interface AgentSession {
   lastActivityTs?: number | null;
   /** 正在干活（tmux 非空闲）——列表状态点显黄色（2026-07-13 owner 需求）。 */
   busy?: boolean;
+  /** 当前上下文占用 token 数（TopBar 超标提示） */
+  contextTokens?: number | null;
 }
 
 interface ApiAgent {
@@ -35,6 +37,8 @@ interface ApiAgent {
   lastActivityTs?: number | null;
   /** 正在回合中（Bridge hook 驱动的 agent_status，比 tmux idle 探测可靠） */
   busy?: boolean;
+  /** 当前上下文占用 token 数（最近一条 assistant 的 usage 合计） */
+  contextTokens?: number | null;
 }
 
 /**
@@ -59,6 +63,7 @@ export async function loadAgents(): Promise<AgentSession[]> {
         pinnedMaster: true,
         lastActivityTs: a.lastActivityTs ?? null,
         busy: a.busy === true,
+        contextTokens: a.contextTokens ?? null,
       };
     }
     const bare = a.name.replace(/^agent-/, "");
@@ -71,6 +76,7 @@ export async function loadAgents(): Promise<AgentSession[]> {
       lastActivityTs: a.lastActivityTs ?? null,
       // Bridge 的 busy（hook 驱动）优先；老 bridge 无此字段时退回 idle 探测
       busy: a.status !== "stopped" && (a.busy ?? a.idle === false),
+      contextTokens: a.contextTokens ?? null,
     };
   });
   // 排序：master 置顶 → 其余按最近活动降序（无时间戳的沉底，registry 序兜底稳定）

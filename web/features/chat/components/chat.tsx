@@ -50,6 +50,22 @@ function TopBar() {
       <span className="truncate font-semibold">
         {info?.displayName || active || "Claudestra"}
       </span>
+      {/* 上下文占用徽章(2026-07-14 owner:context 超标 web 端毫无提示)。
+          色阶按 200k 窗口:≥140k 琥珀,≥170k 红,<100k 不打扰。 */}
+      {typeof info?.contextTokens === "number" && info.contextTokens >= 100_000 && (
+        <span
+          title="当前会话上下文占用(建议在对话里让 agent /compact)"
+          className={`shrink-0 rounded-full px-2 py-0.5 font-mono text-[10.5px] tabular-nums ${
+            info.contextTokens >= 170_000
+              ? "bg-error/15 text-error"
+              : info.contextTokens >= 140_000
+                ? "bg-warning/15 text-warning"
+                : "bg-base-300 text-base-content/50"
+          }`}
+        >
+          ctx {Math.round(info.contextTokens / 1000)}k
+        </span>
+      )}
       {info?.cwd && (
         <span className="hidden truncate font-mono text-xs opacity-50 sm:inline">
           {info.cwd}

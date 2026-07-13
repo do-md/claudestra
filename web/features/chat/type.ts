@@ -101,4 +101,6 @@ export interface AgentSession {
   busy?: boolean;
   /** 最近活动时间（session jsonl mtime，ms epoch）→ 列表行右侧时间标签。 */
   lastActivityTs?: number | null;
+  /** 当前上下文占用 token 数 → TopBar 超标提示。 */
+  contextTokens?: number | null;
 }
