@@ -341,12 +341,16 @@ export function Composer() {
     };
   }, [active]);
 
-  // textarea 自适应高度
+  // textarea 自适应高度。触到 180px 上限后内部滚动;非手动打字的写入
+  // (语音识别回填)自动滚到底——否则长语音转出的文本尾部藏在框外,
+  // 用户「看不到我最后说的话」(owner 2026-07-14)。手动打字不干预,
+  // 浏览器自己保证光标可见。
   useEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, 180)}px`;
+    if (document.activeElement !== ta) ta.scrollTop = ta.scrollHeight;
   }, [text]);
 
   const submit = () => {
@@ -489,7 +493,7 @@ export function Composer() {
             ref={taRef}
             onFocus={() => setTaFocused(true)}
             onBlur={() => setTaFocused(false)}
-            className={`${recState !== "idle" ? "hidden" : "block"} max-h-[180px] min-h-[46px] w-full resize-none bg-transparent px-4 pb-1.5 pt-[14px] text-[14.5px] leading-[1.55] text-base-content outline-none placeholder:text-base-content/35`}
+            className={`${recState !== "idle" ? "hidden" : "block"} max-h-[180px] min-h-[46px] w-full resize-none overflow-y-auto bg-transparent px-4 pb-1.5 pt-[14px] text-[14.5px] leading-[1.55] text-base-content outline-none placeholder:text-base-content/35`}
             rows={1}
             placeholder={
               disabled
