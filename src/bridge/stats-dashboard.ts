@@ -169,6 +169,15 @@ async function scrapeAccountUsage(): Promise<AccountUsage | null> {
       await tmuxRaw(["send-keys", "-t", target, "Right"]);
       await sleep(300);
     }
+    // ⚠ 首帧陷阱（owner 2026-07-14「停在 15% 很久了」实锤）：Usage tab 首帧画的是
+    // CC 进程启动时的缓存快照，后台 fetch 完成后才原地刷新为真值——「一见锚就 capture」
+    // 会永远抓到进程启动那一刻的值（master 长寿进程 → gauge 冻结）。锚定后再等一拍、
+    // 用刷新后的帧解析（实测 15%/20% 冻结值 vs 等待后 74%/40% 真值）。
+    if (found) {
+      await sleep(1800);
+      const refreshed = await tmuxRaw(["capture-pane", "-t", target, "-p", "-S", "-80"]).catch(() => "");
+      if (/Current session/.test(refreshed) && /%\s*used/.test(refreshed)) panel = refreshed;
+    }
     // 关闭面板恢复会话
     await tmuxRaw(["send-keys", "-t", target, "Escape"]);
     await sleep(80);

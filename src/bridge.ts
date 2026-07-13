@@ -2281,6 +2281,8 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
           Bun.spawn(["tmux", "-S", TMUX_SOCK, "send-keys", "-t", `master:${agent.name}`, "C-c"]);
           stopTyping(channelId);
           clearSafetyTimer(channelId);
+          // 同打断按钮：被打断的回合没有 Stop hook，主动收尾 done
+          emitEvent({ agent: agentLabelForChannel(channelId), chatId: channelId, type: "agent_status", data: { status: "done", trigger: "interrupt" } });
           await finishStatusMessage(discord, channelId, t("⚡ 已打断", "⚡ Interrupted"));
           await interaction.reply("⚡ 已发送 Ctrl+C");
         } else {
@@ -2636,6 +2638,9 @@ discord.on("interactionCreate", async (interaction: Interaction) => {
           await finishStatusMessage(discord, targetChannelId, t("⚡ 已打断", "⚡ Interrupted"));
           stopTyping(targetChannelId);
           clearSafetyTimer(targetChannelId);
+          // 被打断的回合没有 Stop hook —— 主动把回合状态收尾成 done，
+          // 否则 agentStatuses 卡 thinking（web 黄点常驻 / busy 补锁复活）
+          emitEvent({ agent: agentLabelForChannel(targetChannelId), chatId: targetChannelId, type: "agent_status", data: { status: "done", trigger: "interrupt" } });
         } catch (e) {
           console.error(`⚡ 打断流程异常:`, e);
         }

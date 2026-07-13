@@ -55,16 +55,30 @@ function AgentRow({
 }) {
   const store = useChatStoreApi();
   const lastAt = fmtLastActive(a.lastActivityTs);
+  // ctx 用量背景条（owner 2026-07-14:用量看板藏太深,列表行内直接可视化）:
+  // 行背景自左向右填充,宽=占 200k 窗口比例;色阶同顶栏 ctx 徽章
+  // (≥170k 红 / ≥140k 琥珀 / 其余中性淡灰),平时几乎隐形,超标一眼看见。
+  const ctx = a.status === "active" && typeof a.contextTokens === "number" ? a.contextTokens : 0;
+  const ctxPct = Math.min(100, Math.round((ctx / 200_000) * 100));
+  const ctxTone =
+    ctx >= 170_000 ? "bg-error/15" : ctx >= 140_000 ? "bg-warning/15" : "bg-base-content/[0.05]";
 
   return (
     <li>
       <div
-        className={`flex items-center gap-2.5 rounded-lg px-2 py-2.5 sm:gap-2 sm:py-1.5 ${
+        className={`relative flex items-center gap-2.5 overflow-hidden rounded-lg px-2 py-2.5 sm:gap-2 sm:py-1.5 ${
           active ? "bg-base-300" : "hover:bg-base-300/60"
         }`}
       >
+        {ctx > 0 && (
+          <span
+            aria-hidden
+            className={`absolute inset-y-0 left-0 ${ctxTone}`}
+            style={{ width: `${ctxPct}%` }}
+          />
+        )}
         <button
-          className="flex min-w-0 flex-1 items-center gap-2.5 text-left sm:gap-2"
+          className="relative flex min-w-0 flex-1 items-center gap-2.5 text-left sm:gap-2"
           onClick={() => {
             store.openAgent(a.name);
             onSelect();

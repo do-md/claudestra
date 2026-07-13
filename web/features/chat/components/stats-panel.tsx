@@ -15,6 +15,15 @@ interface GlobalStats {
   weekPct?: number;
   weekResets?: string;
   totalCost?: string;
+  /** 账号 gauge 抓取时刻——不标年龄用户会把旧缓存当实时（owner 2026-07-14「停在 15%」） */
+  scrapedAt?: number;
+}
+
+function fmtAge(ts: number): string {
+  const ms = Date.now() - ts;
+  if (ms < 90_000) return "刚刚";
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)} 分钟前`;
+  return `${(ms / 3_600_000).toFixed(1)} 小时前`;
 }
 
 function Bar({ pct, tone }: { pct: number; tone: string }) {
@@ -93,6 +102,12 @@ export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => vo
                 <div className="flex justify-between text-xs">
                   <span className="text-base-content/60">累计成本</span>
                   <span className="font-mono tabular-nums">${g.totalCost}</span>
+                </div>
+              )}
+              {typeof g.scrapedAt === "number" && g.scrapedAt > 0 && (
+                <div className="text-[10.5px] text-base-content/35">
+                  账号用量抓取于 {fmtAge(g.scrapedAt)}
+                  {Date.now() - g.scrapedAt > 15 * 60_000 && " ⚠️ 数据偏旧"}
                 </div>
               )}
             </div>

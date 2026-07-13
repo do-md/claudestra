@@ -708,6 +708,13 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     recordMetric("agent_interrupt", { channelId: agent.channelId, agent: agent.name, meta: { trigger: "api" } });
     stopTyping(agent.channelId);
     clearSafetyTimer(agent.channelId);
+    // 被打断的回合 CC 不触发 Stop hook —— agentStatuses 会永远卡在 thinking：
+    // 列表黄点常驻、前端乐观解锁后又被 15s 轮询的 busy 补锁锁回「正在回复」
+    // (owner 2026-07-14 真机)。打断即回合收尾：状态置 done + SSE 广播解锁。
+    const evAgentInt =
+      agentNameForChannel(agent.channelId) ||
+      (agent.channelId === CONTROL_CHANNEL_ID ? "master" : agent.name);
+    emitEvent({ agent: evAgentInt, chatId: agent.channelId, type: "agent_status", data: { status: "done", trigger: "interrupt" } });
     console.log(`⚡ [api] C-c 已发送给 ${agent.name} (token=${tokenId})`);
     return apiJson(200, { ok: true, agent: agent.name });
   }
