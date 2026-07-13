@@ -24,6 +24,8 @@ export interface StreamSink {
   bgTaskStart(id: string, kind: "subagent" | "shell", title: string): void;
   bgTaskUpdate(id: string, items: string[]): void;
   bgTaskDone(id: string, durationMs?: number): void;
+  /** compact 完成：插系统分隔线 + 该 agent contextTokens 即时更新为 post。 */
+  compactDone(pre: number, post: number): void;
 }
 
 /** 处理一条已解析的 Web 流事件。初次发送与断线重连共用。 */
@@ -73,6 +75,9 @@ export function processStreamEvent(sink: StreamSink, evt: WebStreamEvent) {
       break;
     case "bg-done":
       sink.bgTaskDone(evt.id, evt.durationMs);
+      break;
+    case "compact":
+      sink.compactDone(evt.pre, evt.post);
       break;
   }
 }

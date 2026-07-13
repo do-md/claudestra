@@ -327,6 +327,24 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
           }
         }
 
+        // compact 完成通知：compact 结束时 CC 在 jsonl 落一条 system/compact_boundary
+        // （compactMetadata 带 pre/postTokens）。此前「压缩完没完」只能用户亲自去
+        // 验证（owner 2026-07-14）——这里把它变成一等事件：频道推完成消息 +
+        // SSE compact_done（web 端插分隔线、ctx 徽章即时回落）。
+        if (entry.type === "system" && entry.subtype === "compact_boundary") {
+          const cm = entry.compactMetadata || {};
+          const pre = typeof cm.preTokens === "number" ? cm.preTokens : 0;
+          const post = typeof cm.postTokens === "number" ? cm.postTokens : 0;
+          const fmtK = (n: number) => `${Math.round(n / 1000)}k`;
+          state.textQueue.push(pre ? `📦 上下文已压缩：${fmtK(pre)} → ${fmtK(post)}` : "📦 上下文已压缩");
+          emitEvent({
+            agent: state.agentName,
+            chatId: state.channelId,
+            type: "compact_done",
+            data: { preTokens: pre, postTokens: post, trigger: cm.trigger },
+          });
+        }
+
         if (entry.type === "assistant") {
           const content = entry.message?.content;
           if (!Array.isArray(content)) continue;

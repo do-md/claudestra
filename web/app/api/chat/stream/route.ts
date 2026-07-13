@@ -96,6 +96,13 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
       return { t: "bg-update", id: String(d.id ?? ""), items: (d.items as unknown[]).map(String) };
     case "bg_task_completed":
       return { t: "bg-done", id: String(d.id ?? ""), durationMs: typeof d.durationMs === "number" ? d.durationMs : undefined };
+    case "compact_done":
+      // jsonl compact_boundary → 系统分隔线 + ctx 徽章即时回落（不等 15s 轮询）
+      return {
+        t: "compact",
+        pre: typeof d.preTokens === "number" ? d.preTokens : 0,
+        post: typeof d.postTokens === "number" ? d.postTokens : 0,
+      };
     default:
       return null;
   }

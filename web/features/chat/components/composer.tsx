@@ -133,9 +133,17 @@ export function Composer() {
   const store = useChatStoreApi();
   // 上下文超标警示(2026-07-14 owner:到限制要在聊天界面提醒)。每会话可关闭。
   const [ctxDismissedFor, setCtxDismissedFor] = useState("");
+  // 「请求压缩」一次性:点完整条警示立即消失,不给点第二次的机会(owner 2026-07-14
+  // 连点两下发了两条)。压缩成功 → compact_done 把 ctxTokens 打回低位,条自然不再出;
+  // agent 没执行的兜底:10 分钟后 ctx 仍超标才重新亮出来。按 agent 记。
+  const [compactReqAt, setCompactReqAt] = useState<Record<string, number>>({});
   const agentInfo = agents.find((a) => a.name === active);
   const ctxTokens = typeof agentInfo?.contextTokens === "number" ? agentInfo.contextTokens : 0;
-  const showCtxWarn = ctxTokens >= 170_000 && ctxDismissedFor !== active;
+  const reqAt = compactReqAt[active] || 0;
+  const showCtxWarn =
+    ctxTokens >= 170_000 &&
+    ctxDismissedFor !== active &&
+    (!reqAt || Date.now() - reqAt > 10 * 60_000);
 
   const disabled = !active;
   const hasContent = !!text.trim() || files.length > 0;
@@ -397,9 +405,11 @@ export function Composer() {
             </span>
             <button
               className="btn btn-warning btn-xs ml-auto shrink-0"
-              onClick={() =>
-                store.send("上下文占用已经很高了，请执行 /save-compact：先抢救关键记忆，然后压缩上下文。")
-              }
+              onClick={() => {
+                if (reqAt) return; // 双击竞态兜底(rerender 前的第二击)
+                setCompactReqAt((m) => ({ ...m, [active]: Date.now() }));
+                void store.send("上下文占用已经很高了，请执行 /save-compact：先抢救关键记忆，然后压缩上下文。");
+              }}
             >
               请求压缩
             </button>

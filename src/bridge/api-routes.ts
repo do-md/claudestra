@@ -265,6 +265,12 @@ async function sessionTailInfo(path: string): Promise<SessionTailInfo | null> {
       if (!line) continue;
       try {
         const rec = JSON.parse(line);
+        // compact 边界比最近一条 assistant 更新时,占用以 postTokens 为准——
+        // 否则压缩刚完、新回合未跑的窗口里,轮询会把 ctx 徽章顶回压缩前的值
+        if (ctxTokens === null && rec.type === "system" && rec.subtype === "compact_boundary") {
+          const post = rec.compactMetadata?.postTokens;
+          if (typeof post === "number") ctxTokens = post;
+        }
         // 上下文占用:最近一条带 usage 的 assistant——input + cache 读写就是
         // 本轮进模型的全部上下文(web 端「context 快满」指示的数据源)
         if (ctxTokens === null && rec.type === "assistant") {

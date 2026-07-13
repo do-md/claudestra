@@ -74,6 +74,8 @@ export type WebStreamEvent =
   // 后台任务（subagent / bg shell）子会话跟踪：Discord 侧开子区，web 侧渲染折叠面板。
   | { t: "bg-start"; id: string; kind: "subagent" | "shell"; title: string }
   | { t: "bg-update"; id: string; items: string[] }
-  | { t: "bg-done"; id: string; durationMs?: number };
+  | { t: "bg-done"; id: string; durationMs?: number }
+  /** compact 完成（jsonl compact_boundary）：插系统分隔线 + ctx 徽章即时回落。 */
+  | { t: "compact"; pre: number; post: number };
 
 export const SSE_DONE = "[DONE]";

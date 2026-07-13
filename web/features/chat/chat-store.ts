@@ -795,6 +795,24 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     });
   }
 
+  /** compact 完成（bridge compact_done 事件）：聊天流里插一条系统分隔线，并把该
+   *  agent 的 contextTokens 即时改成 post——ctx 徽章/警示条不用等 15s 轮询回落。
+   *  此前「压缩完没完」全靠用户亲自去验证（owner 2026-07-14），这条就是完成回执。 */
+  public compactDone(pre: number, post: number) {
+    this.flushPendingText();
+    const fmtK = (n: number) => `${Math.round(n / 1000)}k`;
+    this.produce((s) => {
+      s.messages.push({
+        id: this.nextId(),
+        role: "system",
+        content: pre ? `📦 上下文已压缩：${fmtK(pre)} → ${fmtK(post)}` : "📦 上下文已压缩",
+        ts: new Date().toISOString(),
+      });
+      const a = s.agents.find((x) => x.name === s.activeAgent);
+      if (a) a.contextTokens = post;
+    });
+  }
+
   /** POST 一个交互回传（interrupt/permission/auq）到 BFF，统一处理 401/错误。 */
   private async postAction(
     path: string,
