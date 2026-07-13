@@ -120,7 +120,12 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
         <span className="font-semibold">会话</span>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-2 pb-3">
+      {/* touch-pan-y + overscroll-contain：iOS 到边界时滚动链会穿透到不可滚的
+          fixed 应用壳，橡皮筋吃掉手势看着像「滑不动」（BgLines 同款修法）。 */}
+      <div
+        className="flex-1 touch-pan-y overflow-y-auto overscroll-contain px-2 pb-3"
+        style={{ WebkitOverflowScrolling: "touch" }}
+      >
         {/* 首拉未完成（!ready）时绝不显示「暂无会话」——SSR 首帧就渲染空态
             是入场卡顿的观感元凶（2026-07-13）；入场期由全屏 Splash 盖住。 */}
         {(!ready || loading) && agents.length === 0 && (
@@ -129,7 +134,10 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
         {ready && !loading && agents.length === 0 && (
           <div className="px-2 py-4 text-sm opacity-50">暂无会话</div>
         )}
-        <ul className="menu w-full gap-0.5 p-0">
+        {/* 不用 daisyUI menu 类——它给每行自带 :hover/:active 按压高亮，iOS 上
+            手指一碰就闪（滑动时「一直触发 hover 特效」，2026-07-13 真机）；
+            行样式本来就是自定义的。 */}
+        <ul className="flex w-full list-none flex-col gap-0.5 p-0">
           {agents.map((a) => (
             <AgentRow
               key={a.name}
