@@ -258,6 +258,17 @@ export function TerminalView({
                 term.resize(evt.cols, evt.rows);
               }
               if (!disposed) setStatus("connected");
+            } else if (evt.t === "resize" && evt.cols && evt.rows) {
+              // 后端 settle 校正推送（iTerm 钳制解除失败的降级/恢复）——同步 xterm
+              if (!disposed) {
+                if (term.cols !== evt.cols || term.rows !== evt.rows) term.resize(evt.cols, evt.rows);
+                lastCols = evt.cols;
+                lastRows = evt.rows;
+                if (mobile) {
+                  adaptFontSize(evt.cols);
+                  setMirror({ cols: evt.cols, rows: evt.rows });
+                }
+              }
             } else if (evt.t === "exit") {
               if (!disposed) setStatus("exited");
             }

@@ -56,6 +56,15 @@ async function tmuxRun(args: string[]): Promise<{ code: number; out: string; err
 
 // ---------- 会话表 ----------
 
+/** iTerm -CC 钳制解除记录：断开时按原尺寸改写回去，桌面端恢复原状。 */
+interface ClampLift {
+  windowId: string;
+  /** 被改写申报尺寸的控制客户端（iTerm -CC） */
+  clients: string[];
+  origCols: number;
+  origRows: number;
+}
+
 interface TermSession {
   id: string;
   tokenId: string;
@@ -63,6 +72,16 @@ interface TermSession {
   viewerSession: string;
   /** master 侧被 link 的窗口引用（断开时恢复 window-size latest 用） */
   windowRef: string;
+  /** 本 viewer 解除过 iTerm 钳制 → 断开时改写回原尺寸 */
+  lift?: ClampLift;
+  /** 最近一次请求的视口（settle 重申用） */
+  want: { cols: number; rows: number };
+  /** 当前 PTY 尺寸（settle 校正比对用） */
+  effCols: number;
+  effRows: number;
+  /** 往 SSE 流推帧（settle 校正推送 resize 事件用；stream start 时赋值） */
+  push?: (payload: string) => void;
+  settleTimer?: ReturnType<typeof setTimeout>;
   term: InstanceType<typeof Bun.Terminal>;
   proc: ReturnType<typeof Bun.spawn>;
   createdAt: number;
@@ -122,6 +141,124 @@ function clampInt(v: string | null, def: number, min: number, max: number): numb
   return Math.max(min, Math.min(max, Math.round(n)));
 }
 
+/**
+ * 解除 iTerm2 -CC 的 per-tab 尺寸钳制。
+ *
+ * 控制客户端会为每个窗口申报自己 tab 的尺寸,tmux 把 window 钳到 ≤ 该申报值——
+ * resize-window / window-size manual 都顶不动（2026-07-13 实验:exit=0、manual
+ * 已置,尺寸纹丝不动）。唯一有效的杠杆是 refresh-client -C <windowId>:WxH 改写
+ * 控制客户端的申报值（同实验:改写后立即生效且不回弹,iTerm 只在自己 tab 几何
+ * 变化时才重新申报）。返回原尺寸供断开时改写回去;无控制客户端时返回 null
+ * （没有钳制来源,不需要解除）。
+ */
+async function liftControlClamp(
+  windowRef: string,
+  cols: number,
+  rows: number,
+  origCols: number,
+  origRows: number,
+): Promise<ClampLift | null> {
+  const idRes = await tmuxRun([
+    "display-message", "-p", "-t", `${MASTER_SESSION}:${windowRef}`, "#{window_id}",
+  ]);
+  const wid = idRes.out.trim();
+  if (idRes.code !== 0 || !/^@\d+$/.test(wid)) return null;
+  const clientsRes = await tmuxRun(["list-clients", "-F", "#{client_name}\t#{client_control_mode}"]);
+  if (clientsRes.code !== 0) return null;
+  const clients = clientsRes.out
+    .split("\n")
+    .filter((l) => l.endsWith("\t1"))
+    .map((l) => l.split("\t")[0])
+    .filter(Boolean);
+  if (!clients.length) return null;
+  for (const c of clients) {
+    await tmuxRun(["refresh-client", "-t", c, "-C", `${wid}:${cols}x${rows}`]).catch(() => {});
+  }
+  return { windowId: wid, clients, origCols, origRows };
+}
+
+/** 把控制客户端的申报尺寸改写回解除前的值（断开 / 失败清理路径共用）。 */
+function restoreControlClamp(lift: ClampLift | undefined | null): void {
+  if (!lift) return;
+  for (const c of lift.clients) {
+    tmuxRun(["refresh-client", "-t", c, "-C", `${lift.windowId}:${lift.origCols}x${lift.origRows}`]).catch(() => {});
+  }
+}
+
+/**
+ * 把 window 拉到 viewer 视口尺寸：先普通 resize-window;window 仍比请求小
+ * = 有控制客户端钳制 → liftControlClamp 改写申报值后再拉一次。返回实际
+ * eff/win 尺寸与 lift 记录（open 和 resize 端点共用）。
+ */
+async function fitWindow(
+  viewerTarget: string,
+  windowRef: string,
+  cols: number,
+  rows: number,
+  existingLift?: ClampLift,
+): Promise<{ effCols: number; effRows: number; winCols: number; winRows: number; lift?: ClampLift }> {
+  const read = async () => {
+    const r = await tmuxRun(["display-message", "-p", "-t", viewerTarget, "#{window_width}x#{window_height}"]);
+    const m = /^(\d+)x(\d+)$/.exec(r.out.trim());
+    return r.code === 0 && m ? { w: parseInt(m[1], 10), h: parseInt(m[2], 10) } : null;
+  };
+  // 原始尺寸必须在任何 resize 之前捕获——resize 可能已经动了宽度，事后读到的
+  // 不再是 iTerm tab 的真实原值，断开还原就还错了
+  const before = await read();
+  await tmuxRun(["resize-window", "-t", viewerTarget, "-x", String(cols), "-y", String(rows)]).catch(() => {});
+  let win = await read();
+  let lift = existingLift;
+  if (win && (win.w < cols || win.h < rows)) {
+    if (lift) {
+      // 已解除过（同一 viewer 再次 resize）→ 直接改写到新尺寸，orig 保持首捕值
+      for (const c of lift.clients) {
+        await tmuxRun(["refresh-client", "-t", c, "-C", `${lift.windowId}:${cols}x${rows}`]).catch(() => {});
+      }
+    } else {
+      const orig = before ?? win;
+      lift = (await liftControlClamp(windowRef, cols, rows, orig.w, orig.h)) ?? undefined;
+    }
+    if (lift) {
+      await tmuxRun(["resize-window", "-t", viewerTarget, "-x", String(cols), "-y", String(rows)]).catch(() => {});
+      win = (await read()) ?? win;
+    }
+  }
+  const winCols = win?.w ?? cols;
+  const winRows = win?.h ?? rows;
+  return { effCols: Math.min(cols, winCols), effRows: Math.min(rows, winRows), winCols, winRows, lift };
+}
+
+/**
+ * lift 后的一次性稳定器。iTerm 跟随宽度变化重排原生窗口后会**重新申报**该窗口
+ * 尺寸，晚于 fitWindow 的读数落地 → 窗口被打回（实验：宽度变化必触发重申报;
+ * 高度超原生窗口物理上限时原生不动、不再申报）。等它落地后再改写一次即钉住。
+ * 若 3 轮后仍被钳（无控制客户端可改写等），把 PTY 校正到实际尺寸并推送前端。
+ */
+function scheduleSettle(sess: TermSession, attempt = 0): void {
+  if (sess.settleTimer) clearTimeout(sess.settleTimer);
+  sess.settleTimer = setTimeout(async () => {
+    sess.settleTimer = undefined;
+    if (!termSessions.has(sess.id)) return;
+    const { cols, rows } = sess.want;
+    const f = await fitWindow(`${sess.viewerSession}:9`, sess.windowRef, cols, rows, sess.lift);
+    if (f.lift) sess.lift = f.lift;
+    if (!termSessions.has(sess.id)) return;
+    if ((f.winCols < cols || f.winRows < rows) && attempt < 2) {
+      scheduleSettle(sess, attempt + 1);
+      return;
+    }
+    if (f.effCols !== sess.effCols || f.effRows !== sess.effRows) {
+      sess.effCols = f.effCols;
+      sess.effRows = f.effRows;
+      try {
+        sess.term.resize(f.effCols, f.effRows);
+        sess.proc.kill("SIGWINCH");
+      } catch { /* PTY 已关 */ }
+      sess.push?.(`data: {"t":"resize","cols":${f.effCols},"rows":${f.effRows},"wcols":${f.winCols},"wrows":${f.winRows}}\n\n`);
+    }
+  }, 1200);
+}
+
 // ---------- 端点 ----------
 
 /**
@@ -164,23 +301,14 @@ export async function handleTerminalApi(req: Request, url: URL): Promise<Respons
       }
       return json(200, { ok: true });
     }
-    // resize：先尝试把 window 拉到新视口,再按 window 实际尺寸 clamp PTY
-    // （window 被 iTerm -CC 的 per-tab 尺寸钳住时拉不动——视口>window 的区域
-    // tmux 会画填充点,所以 PTY 必须 ≤ window;实际值回传给前端 xterm 同步）。
+    // resize：fitWindow 把 window 拉到新视口（iTerm -CC 钳制时先解除），
+    // 再按 window 实际尺寸 clamp PTY;实际值回传给前端 xterm 同步。
     const cols = clampInt(String(body.cols ?? ""), 0, 20, 500);
     const rows = clampInt(String(body.rows ?? ""), 0, 5, 200);
     if (!cols || !rows) return json(400, { ok: false, error: "missing/invalid cols,rows" });
-    await tmuxRun(["resize-window", "-t", `${sess.viewerSession}:9`, "-x", String(cols), "-y", String(rows)]).catch(() => {});
-    let effCols = cols, effRows = rows;
-    let winCols = cols, winRows = rows;
-    const actual = await tmuxRun(["display-message", "-p", "-t", `${sess.viewerSession}:9`, "#{window_width}x#{window_height}"]);
-    const m = /^(\d+)x(\d+)$/.exec(actual.out.trim());
-    if (actual.code === 0 && m) {
-      winCols = parseInt(m[1], 10);
-      winRows = parseInt(m[2], 10);
-      effCols = Math.min(cols, winCols);
-      effRows = Math.min(rows, winRows);
-    }
+    const fitted = await fitWindow(`${sess.viewerSession}:9`, sess.windowRef, cols, rows, sess.lift);
+    if (fitted.lift) sess.lift = fitted.lift;
+    const { effCols, effRows, winCols, winRows } = fitted;
     try {
       sess.term.resize(effCols, effRows);
       // 无 controlling tty → 内核不发 SIGWINCH，必须手动补（PoC 实证，勿删）
@@ -188,6 +316,10 @@ export async function handleTerminalApi(req: Request, url: URL): Promise<Respons
     } catch (e) {
       return json(500, { ok: false, error: `resize failed: ${(e as Error).message}` });
     }
+    sess.want = { cols, rows };
+    sess.effCols = effCols;
+    sess.effRows = effRows;
+    if (fitted.lift) scheduleSettle(sess); // iTerm 迟到的重申报会打回尺寸，落定后再钉一次
     // wcols/wrows = window 实际尺寸——移动端用它做「完整镜像」目标（PTY 提到
     // window 尺寸,字号再按屏宽自适应,不然 window 比手机视口宽时内容被裁）
     return json(200, { ok: true, cols: effCols, rows: effRows, wcols: winCols, wrows: winRows });
@@ -255,26 +387,15 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
   }
   await tmuxRun(["select-window", "-t", `${viewerSession}:9`]);
   await tmuxRun(["kill-window", "-t", `${viewerSession}:0`]);
-  // 消「点阵」两步（2026-07-13 真机「点好多好恶心」）：
-  // ① resize-window 尝试把 window 拉到 viewer 视口——但 tmux 铁律是 window 尺寸
-  //    ≤ 显示它的最小 client（master 上 iTerm -CC 给每个 tab 报自己的尺寸），
-  //    拉不动就会被钳住（实验：exit=0、置 manual、尺寸纹丝不动）。
-  // ② 所以反向 clamp：读 window 实际尺寸,PTY/xterm 用 min(视口, window)——
-  //    视口=window 就没有「window 外」区域,tmux 无处画点;空余留前端背景色。
-  //    断开时恢复 window-size latest,把尺寸决定权还给 iTerm。
-  await tmuxRun(["resize-window", "-t", `${viewerSession}:9`, "-x", String(cols), "-y", String(rows)]);
-  const actual = await tmuxRun(["display-message", "-p", "-t", `${viewerSession}:9`, "#{window_width}x#{window_height}"]);
-  let effCols = cols, effRows = rows;
-  let winCols = cols, winRows = rows;
-  {
-    const m = /^(\d+)x(\d+)$/.exec(actual.out.trim());
-    if (actual.code === 0 && m) {
-      winCols = parseInt(m[1], 10);
-      winRows = parseInt(m[2], 10);
-      effCols = Math.min(cols, winCols);
-      effRows = Math.min(rows, winRows);
-    }
-  }
+  // 尺寸三段式（2026-07-13 定稿）：
+  // ① resize-window 尝试把 window 拉到 viewer 视口;
+  // ② 拉不动 = iTerm -CC 控制客户端按 tab 申报尺寸在钳制 → fitWindow 里
+  //    refresh-client -C 改写申报值解除钳制再拉（实验实证:manual/resize 都
+  //    顶不动,改写申报值立即生效不回弹）,断开时改写回原值还原桌面端;
+  // ③ 仍失败（无控制客户端等）才反向 clamp:PTY 用 min(视口, window),
+  //    视口=window 就没有「window 外」区域,tmux 无处画填充点。
+  const fitted = await fitWindow(`${viewerSession}:9`, windowRef, cols, rows);
+  const { effCols, effRows, winCols, winRows } = fitted;
   // 滚动支持：CC TUI 在 alternate screen（无滚动缓冲），滚轮要靠 tmux 的
   // copy-mode——viewer session 开 mouse（session 级选项，master/本地 attach
   // 不受影响），tmux 会向 PTY 请求鼠标上报，xterm.js 自动转发滚轮 → tmux
@@ -291,11 +412,14 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
         if (closed) return;
         closed = true;
         if (ping) { clearInterval(ping); ping = null; }
+        if (sess.settleTimer) { clearTimeout(sess.settleTimer); sess.settleTimer = undefined; }
         termSessions.delete(termId);
         try { sess.proc.kill(); } catch { /* 已退出 */ }
         try { sess.term.close(); } catch { /* 已关闭 */ }
         // fire-and-forget：viewer session 清理失败由启动 sweep 兜底
         tmuxRun(["kill-session", "-t", viewerSession]).catch(() => {});
+        // 解除过 iTerm 钳制 → 申报尺寸改写回原值，桌面端恢复原状
+        restoreControlClamp(sess.lift);
         // 把 window 尺寸决定权还回去（resize-window 置了 manual;不恢复的话
         // master/iTerm 里这个窗口会一直钉在手机尺寸）
         tmuxRun(["set-option", "-w", "-t", `${MASTER_SESSION}:${windowRef}`, "window-size", "latest"]).catch(() => {});
@@ -329,6 +453,7 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
       } catch (e) {
         release();
         tmuxRun(["kill-session", "-t", viewerSession]).catch(() => {});
+        restoreControlClamp(fitted.lift); // 已解除钳制但 session 没建成 → 就地还原
         try { controller.error(e); } catch { /* 已关闭 */ }
         console.error(`🖥️ [term] spawn failed id=${termId.slice(0, 8)} agent=${agentParam}:`, e);
         return;
@@ -339,6 +464,11 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
         agent: agentParam,
         viewerSession,
         windowRef,
+        lift: fitted.lift,
+        want: { cols, rows },
+        effCols,
+        effRows,
+        push: send,
         term,
         proc,
         createdAt: Date.now(),
@@ -352,6 +482,7 @@ async function openTerminal(req: Request, url: URL, agentParam: string): Promise
       // wcols/wrows = window 实际尺寸——移动端据此把 PTY 提到 window 大小做完整镜像
       send(`data: {"t":"open","id":"${termId}","cols":${effCols},"rows":${effRows},"wcols":${winCols},"wrows":${winRows}}\n\n`);
       ping = setInterval(() => send(`: ping\n\n`), 5_000);
+      if (fitted.lift) scheduleSettle(sess); // iTerm 迟到的重申报会打回尺寸，落定后再钉一次
 
       // PTY 进程退出（window 被 kill / tmux server 重启）→ 通知前端并收尾
       proc.exited.then(() => {
