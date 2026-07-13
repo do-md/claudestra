@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 export default function LoginPage() {
@@ -8,6 +8,10 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  // 水合完成前提交按钮禁用：冷启动时 JS 未就绪就点提交,表单会走原生 GET
+  // 提交(地址栏变 /login?、页面刷新),看起来像「登录失败」(2026-07-14 真机)
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => setHydrated(true), []);
   const router = useRouter();
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -73,9 +77,9 @@ export default function LoginPage() {
             <button
               type="submit"
               className="btn btn-primary btn-sm w-full"
-              disabled={loading}
+              disabled={loading || !hydrated}
             >
-              {loading ? (
+              {loading || !hydrated ? (
                 <span className="loading loading-spinner loading-xs" />
               ) : (
                 "登录"
