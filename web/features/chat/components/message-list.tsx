@@ -1,5 +1,5 @@
 "use client";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useChatStore } from "../chat-store";
 import type { ChatMessage, ChatAttachmentView, ToolCallView, AssistantSegment } from "../type";
 import { Domd } from "@/components/domd";
@@ -402,6 +402,10 @@ export function MessageList() {
   const bgTaskCount = useChatStore((s) => s.state.bgTasks.length);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
+  // 窗口化初始渲染：打开会话只挂最近 30 个气泡（历史一次挂几十个气泡+几百张
+  // 工具卡，手机上进页那一下明显卡），「显示更早」按需展开。extra 按会话重置。
+  const [extraVisible, setExtraVisible] = useState(0);
+  const prevScrollHeightRef = useRef<number | null>(null);
 
   /* 滚动方案（抄 claude-os thread.tsx 的两层结构，坑都踩过了别改回去）：
      ① 只在「消息条数/卡片」变化时 smooth 滚底——deps 用 messages.length 而非 messages：
@@ -416,7 +420,16 @@ export function MessageList() {
         视窗（owner 真机截图 2026-07-11）。 */
   useEffect(() => {
     followRef.current = true; // 切会话恢复吸底
+    setExtraVisible(0); // 渲染窗口回到「最近 30 条」
   }, [active]);
+
+  // 「显示更早」展开后保持视口锚定：内容在上方插入，滚动位置按增量补偿
+  useLayoutEffect(() => {
+    if (prevScrollHeightRef.current === null) return;
+    const el = scrollerRef.current;
+    if (el) el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
+    prevScrollHeightRef.current = null;
+  }, [extraVisible]);
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -457,6 +470,12 @@ export function MessageList() {
   const standaloneThinking =
     awaiting && !(last && last.role === "assistant" && last.streamed);
 
+  // 渲染窗口 = 尾部 30+extra 条（visible 是 messages 的后缀 → 全列表最后一条
+  // 就是 visible 最后一条，isLast 语义不变）
+  const windowSize = 30 + extraVisible;
+  const visible = messages.length > windowSize ? messages.slice(-windowSize) : messages;
+  const hiddenCount = messages.length - visible.length;
+
   return (
     <div ref={scrollerRef} className="flex-1 overflow-y-auto">
       {/* 横向留白对齐 claude-os thread（px-7=28px + 居中限宽），手机端稍收到 24px，
@@ -473,12 +492,23 @@ export function MessageList() {
             向 {active} 发送第一条消息
           </div>
         )}
-        {messages.map((m, i) => (
+        {hiddenCount > 0 && (
+          <button
+            className="btn btn-ghost btn-xs mx-auto mb-4 text-base-content/50"
+            onClick={() => {
+              prevScrollHeightRef.current = scrollerRef.current?.scrollHeight ?? null;
+              setExtraVisible((n) => n + 100);
+            }}
+          >
+            显示更早的 {hiddenCount} 条
+          </button>
+        )}
+        {visible.map((m, i) => (
           <Message
             key={m.id}
             m={m}
             streaming={streaming}
-            isLast={i === messages.length - 1}
+            isLast={i === visible.length - 1}
             awaiting={awaiting}
           />
         ))}
