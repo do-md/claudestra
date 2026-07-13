@@ -130,6 +130,37 @@ html.canvas-list {
 }
 
 /*
+ * ── 全屏 Splash（landing + 加载一体，2026-07-13 owner「藏一下加载、好看一点」）──
+ */
+@keyframes splash-mark {
+    0%,
+    100% {
+        transform: scale(1) rotate(0deg);
+        opacity: 0.85;
+    }
+    50% {
+        transform: scale(1.1) rotate(8deg);
+        opacity: 1;
+    }
+}
+.splash-mark {
+    animation: splash-mark 2.6s ease-in-out infinite;
+}
+@keyframes splash-in {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+.splash-in {
+    animation: splash-in 0.5s ease-out both;
+}
+
+/*
  * 「运行中」状态呼吸光晕：替换生硬的 animate-ping（scale(2)+opacity0 的雷达脉冲，
  * owner 反馈「特别挫」）。改用慢速 ease-in-out 对称呼吸——小幅缩放的柔和外晕，
  * 读作「活着的呼吸」而非扩散的雷达波。用于列表状态点 + composer「正在回复」。

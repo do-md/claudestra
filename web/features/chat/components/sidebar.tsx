@@ -79,6 +79,7 @@ function AgentRow({
 export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const agents = useChatStore((s) => s.state.agents);
   const loading = useChatStore((s) => s.state.loadingAgents);
+  const ready = useChatStore((s) => s.state.agentsReady);
   const active = useChatStore((s) => s.state.activeAgent);
 
   return (
@@ -94,10 +95,12 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 pb-3">
-        {loading && agents.length === 0 && (
+        {/* 首拉未完成（!ready）时绝不显示「暂无会话」——SSR 首帧就渲染空态
+            是入场卡顿的观感元凶（2026-07-13）；入场期由全屏 Splash 盖住。 */}
+        {(!ready || loading) && agents.length === 0 && (
           <div className="px-2 py-4 text-sm opacity-50">加载中…</div>
         )}
-        {!loading && agents.length === 0 && (
+        {ready && !loading && agents.length === 0 && (
           <div className="px-2 py-4 text-sm opacity-50">暂无会话</div>
         )}
         <ul className="menu w-full gap-0.5 p-0">

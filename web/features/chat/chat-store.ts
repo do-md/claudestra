@@ -24,6 +24,9 @@ function agentsSignature(list: AgentSession[]): string {
 interface ChatState {
   agents: AgentSession[];
   loadingAgents: boolean;
+  /** agents 首拉是否已完成（成败均置 true）。false = 入场期，Splash 在场，
+   *  侧栏不许显示「暂无会话」（SSR 首帧就渲染空态是 2026-07-13 的观感 bug）。 */
+  agentsReady: boolean;
   /** 当前打开的 agent 名（""=未选） */
   activeAgent: string;
   messages: ChatMessage[];
@@ -69,6 +72,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     super({
       agents: [],
       loadingAgents: false,
+      agentsReady: false,
       activeAgent: "",
       messages: [],
       loadingHistory: false,
@@ -101,10 +105,12 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       this.produce((s) => {
         s.agents = json.data ?? [];
         s.loadingAgents = false;
+        s.agentsReady = true;
       });
     } catch {
       this.produce((s) => {
         s.loadingAgents = false;
+        s.agentsReady = true; // 失败也算入场结束——Splash 得退场，别永远盖着
       });
     }
   }

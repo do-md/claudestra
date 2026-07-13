@@ -12,6 +12,7 @@ import { ChatNavContext, useChatNav, type ChatNav } from "./nav-context";
 import { Sidebar } from "./sidebar";
 import { MessageList } from "./message-list";
 import { Composer } from "./composer";
+import { Splash } from "./splash";
 import { AgentActions } from "./agent-actions";
 import { TerminalButton } from "../../terminal/terminal-button";
 
@@ -217,6 +218,9 @@ function ChatInner() {
             <Composer />
           </main>
         </div>
+        {/* 全屏启动页：在横滑 transform 容器之外（规则 5.5——fixed 不能在
+            transform 祖先内定位），盖住整个入场加载过程 */}
+        <Splash />
       </div>
     </ChatNavContext.Provider>
   );
