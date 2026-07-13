@@ -3018,15 +3018,28 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
         } catch { /* non-critical */ }
       }
 
-      // 启动 JSONL watcher（仅用于 tool use 流式展示，空闲检测由 hooks 处理）
-      try {
-        const regResult = await runManager("list");
-        const agent = (regResult.agents || []).find((a: any) => a.channelId === msg.channelId);
-        if (agent?.sessionId && agent?.project) {
-          const cwd = agent.project.replace(/^~/, process.env.HOME || "~");
-          startWatching(agent.name, cwd, agent.sessionId, msg.channelId, discord);
-        }
-      } catch { /* non-critical */ }
+      // 启动 JSONL watcher（仅用于 tool use 流式展示，空闲检测由 hooks 处理）。
+      // create 路径 race：register 先于 manager 落 registry（create 到第 6 步才写），
+      // 单次 lookup 必落空且 catch 静默 → 新建 agent 直到下次 bridge/agent 重启都
+      // 没有 watcher（2026-07-14 test-compact 实锤）。改成短轮询等 registry 出现，
+      // 5s×12 上限；restart 路径 registry 已在，首轮即命中，行为不变。
+      if (msg.channelId !== CONTROL_CHANNEL_ID) {
+        void (async () => {
+          for (let i = 0; i < 12; i++) {
+            try {
+              const regResult = await runManager("list");
+              const agent = (regResult.agents || []).find((a: any) => a.channelId === msg.channelId);
+              if (agent?.sessionId && agent?.project) {
+                const cwd = agent.project.replace(/^~/, process.env.HOME || "~");
+                startWatching(agent.name, cwd, agent.sessionId, msg.channelId, discord);
+                return;
+              }
+            } catch { /* registry 竞写等瞬时错，下一轮再试 */ }
+            await new Promise((r) => setTimeout(r, 5000));
+          }
+          console.warn(`⚠️ register 后 60s registry 仍无此频道的 agent，放弃挂 watcher: ${msg.channelId}`);
+        })();
+      }
 
       break;
     }
