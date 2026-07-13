@@ -214,6 +214,26 @@ export function commandsForAgent(agentName: string | null): AgentCommandInfo[] {
   return out;
 }
 
+/**
+ * [fork] Web 自由文本调用解析。与 resolveInvocation 的差别只在 builtin：
+ * builtin 的 argBuilder 按 Discord option 名取值（vals.instructions / vals.name…），
+ * web 端只有一段自由文本参数——直接原样拼接，否则「/compact 保留xx」会被
+ * 静默丢参成裸 /compact（2026-07-14 code review 抓到）。skill 路径本就用
+ * vals.args，直接复用 resolveInvocation。
+ */
+export function resolveWebInvocation(
+  name: string,
+  agentName: string | null,
+  rawArgs: string
+): { ok: true; ccText: string; scope: string } | { ok: false; reason: string } {
+  const builtin = state.builtins.get(name);
+  if (builtin) {
+    const a = rawArgs.trim();
+    return { ok: true, ccText: `/${builtin.invokeName}${a ? ` ${a}` : ""}`, scope: "builtin" };
+  }
+  return resolveInvocation(name, agentName, { args: rawArgs });
+}
+
 /** 快速 dump（调试用） */
 export function debugSnapshot() {
   return {

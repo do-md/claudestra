@@ -9,6 +9,7 @@ import {
   clearProject,
   allRegistrableCommands,
   resolveInvocation,
+  resolveWebInvocation,
   isProjectSkillForOtherAgent,
   debugSnapshot,
 } from "../src/bridge/slash-registry.js";
@@ -107,5 +108,41 @@ describe("slash-registry", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // [fork] resolveWebInvocation：web 自由文本参数路径
+  test("resolveWebInvocation: builtin 自由文本参数不丢失", () => {
+    const r = resolveWebInvocation("compact", null, "保留最近的对话重点");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // resolveInvocation 的 argBuilder 按 Discord option 名(vals.instructions)取值,
+      // web 只有裸 args —— 直通拼接是修复点(丢参 bug,2026-07-14 review)
+      expect(r.ccText).toBe("/compact 保留最近的对话重点");
+      expect(r.scope).toBe("builtin");
+    }
+  });
+
+  test("resolveWebInvocation: builtin 无参数保持裸命令", () => {
+    const r = resolveWebInvocation("cost", null, "");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.ccText).toBe("/cost");
+  });
+
+  test("resolveWebInvocation: project skill 带参数走 vals.args", async () => {
+    const dir = setupFakeProject("web-skill");
+    try {
+      await scanProject("agent-W", dir);
+      const r = resolveWebInvocation("web-skill", "agent-W", "some args");
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.ccText).toBe("/web-skill some args");
+    } finally {
+      clearProject("agent-W");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveWebInvocation: 未知命令返回 error", () => {
+    const r = resolveWebInvocation("no-such-cmd-web", null, "x");
+    expect(r.ok).toBe(false);
   });
 });

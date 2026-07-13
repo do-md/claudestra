@@ -42,7 +42,7 @@ import {
 import { stopTyping } from "./components.js";
 import { clearSafetyTimer } from "./discord-adapter.js";
 import { recordMetric } from "../lib/metrics.js";
-import { commandsForAgent, resolveInvocation, isProjectSkillForOtherAgent } from "./slash-registry.js";
+import { commandsForAgent, resolveWebInvocation, isProjectSkillForOtherAgent } from "./slash-registry.js";
 import { projectsSlug } from "../lib/jsonl-cost.js";
 
 // [fork] master 不在 registry，从 env 读其控制频道 id（各端点的 master 特判用）
@@ -624,7 +624,7 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     const slashM = attachments.length === 0 ? text.trim().match(/^\/([\w:-]+)(?:\s+([\s\S]+))?$/) : null;
     if (slashM) {
       const regName = agent.name === "master" ? null : agent.name;
-      const resolved = resolveInvocation(slashM[1], regName, { args: slashM[2] || "" });
+      const resolved = resolveWebInvocation(slashM[1], regName, slashM[2] || "");
       if (resolved.ok) {
         const win = agent.name === "master" ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
         try {
