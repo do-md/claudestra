@@ -2,6 +2,7 @@ export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 import { isAuthed } from "@/lib/api-auth";
+import { readWebConfig } from "@/lib/web-config";
 
 /**
  * 语音转文字（2026-07-14 owner：应用内语音输入,根治豆包输入法跳 App 黑屏）。
@@ -18,10 +19,11 @@ export async function POST(request: Request) {
   if (!(await isAuthed(request))) {
     return NextResponse.json({ error: "未登录" }, { status: 401 });
   }
-  const key = process.env.GROQ_API_KEY;
+  // 界面配置优先（设置弹窗保存,即时生效）,env 兜底
+  const key = (await readWebConfig()).groqApiKey || process.env.GROQ_API_KEY;
   if (!key) {
     return NextResponse.json(
-      { error: "语音识别未配置（缺 GROQ_API_KEY）" },
+      { error: "语音识别未配置——点侧栏 ⚙️ 设置里填入 Groq API Key" },
       { status: 501 }
     );
   }

@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
+import { SettingsModal } from "./settings-modal";
 
 function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: boolean }) {
   if (status === "active") {
@@ -110,6 +111,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const streaming = useChatStore((s) => s.state.streaming);
   // agent 搜索（2026-07-13 owner）：名称/用途 大小写不敏感即时过滤，纯前端
   const [query, setQuery] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
   const q = query.trim().toLowerCase();
   const filtered = q
     ? agents.filter((a) => `${a.displayName} ${a.name} ${a.purpose}`.toLowerCase().includes(q))
@@ -126,6 +128,17 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
       >
         <div className="flex items-center pb-2.5">
           <span className="font-semibold">会话</span>
+          <button
+            className="ml-auto flex size-7 items-center justify-center rounded-lg text-base-content/50 transition-colors hover:bg-base-300 hover:text-base-content"
+            title="设置"
+            aria-label="设置"
+            onClick={() => setShowSettings(true)}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+          </button>
         </div>
         <label className="flex items-center gap-2 rounded-lg bg-base-300/60 px-2.5 py-1.5">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" className="shrink-0 opacity-40">
@@ -195,6 +208,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
       >
         Claudestra Web
       </div>
+      <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
     </aside>
   );
 }
