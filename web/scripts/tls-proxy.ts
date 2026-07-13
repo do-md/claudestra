@@ -1,6 +1,12 @@
 /**
  * TLS 终结代理：https://mac-mini-jp.<tailnet>.ts.net → http://127.0.0.1:33333
  *
+ * ⚠ 已退役(2026-07-14):裸 TCP 代理只有 HTTP/1.1——Safari 每域名 6 连接,
+ * dev 模式几百个 chunk 串行化,手机端加载卡死(真机:登录按钮永久转圈/卡
+ * Splash)。现役方案 = Caddy(brew)做 h2 终结,LaunchAgent
+ * com.claudestra.tls-proxy 指 caddy run --config
+ * ~/.claude-orchestrator/web/caddy/Caddyfile。本文件保留作无 caddy 环境的备用。
+ *
  * 为什么存在（2026-07-14）：getUserMedia 要求安全上下文，经 Tailscale IP 的
  * HTTP 访问被浏览器硬禁麦克风（语音输入）。tailscale serve 本是首选，但 macOS
  * GUI 版 CLI 在本机报「The Tailscale GUI failed to start (CLIError error 3)」
