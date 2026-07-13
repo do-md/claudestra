@@ -1,0 +1,102 @@
+/**
+ * TLS 终结代理：https://mac-mini-jp.<tailnet>.ts.net → http://127.0.0.1:33333
+ *
+ * 为什么存在（2026-07-14）：getUserMedia 要求安全上下文，经 Tailscale IP 的
+ * HTTP 访问被浏览器硬禁麦克风（语音输入）。tailscale serve 本是首选，但 macOS
+ * GUI 版 CLI 在本机报「The Tailscale GUI failed to start (CLIError error 3)」
+ * 写不进 serve 配置——于是 `tailscale cert` 签发 ts.net 证书 + 本脚本自己做
+ * TLS 终结。裸 TCP 双向转发,HTTP/SSE/WebSocket(Next HMR)全部透明。
+ *
+ * - 监听 0.0.0.0:443——macOS 非 root 只许绑低端口的通配地址(绑具体 IP 报
+ *   EACCES)。LAN 暴露面与 dev server(0.0.0.0:33333)一致,应用自带登录;
+ *   证书只对 ts.net 域名有效,证书校验型客户端只会经 tailnet 名访问
+ * - 证书: ~/.claude-orchestrator/web/tls/mac.{crt,key}（tailscale cert 签发,
+ *   90 天有效——过期前重跑 `tailscale cert` 后重启本进程,见 renewIfNeeded）
+ * - 运行: LaunchAgent com.claudestra.tls-proxy（bun 直跑本文件）
+ */
+
+import { spawnSync } from "child_process";
+import { existsSync, statSync } from "fs";
+
+const HOME = process.env.HOME!;
+const TLS_DIR = `${HOME}/.claude-orchestrator/web/tls`;
+const CERT = `${TLS_DIR}/mac.crt`;
+const KEY = `${TLS_DIR}/mac.key`;
+const TS_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+const TS_HOST = "mac-mini-jp.tailfdc471.ts.net";
+const LISTEN_HOST = process.env.TLS_PROXY_BIND || "0.0.0.0";
+const LISTEN_PORT = Number(process.env.TLS_PROXY_PORT || 443);
+const BACKEND_PORT = Number(process.env.TLS_PROXY_BACKEND || 33333);
+
+/** 证书 60 天以上旧(90 天有效)→ 启动时尝试续签;失败继续用旧证书。 */
+function renewIfNeeded(): void {
+  try {
+    const ageDays = existsSync(CERT)
+      ? (Date.now() - statSync(CERT).mtimeMs) / 86_400_000
+      : Infinity;
+    if (ageDays < 60) return;
+    const r = spawnSync(TS_CLI, ["cert", "--cert-file", CERT, "--key-file", KEY, TS_HOST], {
+      timeout: 30_000,
+    });
+    console.log(`tls-proxy: cert renew ${r.status === 0 ? "ok" : "failed (keep old)"}`);
+  } catch (e) {
+    console.log("tls-proxy: cert renew error (keep old):", (e as Error).message);
+  }
+}
+renewIfNeeded();
+
+interface Pipe {
+  backend: import("bun").Socket | null;
+  queue: Uint8Array[];
+}
+
+Bun.listen<Pipe>({
+  hostname: LISTEN_HOST,
+  port: LISTEN_PORT,
+  tls: { cert: Bun.file(CERT), key: Bun.file(KEY) },
+  socket: {
+    open(socket) {
+      socket.data = { backend: null, queue: [] };
+      Bun.connect<undefined>({
+        hostname: "127.0.0.1",
+        port: BACKEND_PORT,
+        socket: {
+          data(_b, chunk) {
+            socket.write(chunk);
+          },
+          close() {
+            socket.end();
+          },
+          error() {
+            socket.end();
+          },
+        },
+      })
+        .then((backend) => {
+          socket.data.backend = backend;
+          // 握手期间到达的字节按序补发
+          for (const chunk of socket.data.queue) backend.write(chunk);
+          socket.data.queue = [];
+        })
+        .catch(() => socket.end());
+    },
+    data(socket, chunk) {
+      const d = socket.data;
+      if (d.backend) d.backend.write(chunk);
+      else d.queue.push(new Uint8Array(chunk));
+    },
+    close(socket) {
+      socket.data.backend?.end();
+    },
+    error(socket) {
+      socket.data.backend?.end();
+    },
+    drain() {
+      /* dev 规模不做背压 */
+    },
+  },
+});
+
+console.log(
+  `tls-proxy: https://${TS_HOST} (${LISTEN_HOST}:${LISTEN_PORT}) → http://127.0.0.1:${BACKEND_PORT}`
+);
