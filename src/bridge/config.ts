@@ -21,6 +21,9 @@ export const MCP_NAME = process.env.MCP_NAME || "claudestra";
 export const MCP_TOOL_PREFIX = `mcp__${MCP_NAME.replace(/-/g, "_")}__`;
 
 export const TMP_DIR = "/tmp/claude-orchestrator";
+/** 聊天附件落盘目录。曾在 TMP_DIR 下（重启即清），owner 2026-07-13 要求
+ *  图片永久保存 → 迁到持久位置；web BFF 的附件端点同步读这里。 */
+export const INBOX_DIR = `${process.env.HOME}/.claude-orchestrator/inbox`;
 // 从 tmux-helper 引入避免两处常量漂移
 export { TMUX_SOCK } from "../lib/tmux-helper.js";
 export const REPO_ROOT = `${import.meta.dir}/../..`;

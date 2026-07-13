@@ -11,7 +11,7 @@
  */
 
 import { existsSync, readdirSync, statSync } from "fs";
-import { TMP_DIR, MASTER_DIR } from "./config.js";
+import { TMP_DIR, MASTER_DIR, INBOX_DIR } from "./config.js";
 import {
   readPrincipals,
   findByBearer,
@@ -568,7 +568,7 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
         const form = await req.formData();
         text = String(form.get("text") || "");
         waitSec = Number(form.get("wait") || 0);
-        const inboxDir = `${TMP_DIR}/inbox`;
+        const inboxDir = INBOX_DIR;
         await Bun.spawn(["mkdir", "-p", inboxDir]).exited;
         const files = form.getAll("files").filter((f): f is File => f instanceof File).slice(0, 5);
         for (const f of files) {

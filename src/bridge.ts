@@ -23,7 +23,7 @@ import {
 } from "discord.js";
 import type { ServerWebSocket } from "bun";
 
-import { DISCORD_TOKEN, WEB_ONLY, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK, MASTER_DIR } from "./bridge/config.js";
+import { DISCORD_TOKEN, WEB_ONLY, BRIDGE_PORT, ALLOWED_USER_IDS, DISCORD_GUILD_ID, TMP_DIR, TMUX_SOCK, MASTER_DIR, INBOX_DIR } from "./bridge/config.js";
 // [fork:web-only] 无 Discord 模式的会话地址供给 + 出站落空 adapter
 import { createLocalChatAdapter } from "./bridge/local-adapter.js";
 import {
@@ -1538,7 +1538,7 @@ discord.on("messageCreate", async (msg: DiscordMessage) => {
   // 处理附件
   const attachmentPaths: string[] = [];
   if (msg.attachments.size > 0) {
-    const inboxDir = `${TMP_DIR}/inbox`;
+    const inboxDir = INBOX_DIR;
     await Bun.spawn(["mkdir", "-p", inboxDir]).exited;
     for (const [, att] of msg.attachments) {
       try {
@@ -3947,7 +3947,7 @@ async function routePeerDirectWithAgent(
     // 附件
     const attachmentPaths: string[] = [];
     if (origMsg.attachments.size > 0) {
-      const inboxDir = `${TMP_DIR}/inbox`;
+      const inboxDir = INBOX_DIR;
       await Bun.spawn(["mkdir", "-p", inboxDir]).exited;
       for (const [, att] of origMsg.attachments) {
         try {
@@ -4140,7 +4140,7 @@ async function tryRouteForeignAgentExchange(msg: DiscordMessage, channelId: stri
     // 4. 处理附件（跟主流程一样）
     const attachmentPaths: string[] = [];
     if (msg.attachments.size > 0) {
-      const inboxDir = `${TMP_DIR}/inbox`;
+      const inboxDir = INBOX_DIR;
       await Bun.spawn(["mkdir", "-p", inboxDir]).exited;
       for (const [, att] of msg.attachments) {
         try {
