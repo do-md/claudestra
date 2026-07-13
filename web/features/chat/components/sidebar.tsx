@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
 import { SettingsModal } from "./settings-modal";
+import { InstallBanner } from "./install-banner";
 
 function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: boolean }) {
   if (status === "active") {
@@ -167,6 +168,9 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
           )}
         </label>
       </div>
+
+      {/* 添加到主屏幕引导（浏览器标签页访问且未 dismiss 时显示） */}
+      <InstallBanner />
 
       {/* touch-pan-y + overscroll-contain：iOS 到边界时滚动链会穿透到不可滚的
           fixed 应用壳，橡皮筋吃掉手势看着像「滑不动」（BgLines 同款修法）。 */}
