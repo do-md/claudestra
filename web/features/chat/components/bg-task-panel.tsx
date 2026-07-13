@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import { useChatStore } from "../chat-store";
 import type { BgTaskView } from "../type";
 
@@ -23,7 +23,8 @@ function cleanLine(s: string): string {
   return s.replace(/^-#\s+/, "");
 }
 
-function BgTaskCard({ t }: { t: BgTaskView }) {
+// memo：bg-update 事件只替换被更新任务的对象引用（immer），其余卡不重渲染
+const BgTaskCard = memo(function BgTaskCard({ t }: { t: BgTaskView }) {
   const running = t.status === "running";
   return (
     <details className="group rounded-lg border border-warning/25 bg-warning/[0.06] [&>summary]:list-none" open={running}>
@@ -51,7 +52,7 @@ function BgTaskCard({ t }: { t: BgTaskView }) {
       </div>
     </details>
   );
-}
+});
 
 /**
  * 进度行视口：固定高度内滚动（不撑开页面），新行吸底跟随（像 tail -f）,

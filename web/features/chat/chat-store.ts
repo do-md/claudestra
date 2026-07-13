@@ -56,6 +56,12 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   /** openAgent 代际：切走 agent 时自增，令历史加载 / 后续连流的旧回调失效。 */
   private openGen = 0;
   private seq = 0;
+  /** 流式文本合批：SSE text 事件逐条 produce 会让长回合每秒多次触发整棵消息树
+   *  reconcile（2026-07-13「列表滑动卡死」主因之一——移动端列表页与会话页并排
+   *  都在 DOM）。缓冲 80ms 合并写入；工具/回复/定稿/发送前强制 flush 保段序；
+   *  切会话时丢弃（别把旧会话的残字写进新视图）。 */
+  private pendingText = "";
+  private textFlushTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * 每个 agent 的会话快照缓存 —— **只做切回时的首屏即时展示**（stale-while-
    * revalidate）：切走存快照，切回先显示快照、后台重拉历史拉回即替换。
@@ -250,6 +256,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     const name = this.state.activeAgent;
     if (!name) return;
     this.messageCache.delete(name);
+    this.discardPendingText();
     const gen = ++this.openGen;
     this.produce((s) => {
       s.messages = [];
@@ -308,6 +315,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         gen === this.streamGen &&
         (this.state.streaming || this.state.awaitingChunk)
       ) {
+        this.flushPendingText(); // 流断在缓冲窗口内的文本别丢
         this.produce((s) => {
           s.streaming = false;
           s.awaitingChunk = false;
@@ -332,6 +340,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
 
   /** 切走当前 agent：断前端流但不 abort 后端会话；自增代号令旧回调失效。 */
   private detachActiveStream() {
+    this.discardPendingText(); // 旧会话的残字不写进新视图
     this.streamGen++;
     const reader = this.streamReader;
     this.streamReader = null;
@@ -395,6 +404,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           };
         })
       : undefined;
+    this.flushPendingText(); // 用户气泡排在已缓冲的叙述之后
     this.produce((s) => {
       // 流式中插话：给当前流式助手气泡定稿，用户插入独立成段（后续输出另起气泡），
       // 避免把「插入前的回复」和「插入后的回复」挤进同一个气泡显得错乱。
@@ -484,6 +494,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     summary: string,
     state: "running" | "done" | "error"
   ) {
+    this.flushPendingText(); // 保持叙述/工具的真实交错序
     this.ensureLiveAssistant();
     this.produce((s) => {
       const last = s.messages[s.messages.length - 1];
@@ -502,6 +513,21 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   }
 
   public appendAssistantText(text: string) {
+    this.pendingText += text;
+    if (this.textFlushTimer === null) {
+      this.textFlushTimer = setTimeout(() => this.flushPendingText(), 80);
+    }
+  }
+
+  /** 把缓冲的流式文本一次性写入（合批）。时序敏感操作前必须先调它。 */
+  private flushPendingText() {
+    if (this.textFlushTimer !== null) {
+      clearTimeout(this.textFlushTimer);
+      this.textFlushTimer = null;
+    }
+    const text = this.pendingText;
+    if (!text) return;
+    this.pendingText = "";
     this.ensureLiveAssistant();
     this.produce((s) => {
       const last = s.messages[s.messages.length - 1];
@@ -516,6 +542,15 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     });
   }
 
+  /** 丢弃未 flush 的流式文本（切会话/重拉历史时——残字不属于新视图）。 */
+  private discardPendingText() {
+    if (this.textFlushTimer !== null) {
+      clearTimeout(this.textFlushTimer);
+      this.textFlushTimer = null;
+    }
+    this.pendingText = "";
+  }
+
   /**
    * [fork] reply() 的最终回复：挂到当前/最后一条 assistant 气泡的 replyText
    * （与过程叙述 content 分区渲染，中间淡分隔线）。
@@ -527,6 +562,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
    * Domd 富文本。没有前置 assistant 气泡（纯 reply 无叙述）才新建，且回合外直接定稿。
    */
   public setReplyText(text: string, components?: WebComponentRow[]) {
+    this.flushPendingText(); // reply 段插入前先落缓冲的叙述文本
     const hasComp = Array.isArray(components) && components.length > 0;
     const last = this.state.messages[this.state.messages.length - 1];
     if (last && last.role === "assistant") {
@@ -598,6 +634,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   }
 
   public endTurn() {
+    this.flushPendingText(); // 定稿前落掉缓冲文本
     this.produce((s) => {
       const last = s.messages[s.messages.length - 1];
       if (last?.role === "assistant") last.streamed = false; // 定稿

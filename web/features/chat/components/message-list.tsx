@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useChatStore } from "../chat-store";
 import type { ChatMessage, ChatAttachmentView, ToolCallView, AssistantSegment } from "../type";
 import { Domd } from "@/components/domd";
@@ -58,8 +58,10 @@ function TsBadge({ ts, shown }: { ts?: string; shown: boolean }) {
   );
 }
 
-/** 流式期间的工具行：紧凑单行，最后一个转圈。点击显示秒级时间。 */
-function ActiveToolRow({ tool, active }: { tool: ToolCallView; active: boolean }) {
+/** 流式期间的工具行：紧凑单行，最后一个转圈。点击显示秒级时间。
+ *  memo：immer 结构共享下旧 tool 对象引用稳定，流式长回合几百张工具卡
+ *  只有最新一张需要重渲染（2026-07-13 性能刀）。 */
+const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: ToolCallView; active: boolean }) {
   const summary = cleanSummary(tool.summary);
   const [showTs, setShowTs] = useState(false);
   return (
@@ -83,10 +85,10 @@ function ActiveToolRow({ tool, active }: { tool: ToolCallView; active: boolean }
       <TsBadge ts={tool.ts} shown={showTs} />
     </div>
   );
-}
+});
 
 /** 历史 / 定稿后的工具行：可展开看完整摘要。 */
-function HistoryToolRow({ tool }: { tool: ToolCallView }) {
+const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallView }) {
   const summary = cleanSummary(tool.summary);
   return (
     <details className="group rounded-lg border border-info/25 bg-info/[0.06] [&>summary]:list-none">
@@ -116,7 +118,7 @@ function HistoryToolRow({ tool }: { tool: ToolCallView }) {
       </div>
     </details>
   );
-}
+});
 
 function ToolCallsBlock({
   tools,
@@ -194,7 +196,7 @@ function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
 
 /** system 级事件（compact / 斜杠命令 / 中断 / 命令输出）的通用居中分隔条。
  *  与消息气泡视觉解耦：无头像无名字，两侧细线 + 小灰字；点击附带秒级时间。 */
-function SystemDivider({ m }: { m: ChatMessage }) {
+const SystemDivider = memo(function SystemDivider({ m }: { m: ChatMessage }) {
   const [showTs, setShowTs] = useState(false);
   return (
     <div
@@ -211,7 +213,7 @@ function SystemDivider({ m }: { m: ChatMessage }) {
       <span className="h-px flex-1 bg-base-content/10" />
     </div>
   );
-}
+});
 
 /** [fork] 过程叙述 ↔ 最终回复 之间的淡分隔线（仅两者都在时出现）。 */
 function ReplyDivider() {
@@ -225,8 +227,9 @@ function ReplyDivider() {
 }
 
 /** 叙述/回复的文本块：点击显示**该段自己**的秒级时间（不是整个回合的开场时间——
- *  长回合一个气泡跨一小时，整体时间对「这句话什么时候说的」没意义）。 */
-function TextBlock({
+ *  长回合一个气泡跨一小时，整体时间对「这句话什么时候说的」没意义）。
+ *  memo：props 全是原始值，定稿段的 Domd（markdown 解析）不再随流式重渲染。 */
+const TextBlock = memo(function TextBlock({
   text,
   ts,
   streamed,
@@ -248,7 +251,7 @@ function TextBlock({
       )}
     </div>
   );
-}
+});
 
 /**
  * 助手正文：过程叙述 + 最终回复（replyText）分区渲染，中间淡分隔线。
@@ -319,7 +322,14 @@ function AssistantBody({
   );
 }
 
-function Message({
+/**
+ * memo 是整个会话页的性能命门（2026-07-13「列表滑动卡死」根因）：流式期间每个
+ * SSE 事件都会 produce 新 messages 数组，无 memo 时全部气泡（几十个气泡 + 几百
+ * 张工具卡 + 全部 Domd markdown）每事件全量 reconcile；immer 结构共享保证未变
+ * 消息的对象引用稳定，memo 后每事件只有正在流式的最后一个气泡重渲染。移动端
+ * 列表页与会话页并排都在 DOM——会话页的重渲染风暴会卡死列表页的滚动。
+ */
+const Message = memo(function Message({
   m,
   streaming,
   isLast,
@@ -379,7 +389,7 @@ function Message({
       {!!m.replyComponents?.length && <ReplyComponents m={m} />}
     </div>
   );
-}
+});
 
 export function MessageList() {
   const messages = useChatStore((s) => s.state.messages);
