@@ -289,6 +289,9 @@ function ReplyDivider() {
 
 /** 叙述/回复的文本块：点击显示**该段自己**的秒级时间（不是整个回合的开场时间——
  *  长回合一个气泡跨一小时，整体时间对「这句话什么时候说的」没意义）。
+ *  streamed 语义 = 「本段还在生长」：只有它用纯文本（DOMD 只读一次,不适合增量
+ *  喂字）;已封笔的段立即走 Domd——此前整个回合流式期间全是裸 markdown 星号,
+ *  长回合要等几十分钟才「渲染出来」（2026-07-14 owner「渲染速度这么慢」）。
  *  memo：props 全是原始值，定稿段的 Domd（markdown 解析）不再随流式重渲染。 */
 const TextBlock = memo(function TextBlock({
   text,
@@ -343,11 +346,18 @@ function AssistantBody({
     <>
       {segs!.map((seg: AssistantSegment, i) =>
         seg.kind === "text" ? (
-          <TextBlock key={i} text={seg.text} ts={seg.ts ?? m.ts} streamed={m.streamed} />
+          // 只有「最后一段且回合仍在流式」在生长——其余段已封笔,立即富文本
+          <TextBlock
+            key={i}
+            text={seg.text}
+            ts={seg.ts ?? m.ts}
+            streamed={m.streamed && i === segs!.length - 1}
+          />
         ) : seg.kind === "reply" ? (
           <div key={i}>
             {i > 0 && <ReplyDivider />}
-            <TextBlock text={seg.text} ts={seg.ts ?? m.replyTs ?? m.ts} streamed={m.streamed} />
+            {/* reply 到达即完整,永远直接富文本 */}
+            <TextBlock text={seg.text} ts={seg.ts ?? m.replyTs ?? m.ts} streamed={false} />
           </div>
         ) : (
           <div key={i} className="my-2 space-y-1">
@@ -376,7 +386,8 @@ function AssistantBody({
       {hasReply && !hasReplySeg && (
         <>
           {hasNarration && <ReplyDivider />}
-          <TextBlock text={m.replyText!} ts={m.replyTs ?? m.ts} streamed={m.streamed} />
+          {/* reply 到达即完整,直接富文本 */}
+          <TextBlock text={m.replyText!} ts={m.replyTs ?? m.ts} streamed={false} />
         </>
       )}
     </>
