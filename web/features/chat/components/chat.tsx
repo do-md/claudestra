@@ -124,6 +124,39 @@ function ChatInner() {
     }
   }, []);
 
+  // ── 移动端横滑手势（2026-07-13 owner）：会话页右滑 → 回列表；列表页左滑 →
+  //    进入已选会话（未选过不动）。起点在横向可滚容器内（代码块等）不启用，
+  //    避免劫持其滚动；纵向为主的手势（滚消息列表）用比例阈值排除。
+  const swipeRef = useRef<{ x: number; y: number; hscroll: boolean } | null>(null);
+  const onShellTouchStart = (e: React.TouchEvent) => {
+    if (!isNarrow() || e.touches.length !== 1) {
+      swipeRef.current = null;
+      return;
+    }
+    let el = e.target as HTMLElement | null;
+    let hscroll = false;
+    while (el && el !== e.currentTarget) {
+      if (el.scrollWidth - el.clientWidth > 4) {
+        hscroll = true;
+        break;
+      }
+      el = el.parentElement;
+    }
+    const t = e.touches[0];
+    swipeRef.current = { x: t.clientX, y: t.clientY, hscroll };
+  };
+  const onShellTouchEnd = (e: React.TouchEvent) => {
+    const s = swipeRef.current;
+    swipeRef.current = null;
+    if (!s || s.hscroll) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - s.x;
+    const dy = t.clientY - s.y;
+    if (Math.abs(dx) < 70 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
+    if (dx > 0 && showContent) toList();
+    else if (dx < 0 && !showContent && activeAgent) toContent();
+  };
+
   const nav = useMemo<ChatNav>(
     () => ({ showContent, toContent, toList }),
     [showContent, toContent, toList],
@@ -196,6 +229,8 @@ function ChatInner() {
           if (el.scrollLeft !== 0) el.scrollLeft = 0;
           if (el.scrollTop !== 0) el.scrollTop = 0;
         }}
+        onTouchStart={onShellTouchStart}
+        onTouchEnd={onShellTouchEnd}
       >
         {/* 横滑容器：移动端 sidebar + main 各 w-full 并排溢出，showContent 时整体 -100% 切到内容；
             桌面端（sm+）sidebar 定宽 + main flex-1 双栏并存，translate 恒 0。 */}

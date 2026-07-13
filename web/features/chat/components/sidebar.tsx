@@ -2,19 +2,35 @@
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
 
-function StatusDot({ status }: { status: AgentSession["status"] }) {
+function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: boolean }) {
   if (status === "active") {
-    // 运行中：实心核心点 + 柔和呼吸外晕（cstra-breathe，替换生硬的 animate-ping）
+    // 运行中：实心核心点 + 柔和呼吸外晕（cstra-breathe，替换生硬的 animate-ping）。
+    // 正在干活（tmux 非空闲 / 本端流式中）→ 黄色；空闲 → 绿色。
+    const tone = busy ? "bg-warning" : "bg-success";
     return (
       <span className="relative flex size-2.5 shrink-0 items-center justify-center">
-        <span className="animate-cstra-breathe absolute inline-flex size-2.5 rounded-full bg-success" />
-        <span className="relative inline-flex size-2 rounded-full bg-success" />
+        <span className={`animate-cstra-breathe absolute inline-flex size-2.5 rounded-full ${tone}`} />
+        <span className={`relative inline-flex size-2 rounded-full ${tone}`} />
       </span>
     );
   }
   return (
     <span className="inline-flex size-2.5 shrink-0 rounded-full bg-base-content/25" />
   );
+}
+
+/** 最近对话时间：当天 HH:mm，昨天，今年 M-D，跨年 YYYY-M-D。 */
+function fmtLastActive(ts?: number | null): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  if (d.toDateString() === now.toDateString()) return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const yest = new Date(now);
+  yest.setDate(now.getDate() - 1);
+  if (d.toDateString() === yest.toDateString()) return "昨天";
+  if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}-${pad(d.getDate())}`;
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${pad(d.getDate())}`;
 }
 
 /**
@@ -24,13 +40,17 @@ function StatusDot({ status }: { status: AgentSession["status"] }) {
 function AgentRow({
   a,
   active,
+  busyLive,
   onSelect,
 }: {
   a: AgentSession;
   active: boolean;
+  /** 本端正在流式对话（active agent 的实时忙碌,比 15s 轮询的 busy 快） */
+  busyLive: boolean;
   onSelect: () => void;
 }) {
   const store = useChatStoreApi();
+  const lastAt = fmtLastActive(a.lastActivityTs);
 
   return (
     <li>
@@ -51,7 +71,7 @@ function AgentRow({
               👑
             </span>
           ) : (
-            <StatusDot status={a.status} />
+            <StatusDot status={a.status} busy={a.busy || busyLive} />
           )}
           <span className="min-w-0 flex-1 truncate text-[15px] sm:text-sm">
             {a.displayName}
@@ -66,6 +86,11 @@ function AgentRow({
               </span>
             )}
           </span>
+          {lastAt && (
+            <span className="shrink-0 pl-1 font-mono text-[11px] tabular-nums text-base-content/35">
+              {lastAt}
+            </span>
+          )}
         </button>
       </div>
     </li>
@@ -81,6 +106,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const loading = useChatStore((s) => s.state.loadingAgents);
   const ready = useChatStore((s) => s.state.agentsReady);
   const active = useChatStore((s) => s.state.activeAgent);
+  const streaming = useChatStore((s) => s.state.streaming);
 
   return (
     <aside className="flex w-full shrink-0 flex-col border-r border-base-300 bg-base-200 sm:w-64">
@@ -109,6 +135,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
               key={a.name}
               a={a}
               active={active === a.name}
+              busyLive={active === a.name && streaming}
               onSelect={onSelect}
             />
           ))}

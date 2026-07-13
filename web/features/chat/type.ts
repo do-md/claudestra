@@ -94,4 +94,8 @@ export interface AgentSession {
   mock?: boolean;
   /** 大总管置顶入口——不显示 kill/restart，列表第一位。 */
   pinnedMaster?: boolean;
+  /** 正在干活（tmux 非空闲）→ 列表状态点显黄色。 */
+  busy?: boolean;
+  /** 最近活动时间（session jsonl mtime，ms epoch）→ 列表行右侧时间标签。 */
+  lastActivityTs?: number | null;
 }

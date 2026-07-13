@@ -247,6 +247,13 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
       const agents = ((listResult.agents || []) as any[])
         .filter((a) => agentInScope(principal, a.name))
         .map((a) => ({ name: a.name, status: a.status, idle: a.idle, purpose: a.purpose }));
+      // [fork] busy：正在回合中（hook 驱动的 agent_status，与 /pending 的
+      // thinking 同源——manager list 的 tmux idle 探测在回合中也常报 idle，
+      // 不可靠，只作 OR 兜底）。web 列表的黄色状态点数据源。
+      for (const a of agents as any[]) {
+        const st = getAgentStatus(a.name) ?? getAgentStatus(String(a.name).replace(/^agent-/, ""));
+        a.busy = st === "thinking" || a.idle === false;
+      }
       // [fork] lastActivityTs：agent 当前 session jsonl 的 mtime（ms epoch）——
       // 前端「按最近活跃排序」的数据源。registry 读 cwd/sessionId，stat 失败给 null。
       {
@@ -286,7 +293,8 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
           status: deps.clients.has(CONTROL_CHANNEL_ID) ? "active" : "stopped",
           idle: undefined,
           purpose: "master orchestrator (大总管)",
-        });
+          busy: getAgentStatus("master") === "thinking",
+        } as any);
       }
       return apiJson(200, { ok: true, agents });
     } catch (e) {
