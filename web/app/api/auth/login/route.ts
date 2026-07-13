@@ -12,9 +12,26 @@ const SESSION_DAYS = 7;
 
 export async function POST(request: Request) {
   // host/port 不再从 body 取——verifySSH 硬编码本机（防未认证 SSH-target 注入 + SSRF）
-  const { username, password } = await request.json();
+  // 两种载荷:JSON(水合后的 fetch)/ 表单(未水合的原生 <form> 提交——JS 慢/失败
+  // 时登录也必须能成,2026-07-14「按钮一直转圈」)。表单路径成败都用 303 重定向,
+  // Location 用相对路径(TLS 反代后端是 http,绝对 URL 会把浏览器带回明文)。
+  const isForm = (request.headers.get("content-type") || "").includes("form");
+  let username = "";
+  let password = "";
+  if (isForm) {
+    const fd = await request.formData().catch(() => null);
+    username = String(fd?.get("username") || "");
+    password = String(fd?.get("password") || "");
+  } else {
+    const j = (await request.json().catch(() => ({}))) as { username?: string; password?: string };
+    username = j.username || "";
+    password = j.password || "";
+  }
+  const formRedirect = (to: string) =>
+    new NextResponse(null, { status: 303, headers: { Location: to } });
 
   if (!username || !password) {
+    if (isForm) return formRedirect("/login?e=empty");
     return NextResponse.json(
       { error: "用户名和密码不能为空" },
       { status: 400 }
@@ -27,6 +44,7 @@ export async function POST(request: Request) {
   const ip = xff?.split(",")[0]?.trim() || "";
   const rlKey = ip ? `ip:${ip}` : `user:${username}`;
   if (!checkRateLimit(rlKey)) {
+    if (isForm) return formRedirect("/login?e=rate");
     return NextResponse.json(
       { error: "登录尝试过于频繁，请稍后再试" },
       { status: 429 }
@@ -35,11 +53,12 @@ export async function POST(request: Request) {
 
   const ok = await verifySSH(username, password);
   if (!ok) {
+    if (isForm) return formRedirect("/login?e=cred");
     return NextResponse.json({ error: "用户名或密码错误" }, { status: 401 });
   }
 
   const session = createSession(username);
-  const res = NextResponse.json({ data: { username } });
+  const res = isForm ? formRedirect("/chat") : NextResponse.json({ data: { username } });
   const maxAge = SESSION_DAYS * 24 * 60 * 60;
   // Secure 默认**关**：这套 web 常经 Tailscale / 本机的明文 HTTP 访问，Secure cookie
   // 在 HTTP 下会被浏览器直接丢弃 → 登录成功但 cookie 存不下、一直跳回登录页。
