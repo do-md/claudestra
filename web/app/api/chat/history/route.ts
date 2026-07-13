@@ -3,7 +3,7 @@ export const runtime = "nodejs";
 import { NextResponse } from "next/server";
 import { apiAgentName, bridgeGet } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
-import type { ChatMessage, ToolCallView, AssistantSegment } from "@/features/chat/type";
+import type { ChatMessage, ToolCallView, AssistantSegment, ChatAttachmentView } from "@/features/chat/type";
 import type { WebComponentRow } from "@/lib/chat/events";
 
 /**
@@ -31,6 +31,33 @@ interface NeutralMessage {
 
 /** 本前端自己的 token 名（manager token-add web-ui）——自己发的消息不用再标来源。 */
 const SELF_FROM = new Set(["web-ui"]);
+
+const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "heic"]);
+
+/**
+ * 用户消息文本里的 [attachment: /path] 标记 → attachments 数组（图片走
+ * /api/chat/attachment/<name> 内联显示,其它给文件 chip），正文剥掉标记行。
+ * 之前裸渲染成一行路径文字（2026-07-13 owner:图片要显示/预览/保存）。
+ */
+function extractAttachments(text: string): { content: string; attachments?: ChatAttachmentView[] } {
+  const atts: ChatAttachmentView[] = [];
+  const content = text
+    .replace(/\n?\s*\[attachment:\s*([^\]]+)\]/g, (_m, p: string) => {
+      const file = p.trim().split("/").pop() || "";
+      if (file) {
+        const ext = file.split(".").pop()?.toLowerCase() || "";
+        atts.push({
+          // 展示名去掉雪花 id 前缀
+          name: file.replace(/^\d+_/, ""),
+          kind: IMG_EXT.has(ext) ? "image" : "file",
+          url: `/api/chat/attachment/${encodeURIComponent(file)}`,
+        });
+      }
+      return "";
+    })
+    .trim();
+  return atts.length ? { content, attachments: atts } : { content };
+}
 
 /**
  * 把中性消息映射成 ChatMessage，并**合并同一回合的连续 assistant 记录**。
@@ -110,8 +137,9 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
         );
         if (clicked) lastWithComponents.replyClickedId = clicked;
       }
-      const content = btnMatch ? `🔘 ${btnMatch[1]}` : selMatch ? `🔘 ${selMatch[2]}` : m.text || "";
-      out.push({ id: `h${m.seq}`, role: "user", content, ts: m.ts, from });
+      const raw = btnMatch ? `🔘 ${btnMatch[1]}` : selMatch ? `🔘 ${selMatch[2]}` : m.text || "";
+      const { content, attachments } = extractAttachments(raw);
+      out.push({ id: `h${m.seq}`, role: "user", content, ts: m.ts, from, ...(attachments ? { attachments } : {}) });
       continue;
     }
 

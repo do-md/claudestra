@@ -1,5 +1,6 @@
 "use client";
 import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { ChatMessage, ChatAttachmentView, ToolCallView, AssistantSegment } from "../type";
 import { Domd } from "@/components/domd";
@@ -172,29 +173,85 @@ function ClaudeHeader() {
 }
 
 /** 用户气泡里的上传附件回显：图片缩略图 / 文件名 chip。 */
-function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
+/** 附件文件 chip（非图片 / 图片加载失败的降级）。有 url 可点击下载。 */
+function FileChip({ a }: { a: ChatAttachmentView }) {
+  const cls =
+    "flex max-w-[220px] items-center gap-2 rounded-[12px] border border-base-content/10 bg-base-300 px-3 py-2 text-[12.5px] text-base-content/80";
+  return a.url ? (
+    <a href={a.url} download={a.name} title={a.name} className={cls}>
+      📎 <span className="truncate">{a.name}</span>
+    </a>
+  ) : (
+    <span title={a.name} className={cls}>
+      📎 <span className="truncate">{a.name}</span>
+    </span>
+  );
+}
+
+/** 图片附件：内联缩略图,点击全屏预览;加载失败(/tmp 被清)降级为文件 chip。 */
+function AttachedImage({ a, onPreview }: { a: ChatAttachmentView; onPreview: () => void }) {
+  const [err, setErr] = useState(false);
+  if (err || !a.url) return <FileChip a={a} />;
   return (
-    <div className="flex max-w-[85%] flex-wrap justify-end gap-2">
-      {items.map((a, i) =>
-        a.kind === "image" && a.url ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            key={i}
-            src={a.url}
-            alt={a.name}
-            className="max-h-52 max-w-[220px] rounded-[12px] border border-base-content/10 object-cover"
-          />
-        ) : (
-          <span
-            key={i}
-            title={a.name}
-            className="flex max-w-[220px] items-center gap-2 rounded-[12px] border border-base-content/10 bg-base-300 px-3 py-2 text-[12.5px] text-base-content/80"
-          >
-            📎 <span className="truncate">{a.name}</span>
-          </span>
-        )
-      )}
-    </div>
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={a.url}
+      alt={a.name}
+      onClick={onPreview}
+      onError={() => setErr(true)}
+      className="max-h-52 max-w-[220px] cursor-zoom-in rounded-[12px] border border-base-content/10 object-cover"
+    />
+  );
+}
+
+/** 全屏图片预览：portal 到 body（规则 5.5——横滑 transform 容器内 fixed 会漂）。
+ *  「保存」走下载 anchor;iOS 上也可直接长按图片走系统保存菜单。 */
+function ImagePreview({ a, onClose }: { a: ChatAttachmentView; onClose: () => void }) {
+  return createPortal(
+    <div className="fixed inset-0 z-[70] flex flex-col bg-black/92" onClick={onClose}>
+      <div
+        className="flex shrink-0 items-center justify-between gap-3 px-4 pb-2"
+        style={{ paddingTop: "max(env(safe-area-inset-top), 12px)" }}
+      >
+        <span className="min-w-0 truncate text-sm text-white/70">{a.name}</span>
+        <div className="flex shrink-0 items-center gap-2" onClick={(e) => e.stopPropagation()}>
+          <a href={a.url} download={a.name} className="btn btn-sm">
+            保存
+          </a>
+          <button className="btn btn-sm" aria-label="关闭" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+      </div>
+      <div className="grid min-h-0 flex-1 place-items-center p-3" style={{ paddingBottom: "max(env(safe-area-inset-bottom), 12px)" }}>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={a.url}
+          alt={a.name}
+          className="max-h-full max-w-full rounded object-contain"
+          onClick={(e) => e.stopPropagation()}
+        />
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
+  const [preview, setPreview] = useState<ChatAttachmentView | null>(null);
+  return (
+    <>
+      <div className="flex max-w-[85%] flex-wrap justify-end gap-2">
+        {items.map((a, i) =>
+          a.kind === "image" ? (
+            <AttachedImage key={i} a={a} onPreview={() => setPreview(a)} />
+          ) : (
+            <FileChip key={i} a={a} />
+          )
+        )}
+      </div>
+      {preview && <ImagePreview a={preview} onClose={() => setPreview(null)} />}
+    </>
   );
 }
 
