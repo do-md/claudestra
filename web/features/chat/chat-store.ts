@@ -64,6 +64,11 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
    *  切会话时丢弃（别把旧会话的残字写进新视图）。 */
   private pendingText = "";
   private textFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 回合边界标志：进入新回合(status running)置 true，下一段输出另起气泡。
+   *  用于区分「新回合的输出」和「Stop 之后才冲刷到的同回合迟到文本」——后者
+   *  必须并进同一气泡，否则渲染成「两个 Claude」，且新气泡永远等不到 done
+   *  定稿、markdown 不渲染（2026-07-13 截图）。 */
+  private nextBubbleBoundary = false;
   /**
    * 每个 agent 的会话快照缓存 —— **只做切回时的首屏即时展示**（stale-while-
    * revalidate）：切走存快照，切回先显示快照、后台重拉历史拉回即替换。
@@ -493,14 +498,23 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   /** 确保当前有一个流式助手气泡承接工具/文本；没有则新建。 */
   private ensureLiveAssistant() {
     const last = this.state.messages[this.state.messages.length - 1];
-    if (last && last.role === "assistant" && last.streamed) return;
+    // 尾部是 assistant 气泡且不在回合边界 → 直接承接。包括已定稿的：
+    // Stop 之后才冲刷到的同回合迟到文本并进原气泡（此时 streamed=false，
+    // 渲染自动走 Domd，markdown 正常）。只有新回合(boundary)才另起气泡。
+    if (last && last.role === "assistant" && (last.streamed || !this.nextBubbleBoundary)) {
+      this.nextBubbleBoundary = false; // 本回合输出已开始流动，边界消费掉
+      return;
+    }
+    this.nextBubbleBoundary = false;
+    const streamed = this.state.streaming;
     this.produce((s) => {
       s.messages.push({
         id: this.nextId(),
         role: "assistant",
         content: "",
         segments: [],
-        streamed: true,
+        // 回合外冒出的文本（罕见）直接定稿——永远等不到 done，别卡在纯文本渲染
+        streamed,
         toolCalls: [],
         ts: new Date().toISOString(),
       });
@@ -584,7 +598,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     this.flushPendingText(); // reply 段插入前先落缓冲的叙述文本
     const hasComp = Array.isArray(components) && components.length > 0;
     const last = this.state.messages[this.state.messages.length - 1];
-    if (last && last.role === "assistant") {
+    // 回合边界上的 reply（他端触发、纯 reply 无叙述）另起气泡，不并进上一回合
+    if (last && last.role === "assistant" && !this.nextBubbleBoundary) {
       this.produce((s) => {
         const m = s.messages[s.messages.length - 1];
         m.replyText = m.replyText ? `${m.replyText}\n${text}` : text;
@@ -597,6 +612,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         s.awaitingChunk = false;
       });
     } else {
+      this.nextBubbleBoundary = false; // 本回合气泡由 reply 开启
       const streamed = this.state.streaming;
       this.produce((s) => {
         s.messages.push({
@@ -650,6 +666,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         s.awaitingChunk = true;
       }
     });
+    // 新回合开始（此前不在回合中）→ 下一段输出另起气泡，不并进上一回合
+    if (status === "running") this.nextBubbleBoundary = true;
   }
 
   public endTurn() {
