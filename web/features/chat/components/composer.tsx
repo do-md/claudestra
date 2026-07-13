@@ -263,6 +263,59 @@ export function Composer() {
     if (recRef.current?.state === "recording") recRef.current.stop();
   };
 
+  // ── 输入框整体 = 按住说话热区（2026-07-14 owner：「手按在聊天框上就是要说话」）──
+  // 透明手势层盖在 textarea 上(仅未聚焦时):短按 = 正常聚焦打字;按住 ≥300ms =
+  // 开录,松手 = 识别。聚焦编辑期间手势层退场,光标/选词不受影响。
+  const [taFocused, setTaFocused] = useState(false);
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pressRef = useRef<{ x: number; y: number; fired: boolean } | null>(null);
+  const HOLD_MS = 300;
+
+  const overlayDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (disabled || recState !== "idle") return;
+    e.preventDefault(); // 压掉 iOS 长按放大镜/呼出菜单
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch { /* 老浏览器 */ }
+    pressRef.current = { x: e.clientX, y: e.clientY, fired: false };
+    holdTimerRef.current = setTimeout(() => {
+      holdTimerRef.current = null;
+      if (pressRef.current) {
+        pressRef.current.fired = true;
+        void holdStart();
+      }
+    }, HOLD_MS);
+  };
+  const overlayMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const p = pressRef.current;
+    if (!p || p.fired) return;
+    // 位移过大 = 想滑动/拖拽,取消长按判定
+    if (Math.hypot(e.clientX - p.x, e.clientY - p.y) > 12 && holdTimerRef.current !== null) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+      pressRef.current = null;
+    }
+  };
+  const overlayUp = () => {
+    if (holdTimerRef.current !== null) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    const p = pressRef.current;
+    pressRef.current = null;
+    if (p?.fired) {
+      holdEnd(); // 松手结束录音
+    } else if (p) {
+      // 短按 = 正常进入打字(手势层挡住了原生聚焦,手动补)
+      const ta = taRef.current;
+      if (ta) {
+        ta.focus();
+        const len = ta.value.length;
+        try { ta.setSelectionRange(len, len); } catch { /* 类型不支持 */ }
+      }
+    }
+  };
+
   // 卸载/切会话时若还在录,收掉麦克风
   useEffect(() => {
     return () => {
@@ -370,6 +423,8 @@ export function Composer() {
             onChange={onPick}
           />
 
+          {/* relative 包裹:录音状态条 + textarea + 按住说话手势层共用这块区域 */}
+          <div className="relative">
           {/* 录音/识别状态条:按住期间替换输入区显示(红点脉冲+计时),松开转圈,
               完成后文字进输入框(textarea 隐藏不卸载,保内容与高度) */}
           {recState !== "idle" && (
@@ -394,6 +449,8 @@ export function Composer() {
           )}
           <textarea
             ref={taRef}
+            onFocus={() => setTaFocused(true)}
+            onBlur={() => setTaFocused(false)}
             className={`${recState !== "idle" ? "hidden" : "block"} max-h-[180px] min-h-[46px] w-full resize-none bg-transparent px-4 pb-1.5 pt-[14px] text-[14.5px] leading-[1.55] text-base-content outline-none placeholder:text-base-content/35`}
             rows={1}
             placeholder={
@@ -413,6 +470,21 @@ export function Composer() {
             onKeyDown={onKeyDown}
             onPaste={onPaste}
           />
+          {/* 按住说话手势层:未聚焦时盖在输入区上——短按补 focus 进打字,按住开录。
+              录音中保持挂载(pointer capture 连续性,松手才能收到 up);识别中卸载。
+              聚焦编辑期间退场,光标/选词不受影响。 */}
+          {!taFocused && recState !== "busy" && !disabled && (
+            <div
+              className="absolute inset-0 select-none"
+              style={{ touchAction: "none", WebkitTouchCallout: "none" } as React.CSSProperties}
+              onPointerDown={overlayDown}
+              onPointerMove={overlayMove}
+              onPointerUp={overlayUp}
+              onPointerCancel={overlayUp}
+              onContextMenu={(e) => e.preventDefault()}
+            />
+          )}
+          </div>
 
           {/* 控件行 */}
           <div className="flex items-center gap-1.5 px-2.5 pb-[9px] pt-1.5">
