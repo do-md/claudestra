@@ -138,6 +138,8 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
       if (tail?.kind === "text") tail.text += `\n\n${m.text}`;
       else segs.push({ kind: "text", text: m.text, ts: m.ts });
     }
+    // reply 按时间序插进段序列（渲染层不再钉底——reply 后叙述可能还在继续）
+    if (m.replyText) segs.push({ kind: "reply", text: m.replyText, ts: m.ts });
     if (toolCalls) {
       const tail = segs[segs.length - 1];
       if (tail?.kind === "tools") tail.tools.push(...toolCalls);

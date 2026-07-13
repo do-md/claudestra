@@ -269,6 +269,8 @@ function AssistantBody({
   const hasSegs = !!segs && segs.length > 0;
   const hasNarration = hasSegs || !!m.content;
   const hasReply = !!m.replyText;
+  // reply 已按时间序入段（新数据）→ 就地渲染；否则回退到底部钉底（旧快照/纯 reply 无段）
+  const hasReplySeg = hasSegs && segs!.some((s) => s.kind === "reply");
 
   if (m.streamed && liveEmpty && !hasReply && !hasSegs) return <ThinkingDots />;
   if (!hasNarration && !hasReply) return null;
@@ -278,6 +280,11 @@ function AssistantBody({
       {segs!.map((seg: AssistantSegment, i) =>
         seg.kind === "text" ? (
           <TextBlock key={i} text={seg.text} ts={seg.ts ?? m.ts} streamed={m.streamed} />
+        ) : seg.kind === "reply" ? (
+          <div key={i}>
+            {i > 0 && <ReplyDivider />}
+            <TextBlock text={seg.text} ts={seg.ts ?? m.replyTs ?? m.ts} streamed={m.streamed} />
+          </div>
         ) : (
           <div key={i} className="my-2 space-y-1">
             {seg.tools.map((t, j) =>
@@ -302,7 +309,7 @@ function AssistantBody({
   return (
     <>
       {narration}
-      {hasReply && (
+      {hasReply && !hasReplySeg && (
         <>
           {hasNarration && <ReplyDivider />}
           <TextBlock text={m.replyText!} ts={m.replyTs ?? m.ts} streamed={m.streamed} />

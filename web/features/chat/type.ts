@@ -8,7 +8,9 @@ export interface ToolCallView {
   ts?: string;
 }
 
-/** assistant 气泡内的交错段——叙述与工具按真实时间顺序排列（修「工具全堆气泡顶部」）。 */
+/** assistant 气泡内的交错段——叙述与工具按真实时间顺序排列（修「工具全堆气泡顶部」）。
+ *  reply 也是一个段：按时间序插入而非钉在气泡底——reply() 之后叙述可能还在继续
+ *  （终端总结文本），钉底会让「后面的段时间比前面早」（2026-07-13 真机截图）。 */
 export type AssistantSegment =
   | {
       kind: "text";
@@ -16,7 +18,8 @@ export type AssistantSegment =
       /** 该段开始时间（历史=首条 jsonl 记录 ts，直播=前端 stamp）。点击该段显示。 */
       ts?: string;
     }
-  | { kind: "tools"; tools: ToolCallView[] };
+  | { kind: "tools"; tools: ToolCallView[] }
+  | { kind: "reply"; text: string; ts?: string };
 
 /** 待处理的权限 / session-idle 卡（一个会话同时最多一张）。 */
 export interface PendingPermission {

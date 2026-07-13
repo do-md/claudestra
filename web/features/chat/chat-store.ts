@@ -528,6 +528,9 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         const m = s.messages[s.messages.length - 1];
         m.replyText = m.replyText ? `${m.replyText}\n${text}` : text;
         m.replyTs = m.replyTs ?? new Date().toISOString();
+        // reply 作为段按时间序入列（reply 后叙述可能还在继续，钉底会时间倒挂）
+        m.segments = m.segments ?? [];
+        m.segments.push({ kind: "reply", text, ts: new Date().toISOString() });
         // 组件挂到承载 reply 的气泡；一条 reply 多段拼接时后到的组件覆盖（通常只一组）
         if (hasComp) m.replyComponents = components;
         s.awaitingChunk = false;
@@ -541,6 +544,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           content: "",
           replyText: text,
           replyTs: new Date().toISOString(),
+          segments: [{ kind: "reply", text, ts: new Date().toISOString() }],
           ...(hasComp ? { replyComponents: components } : {}),
           streamed,
           ts: new Date().toISOString(),
