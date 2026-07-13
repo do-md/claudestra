@@ -1,6 +1,8 @@
 "use client";
 import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import Lightbox from "yet-another-react-lightbox";
+import Zoom from "yet-another-react-lightbox/plugins/zoom";
+import Download from "yet-another-react-lightbox/plugins/download";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { ChatMessage, ChatAttachmentView, ToolCallView, AssistantSegment } from "../type";
 import { Domd } from "@/components/domd";
@@ -204,53 +206,38 @@ function AttachedImage({ a, onPreview }: { a: ChatAttachmentView; onPreview: () 
   );
 }
 
-/** 全屏图片预览：portal 到 body（规则 5.5——横滑 transform 容器内 fixed 会漂）。
- *  「保存」走下载 anchor;iOS 上也可直接长按图片走系统保存菜单。 */
-function ImagePreview({ a, onClose }: { a: ChatAttachmentView; onClose: () => void }) {
-  return createPortal(
-    <div className="fixed inset-0 z-[70] flex flex-col bg-black/92" onClick={onClose}>
-      <div
-        className="flex shrink-0 items-center justify-between gap-3 px-4 pb-2"
-        style={{ paddingTop: "max(env(safe-area-inset-top), 12px)" }}
-      >
-        <span className="min-w-0 truncate text-sm text-white/70">{a.name}</span>
-        <div className="flex shrink-0 items-center gap-2" onClick={(e) => e.stopPropagation()}>
-          <a href={a.url} download={a.name} className="btn btn-sm">
-            保存
-          </a>
-          <button className="btn btn-sm" aria-label="关闭" onClick={onClose}>
-            ✕
-          </button>
-        </div>
-      </div>
-      <div className="grid min-h-0 flex-1 place-items-center p-3" style={{ paddingBottom: "max(env(safe-area-inset-bottom), 12px)" }}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={a.url}
-          alt={a.name}
-          className="max-h-full max-w-full rounded object-contain"
-          onClick={(e) => e.stopPropagation()}
-        />
-      </div>
-    </div>,
-    document.body
-  );
-}
-
 function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
-  const [preview, setPreview] = useState<ChatAttachmentView | null>(null);
+  // lightbox 打开的图片下标(-1=关);同一条消息的多图可左右滑动切换
+  const [lbIndex, setLbIndex] = useState(-1);
+  const images = items.filter((a) => a.kind === "image" && a.url);
   return (
     <>
       <div className="flex max-w-[85%] flex-wrap justify-end gap-2">
         {items.map((a, i) =>
           a.kind === "image" ? (
-            <AttachedImage key={i} a={a} onPreview={() => setPreview(a)} />
+            <AttachedImage key={i} a={a} onPreview={() => setLbIndex(images.indexOf(a))} />
           ) : (
             <FileChip key={i} a={a} />
           )
         )}
       </div>
-      {preview && <ImagePreview a={preview} onClose={() => setPreview(null)} />}
+      {/* yet-another-react-lightbox：双击/捏合缩放、多图滑动、内置下载按钮
+          （2026-07-14 owner:手写预览太糙,换现成库）。自带 portal,无 5.5 问题。 */}
+      {lbIndex >= 0 && (
+        <Lightbox
+          open
+          close={() => setLbIndex(-1)}
+          index={lbIndex}
+          slides={images.map((a) => ({
+            src: a.url!,
+            download: { url: a.url!, filename: a.name },
+          }))}
+          plugins={[Zoom, Download]}
+          carousel={{ finite: true }}
+          zoom={{ maxZoomPixelRatio: 4, doubleTapDelay: 250 }}
+          controller={{ closeOnBackdropClick: true }}
+        />
+      )}
     </>
   );
 }
@@ -306,7 +293,11 @@ const TextBlock = memo(function TextBlock({
   return (
     <div className="cursor-pointer" onClick={() => setShowTs((v) => !v)}>
       {streamed ? (
-        <div className="whitespace-pre-wrap break-words text-[14.5px] leading-[1.7]">{text}</div>
+        // 生长中的段也实时富文本（2026-07-14 owner「边输出边渲染」）：DOMD 只读
+        // 一次 → 用 key 按内容长度强制重挂,每次 80ms 合批后重新解析整段。段落
+        // 级体量解析是亚毫秒级,memo 隔离其它段;未闭合语法(写到一半的 **/```)
+        // 期间样式会短暂跳动,属流式渲染的正常代价。
+        <Domd key={text.length} initMd={text} bodyClassName="chat-domd" />
       ) : (
         <Domd initMd={text} bodyClassName="chat-domd" />
       )}

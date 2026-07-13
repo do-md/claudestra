@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+// 图片 lightbox(缩放/滑动/下载)——全局 CSS 只能在根 layout 引
+import "yet-another-react-lightbox/styles.css";
 
 export const metadata: Metadata = {
   title: "Claudestra",

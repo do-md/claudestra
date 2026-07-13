@@ -1,6 +1,6 @@
 "use client";
 import { memo, useEffect, useRef } from "react";
-import { useChatStore } from "../chat-store";
+import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { BgTaskView } from "../type";
 
 /**
@@ -26,6 +26,7 @@ function cleanLine(s: string): string {
 // memo：bg-update 事件只替换被更新任务的对象引用（immer），其余卡不重渲染
 const BgTaskCard = memo(function BgTaskCard({ t }: { t: BgTaskView }) {
   const running = t.status === "running";
+  const store = useChatStoreApi();
   return (
     <details className="group rounded-lg border border-warning/25 bg-warning/[0.06] [&>summary]:list-none" open={running}>
       <summary className="flex cursor-pointer select-none items-center gap-2 px-3 py-1.5 text-xs">
@@ -41,6 +42,34 @@ const BgTaskCard = memo(function BgTaskCard({ t }: { t: BgTaskView }) {
         {t.lines.length > 0 && (
           <span className="ml-auto shrink-0 opacity-40">{t.lines.length} 行</span>
         )}
+        {/* 停止 = 请 agent 用 TaskStop(bridge 无 kill 权柄);✕ = 收起卡片(纯前端)。
+            preventDefault 防触发 details 开合 */}
+        {running && (
+          <button
+            className="shrink-0 rounded px-1 text-error/70 hover:bg-error/10"
+            title="请求 agent 停止此任务"
+            aria-label="停止任务"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              store.requestStopBgTask(t);
+            }}
+          >
+            ⏹
+          </button>
+        )}
+        <button
+          className="shrink-0 rounded px-1 opacity-40 hover:bg-base-content/10 hover:opacity-80"
+          title="收起"
+          aria-label="收起任务卡"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            store.dismissBgTask(t.id);
+          }}
+        >
+          ✕
+        </button>
         <span className="shrink-0 opacity-30 transition-transform group-open:rotate-90">›</span>
       </summary>
       <div className="px-3 pb-2 pt-0.5">

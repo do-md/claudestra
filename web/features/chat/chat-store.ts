@@ -701,6 +701,19 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   // 每行已在 bridge 侧截断；这里再给单任务的行数封顶，防长跑任务无界增长。
   private static readonly BG_MAX_LINES = 500;
 
+  /** 收起一张后台任务卡（纯前端——bridge 重启后的 stale 卡 / 看完的完成卡）。 */
+  public dismissBgTask(id: string) {
+    this.produce((s) => {
+      s.bgTasks = s.bgTasks.filter((t) => t.id !== id);
+    });
+  }
+
+  /** 请求 agent 停止某后台任务。bridge 层没有 kill 权柄（任务进程归 Claude Code
+   *  管），走普通消息让 agent 自己用 TaskStop——用户点了停止按钮,插话是预期行为。 */
+  public requestStopBgTask(t: { id: string; title: string }) {
+    void this.send(`请立即停止后台任务「${t.title || t.id}」(task id: ${t.id})，用 TaskStop。`);
+  }
+
   public bgTaskStart(id: string, kind: "subagent" | "shell", title: string) {
     if (!id) return;
     this.produce((s) => {
