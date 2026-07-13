@@ -47,11 +47,10 @@ async function restorePunctuation(key: string, text: string): Promise<string> {
     };
     const out = j.choices?.[0]?.message?.content?.trim();
     if (!out) return text;
-    // 防模型自由发挥:去标点后的字符量应与原文接近
+    // 铁律:LLM 只许加标点——去掉标点后必须与原文**逐字相同**,否则一律用原文
+    // (之前 ±20% 的松护栏放过了模型的指令复读,2026-07-14 真机)
     const strip = (s: string) => s.replace(/[\s，。？！、：；""''（）,.?!:;'"()\-—…·]/g, "");
-    const a = strip(text);
-    const b = strip(out);
-    if (b.length < a.length * 0.8 || b.length > a.length * 1.2) return text;
+    if (strip(out) !== strip(text)) return text;
     return out;
   } catch {
     return text;
@@ -83,10 +82,11 @@ export async function POST(request: Request) {
   fd.append("file", audio, audio.name || "audio.m4a");
   // large-v3 全量版:中文质量明显好于 turbo,免费层同样覆盖(短音频延迟差异无感)
   fd.append("model", "whisper-large-v3");
-  // 中文为主 + 标点引导 prompt(whisper 对中文常吞标点,带标点的引导文本能显著改善;
-  // 2026-07-14 owner:「标点符号也没有给我加」)
   fd.append("language", "zh");
-  fd.append("prompt", "以下是普通话的内容，请使用规范的标点符号。");
+  // ⚠ prompt 只能放「像转录上文」的自然文本——指令式 prompt(如「请使用规范的
+  // 标点符号」)会在静音/短音频时被 whisper 整句幻觉复读进结果(2026-07-14
+  // 真机:「经常返回一个请使用正确的标点符号」)。标点由后置 LLM 阶段负责。
+  fd.append("prompt", "嗯，好的，我们继续。");
   fd.append("temperature", "0");
   fd.append("response_format", "json");
 
@@ -105,6 +105,11 @@ export async function POST(request: Request) {
       );
     }
     const raw = (j.text || "").trim();
+    // 静音/噪声下 whisper 的经典幻觉(复读 prompt、字幕水印等)——短输出且命中
+    // 特征词就按「没听清」处理,别把幻觉喂给用户
+    if (raw.length < 25 && /标点符号|字幕|订阅|点赞|Amara|^嗯，好的，我们继续/.test(raw)) {
+      return NextResponse.json({ text: "" });
+    }
     const text = await restorePunctuation(key, raw);
     return NextResponse.json({ text });
   } catch (e) {

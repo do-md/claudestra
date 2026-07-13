@@ -171,26 +171,41 @@ export function Composer() {
   }, [text, active]);
 
   // ── 语音输入（2026-07-14 owner：应用内录音 → Groq 转写,根治输入法跳 App）──
+  // 交互 = 按住说话(微信同款,owner 拍板):按下 🎤 开录(录音状态条+计时),
+  // 松开结束 → 转圈识别 → 文字进输入框;按太短(<400ms)视为误触丢弃。
   const [recState, setRecState] = useState<"idle" | "recording" | "busy">("idle");
   const [recErr, setRecErr] = useState("");
+  const [recSecs, setRecSecs] = useState(0);
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const holdRef = useRef(false); // 手指是否仍按着(getUserMedia 授权期间可能已松手)
+  const recStartRef = useRef(0);
+  const recTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const flashRecErr = (msg: string) => {
     setRecErr(msg);
     setTimeout(() => setRecErr(""), 4000);
   };
-  const toggleRec = async () => {
-    if (recState === "busy") return;
-    if (recState === "recording") {
-      recRef.current?.stop(); // onstop 里收尾
-      return;
+  const stopRecTimer = () => {
+    if (recTimerRef.current !== null) {
+      clearInterval(recTimerRef.current);
+      recTimerRef.current = null;
     }
+  };
+
+  const holdStart = async () => {
+    if (recState !== "idle") return;
+    holdRef.current = true;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // 授权弹窗期间手指可能已松开 → 立即归还麦克风
+      if (!holdRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       // iOS Safari 只支持 mp4/AAC;桌面 Chrome 用 webm/opus
       const mime =
-        ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find((t) =>
-          typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(t)
+        ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find(
+          (t) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(t)
         ) || "";
       const mr = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
       chunksRef.current = [];
@@ -199,17 +214,24 @@ export function Composer() {
       };
       mr.onstop = async () => {
         stream.getTracks().forEach((t) => t.stop());
+        stopRecTimer();
+        const durMs = Date.now() - recStartRef.current;
+        const type = mr.mimeType || "audio/mp4";
+        const blob = new Blob(chunksRef.current, { type });
+        if (durMs < 400 || blob.size < 1000) {
+          setRecState("idle");
+          flashRecErr("按住说话，松开结束");
+          return;
+        }
         setRecState("busy");
         try {
-          const type = mr.mimeType || "audio/mp4";
-          const blob = new Blob(chunksRef.current, { type });
-          if (blob.size < 1000) return; // 误触的空录音不上传
           const fd = new FormData();
           fd.append("audio", blob, `rec.${type.includes("mp4") ? "m4a" : "webm"}`);
           const res = await fetch("/api/chat/transcribe", { method: "POST", body: fd });
           const j = (await res.json().catch(() => ({}))) as { text?: string; error?: string };
-          if (res.ok && j.text) {
-            setText((prev) => (prev ? `${prev}${j.text}` : j.text!));
+          if (res.ok && typeof j.text === "string") {
+            if (j.text) setText((prev) => (prev ? `${prev}${j.text}` : j.text!));
+            else flashRecErr("没听清，再试一次");
           } else {
             flashRecErr(j.error || "识别失败");
           }
@@ -221,15 +243,31 @@ export function Composer() {
       };
       mr.start();
       recRef.current = mr;
+      recStartRef.current = Date.now();
+      setRecSecs(0);
+      recTimerRef.current = setInterval(
+        () => setRecSecs(Math.floor((Date.now() - recStartRef.current) / 1000)),
+        500
+      );
       setRecState("recording");
+      // start 完成时手指已松开(极快松手)→ 立即收尾
+      if (!holdRef.current) mr.stop();
     } catch {
       // 主屏 PWA 的录音权限在部分 iOS 版本受限——提示换浏览器标签页用
       flashRecErr("无法访问麦克风（权限被拒,或当前模式不支持录音）");
     }
   };
+
+  const holdEnd = () => {
+    holdRef.current = false;
+    if (recRef.current?.state === "recording") recRef.current.stop();
+  };
+
   // 卸载/切会话时若还在录,收掉麦克风
   useEffect(() => {
     return () => {
+      holdRef.current = false;
+      stopRecTimer();
       try {
         recRef.current?.stream.getTracks().forEach((t) => t.stop());
       } catch { /* 已停止 */ }
@@ -332,9 +370,31 @@ export function Composer() {
             onChange={onPick}
           />
 
+          {/* 录音/识别状态条:按住期间替换输入区显示(红点脉冲+计时),松开转圈,
+              完成后文字进输入框(textarea 隐藏不卸载,保内容与高度) */}
+          {recState !== "idle" && (
+            <div className="flex min-h-[46px] items-center gap-2.5 px-4 pb-1.5 pt-[14px]">
+              {recState === "recording" ? (
+                <>
+                  <span className="relative flex size-3 shrink-0 items-center justify-center">
+                    <span className="animate-cstra-breathe absolute inline-flex size-3 rounded-full bg-error" />
+                    <span className="relative inline-flex size-2 rounded-full bg-error" />
+                  </span>
+                  <span className="text-[14px] font-medium text-error/90">
+                    正在录音 {recSecs}s · 松开结束
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="loading loading-spinner loading-sm text-base-content/60" />
+                  <span className="text-[14px] text-base-content/60">识别中…</span>
+                </>
+              )}
+            </div>
+          )}
           <textarea
             ref={taRef}
-            className="block max-h-[180px] min-h-[46px] w-full resize-none bg-transparent px-4 pb-1.5 pt-[14px] text-[14.5px] leading-[1.55] text-base-content outline-none placeholder:text-base-content/35"
+            className={`${recState !== "idle" ? "hidden" : "block"} max-h-[180px] min-h-[46px] w-full resize-none bg-transparent px-4 pb-1.5 pt-[14px] text-[14.5px] leading-[1.55] text-base-content outline-none placeholder:text-base-content/35`}
             rows={1}
             placeholder={
               disabled
@@ -366,31 +426,32 @@ export function Composer() {
               <PaperclipIcon />
             </button>
             <button
-              onClick={toggleRec}
-              title={recState === "recording" ? "停止并转文字" : "语音输入"}
-              aria-label="语音输入"
+              onPointerDown={(e) => {
+                e.preventDefault(); // 不抢输入焦点/不触发长按系统菜单
+                if (!disabled && recState === "idle") void holdStart();
+              }}
+              onPointerUp={holdEnd}
+              onPointerCancel={holdEnd}
+              onContextMenu={(e) => e.preventDefault()}
+              title="按住说话，松开结束"
+              aria-label="按住说话"
               disabled={disabled || recState === "busy"}
-              className={`flex size-8 items-center justify-center rounded-[9px] transition-colors disabled:opacity-30 ${
+              style={{ touchAction: "none" }}
+              className={`flex size-8 select-none items-center justify-center rounded-[9px] transition-colors disabled:opacity-30 ${
                 recState === "recording"
-                  ? "bg-error/15 text-error"
+                  ? "bg-error/20 text-error"
                   : "text-base-content/60 hover:bg-base-content/[0.06] hover:text-base-content"
               }`}
             >
               {recState === "busy" ? (
                 <span className="loading loading-spinner loading-xs" />
-              ) : recState === "recording" ? (
-                <span className="relative flex items-center justify-center">
-                  <span className="animate-cstra-breathe absolute inline-flex size-4 rounded-full bg-error/40" />
-                  <MicIcon />
-                </span>
               ) : (
                 <MicIcon />
               )}
             </button>
-            {recState === "recording" && (
-              <span className="text-[11px] font-medium text-error/80">录音中…点 🎤 结束</span>
+            {recErr && recState === "idle" && (
+              <span className="truncate text-[11px] text-error/70">{recErr}</span>
             )}
-            {recErr && <span className="truncate text-[11px] text-error/70">{recErr}</span>}
 
             <div className="ml-auto flex items-center gap-1.5">
               {/* 流式期间：暂停与发送并列（不互斥替换）——可一边看回复一边输入插话 */}
