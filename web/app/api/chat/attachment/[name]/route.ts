@@ -66,21 +66,35 @@ export async function GET(
       /* uploads 目录尚不存在 */
     }
   }
+  const serve = (buf: Buffer, filename: string) => {
+    const ext = filename.split(".").pop()?.toLowerCase() || "";
+    return new NextResponse(new Uint8Array(buf), {
+      headers: {
+        "Content-Type": MIME[ext] || "application/octet-stream",
+        // 文件名带雪花/时间戳前缀,内容不可变 → 放心长缓存
+        "Cache-Control": "private, max-age=604800, immutable",
+        "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      },
+    });
+  };
   for (const dir of dirs) {
     try {
-      const buf = await readFile(join(dir, safe));
-      const ext = safe.split(".").pop()?.toLowerCase() || "";
-      return new NextResponse(new Uint8Array(buf), {
-        headers: {
-          "Content-Type": MIME[ext] || "application/octet-stream",
-          // 文件名带雪花 id 前缀,内容不可变 → 放心长缓存
-          "Cache-Control": "private, max-age=604800, immutable",
-          "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(safe)}`,
-        },
-      });
+      return serve(await readFile(join(dir, safe)), safe);
     } catch {
       /* 试下一个目录 */
     }
+  }
+  // 历史里的 agent 出站附件只有 basename（jsonl 记录 reply 的原路径），bridge
+  // 落到 inbox 时加了 `<时间戳>_` 前缀——精确名全落空后按后缀匹配 inbox,
+  // 取名字最大（=时间戳最新）的一个。
+  try {
+    const suffixed = (await readdir(INBOX_DIRS[0]))
+      .filter((f) => /^\d+_/.test(f) && f.endsWith(`_${safe}`))
+      .sort()
+      .pop();
+    if (suffixed) return serve(await readFile(join(INBOX_DIRS[0], suffixed)), suffixed);
+  } catch {
+    /* inbox 不存在 / 读失败 */
   }
   return NextResponse.json({ error: "attachment not found" }, { status: 404 });
 }

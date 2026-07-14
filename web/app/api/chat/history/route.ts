@@ -24,6 +24,8 @@ interface NeutralMessage {
   replyText?: string;
   /** [fork] reply() 附带的按钮/选单（后端从 reply tool_use 的 input.components 提取） */
   replyComponents?: WebComponentRow[];
+  /** [fork] reply() 出站附件文件名（basename;取回走 /api/chat/attachment 的 inbox 后缀兜底） */
+  replyFiles?: string[];
   compactSummary?: boolean;
   /** 入站消息发送者标签（<channel> user 属性：API token 名 / Discord 用户名 / 来源 agent） */
   from?: string;
@@ -167,10 +169,15 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
     // assistant：累积进当前回合气泡（首条建组并入 out，后续 mutate 同一引用）。
     // segments 保留叙述/工具的真实交错序——不然长回合渲染成「一坨工具卡在顶 +
     // 一坨文本在底」，时间线全乱（2026-07-12 真机反馈）。
+    // agent 出站附件（reply files）：basename → 附件视图,累积到回合气泡
+    const replyAtts = (m.replyFiles ?? [])
+      .map((f) => attachmentFromPath(f))
+      .filter((a): a is ChatAttachmentView => !!a);
     if (!group) {
       group = { id: `h${m.seq}`, role: "assistant", content: m.text || "", toolCalls, ts: m.ts, segments: [] };
       if (m.replyText) group.replyText = m.replyText;
       if (m.replyComponents?.length) group.replyComponents = m.replyComponents;
+      if (replyAtts.length) group.attachments = replyAtts;
       out.push(group);
     } else {
       if (m.text) group.content = group.content ? `${group.content}\n\n${m.text}` : m.text;
@@ -178,6 +185,7 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
       if (m.replyText) group.replyText = group.replyText ? `${group.replyText}\n${m.replyText}` : m.replyText;
       // 同一回合多条 reply 的组件累积（通常只一组）
       if (m.replyComponents?.length) group.replyComponents = [...(group.replyComponents ?? []), ...m.replyComponents];
+      if (replyAtts.length) group.attachments = [...(group.attachments ?? []), ...replyAtts];
     }
     // reply 的时间与气泡开场 ts 分开记（长回合里回复晚得多），取首条 reply 记录的 ts
     if (m.replyText && !group.replyTs && m.ts) group.replyTs = m.ts;

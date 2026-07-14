@@ -32,6 +32,8 @@ const SSE_HEADERS = {
  * 订阅之前（切会话/刷新/回前台），对应旧 web-hub 的 pendingInteraction replay。
  */
 
+const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "avif", "svg"]);
+
 interface BridgeEvent {
   seq: number;
   ts: string;
@@ -66,17 +68,30 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
       return { t: "tool", name: String(d.name ?? "?"), summary: String(d.summary ?? ""), state: "running" };
     case "assistant_text":
       return { t: "text", text: String(d.text ?? "") };
-    case "chat_message":
+    case "chat_message": {
       // direction=in 是自己发出去的消息回声；out 才是 agent 的回复
       if (d.direction !== "out") return null;
       // [fork] reply() 的最终回复 → 独立 reply 事件（挂 replyText，与过程叙述分区、
       // 走 Domd 富文本、且回合 done 之后到达也能定稿——修「回复完又冒一条纯文本」）
       // components：reply 附带的按钮/选单（后端 #29 起 chat_message 事件带上），原样透传
+      // files：agent 出站附件（bridge 已拷贝进 inbox，attachment=落盘文件名）→
+      // 前端走 /api/chat/attachment/<name> 内联显示（owner:「你也可以给我发图片」）
+      const atts = Array.isArray(d.files)
+        ? (d.files as { name?: string; attachment?: string }[])
+            .filter((f) => f?.attachment)
+            .map((f) => ({
+              name: String(f.name || f.attachment),
+              kind: IMG_EXT.has(String(f.attachment).split(".").pop()?.toLowerCase() || "") ? ("image" as const) : ("file" as const),
+              url: `/api/chat/attachment/${encodeURIComponent(String(f.attachment))}`,
+            }))
+        : [];
       return {
         t: "reply",
         text: String(d.text ?? ""),
         ...(Array.isArray(d.components) ? { components: d.components as WebComponentRow[] } : {}),
+        ...(atts.length ? { attachments: atts } : {}),
       };
+    }
     case "question":
       return { t: "ask", id: `auq-${evt.seq}`, questions: mapAuqQuestions(d.questions) };
     case "question_cleared":

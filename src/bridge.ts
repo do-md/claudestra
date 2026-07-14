@@ -53,6 +53,7 @@ import { tmuxScreenshot } from "./bridge/screenshot.js";
 import { startWatching, stopWatching, stopWatchingByChannel, resetToolTracking, hasRecentScheduleWakeup, agentNameForChannel, formatTool } from "./bridge/jsonl-watcher.js";
 import { listAgentSessions, readSessionHistory, isValidSessionId, isValidSubagentId } from "./lib/session-history.js";
 import { existsSync, readdirSync, statSync } from "fs";
+import * as fs from "fs/promises";
 // [fork] master 历史 probe 用（master 不在 registry，sessionId 从 projects slug 目录取最新）
 import { projectsSlug } from "./lib/jsonl-cost.js";
 // v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
@@ -472,6 +473,22 @@ async function deliverToApi(env: RouterEnvelope, to: RouterApiUserEndpoint): Pro
     apiFiles.set(id, { path: p, tokenId: to.tokenId, name });
     return { name, url: `/api/v1/files/${id}` };
   });
+  // 出站附件持久化（owner 2026-07-14:「你也可以给我发图片」）：agent reply 的
+  // files 常在临时目录（scratchpad/截图），拷进 inbox（web 附件取回白名单）——
+  // SSE 事件带 inbox 文件名，web 前端走 /api/chat/attachment/<name> 内联显示，
+  // 时间戳前缀防碰撞 + 与 Discord 下载附件同一套展示名清洗（去 ^\d+_）。
+  const eventFiles: { name: string; attachment: string }[] = [];
+  for (const p of env.meta.files || []) {
+    try {
+      const base = (p.split("/").pop() || "file").replace(/[^\w.\-]+/g, "_").slice(0, 80);
+      const dest = `${Date.now()}_${base}`;
+      await fs.mkdir(INBOX_DIR, { recursive: true });
+      await fs.copyFile(p, `${INBOX_DIR}/${dest}`);
+      eventFiles.push({ name: base, attachment: dest });
+    } catch (e) {
+      console.error(`API 出站附件拷贝失败 ${p}:`, (e as Error).message);
+    }
+  }
 
   const threadId = pending?.threadId || env.meta.threadId;
   const agentName = pending?.agentName ||
@@ -491,7 +508,7 @@ async function deliverToApi(env: RouterEnvelope, to: RouterApiUserEndpoint): Pro
     agent: agentName,
     chatId: `api:${to.tokenId}`,
     type: "chat_message",
-    data: { direction: "out", from: agentName, text: env.content, threadId, api: true, ...(env.meta.components ? { components: env.meta.components } : {}) },
+    data: { direction: "out", from: agentName, text: env.content, threadId, api: true, ...(env.meta.components ? { components: env.meta.components } : {}), ...(eventFiles.length ? { files: eventFiles } : {}) },
   });
 
   // R2 审计镜像（fire-and-forget，走 bridge→user 的 UI 类通道）

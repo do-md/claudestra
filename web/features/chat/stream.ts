@@ -13,8 +13,13 @@ export interface StreamSink {
   ): void;
   appendAssistantText(text: string): void;
   /** [fork] reply() 的最终回复：挂到当前 assistant 气泡的 replyText（回合外到达也定稿）。
-   *  components：reply 附带的按钮/选单，挂到同一气泡供渲染。 */
-  setReplyText(text: string, components?: WebComponentRow[]): void;
+   *  components：reply 附带的按钮/选单，挂到同一气泡供渲染。
+   *  attachments：agent 出站附件（图片/文件），挂到气泡尾部渲染。 */
+  setReplyText(
+    text: string,
+    components?: WebComponentRow[],
+    attachments?: { name: string; kind: "image" | "file"; url: string }[]
+  ): void;
   setStatus(status: "running" | "done"): void;
   endTurn(): void;
   /** Phase 2：待处理交互卡（null=清卡）。 */
@@ -40,7 +45,7 @@ export function processStreamEvent(sink: StreamSink, evt: WebStreamEvent) {
       sink.appendAssistantText(evt.text);
       break;
     case "reply":
-      sink.setReplyText(evt.text, evt.components);
+      sink.setReplyText(evt.text, evt.components, evt.attachments);
       break;
     case "status":
       sink.setStatus(evt.status);

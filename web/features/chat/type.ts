@@ -82,7 +82,7 @@ export interface ChatMessage {
   streamed?: boolean;
   /** ISO 时间戳（历史来自 session jsonl，实时由前端 stamp）。 */
   ts?: string;
-  /** 用户上传的附件（仅 user 气泡回显）。 */
+  /** 附件:user 气泡=用户上传回显;assistant 气泡=agent 出站附件(reply files)。 */
   attachments?: ChatAttachmentView[];
   /** 入站消息来源标签（Discord 用户名 / 来源 agent；自己发的不带）。 */
   from?: string;

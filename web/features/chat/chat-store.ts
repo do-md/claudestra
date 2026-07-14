@@ -668,9 +668,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
    * 直接挂到最后一条 assistant 气泡上（无论是否已定稿），已定稿的保持定稿 → reply 走
    * Domd 富文本。没有前置 assistant 气泡（纯 reply 无叙述）才新建，且回合外直接定稿。
    */
-  public setReplyText(text: string, components?: WebComponentRow[]) {
+  public setReplyText(
+    text: string,
+    components?: WebComponentRow[],
+    attachments?: { name: string; kind: "image" | "file"; url: string }[]
+  ) {
     this.flushPendingText(); // reply 段插入前先落缓冲的叙述文本
     const hasComp = Array.isArray(components) && components.length > 0;
+    const hasAtts = Array.isArray(attachments) && attachments.length > 0;
     const last = this.state.messages[this.state.messages.length - 1];
     // 回合边界上的 reply（他端触发、纯 reply 无叙述）另起气泡，不并进上一回合
     if (last && last.role === "assistant" && !this.nextBubbleBoundary) {
@@ -683,6 +688,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         m.segments.push({ kind: "reply", text, ts: new Date().toISOString() });
         // 组件挂到承载 reply 的气泡；一条 reply 多段拼接时后到的组件覆盖（通常只一组）
         if (hasComp) m.replyComponents = components;
+        // agent 出站附件（发图给用户）——多段 reply 各自的附件累积
+        if (hasAtts) m.attachments = [...(m.attachments ?? []), ...attachments!];
         s.awaitingChunk = false;
       });
     } else {
@@ -697,6 +704,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           replyTs: new Date().toISOString(),
           segments: [{ kind: "reply", text, ts: new Date().toISOString() }],
           ...(hasComp ? { replyComponents: components } : {}),
+          ...(hasAtts ? { attachments } : {}),
           streamed,
           ts: new Date().toISOString(),
         });

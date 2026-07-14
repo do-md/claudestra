@@ -39,6 +39,8 @@ export interface HistoryMessage {
   replyText?: string;
   /** [fork] reply() 附带的按钮/选单——历史里也渲染（否则用户不在直播那刻就看不到按钮） */
   replyComponents?: ReplyComponentRow[];
+  /** [fork] reply() 附带的出站附件文件名（basename;取回走 inbox 后缀匹配兜底） */
+  replyFiles?: string[];
   /** compact 产生的摘要条目（不是真实用户输入） */
   compactSummary?: boolean;
   model?: string;
@@ -339,6 +341,7 @@ export async function readSessionHistory(
       const texts: string[] = [];
       const replyTexts: string[] = [];
       const replyComponents: ReplyComponentRow[] = [];
+      const replyFiles: string[] = [];
       const tools: HistoryToolCall[] = [];
       for (const b of content) {
         if (b?.type === "text" && b.text?.trim()) texts.push(b.text);
@@ -350,6 +353,16 @@ export async function readSessionHistory(
             replyTexts.push(b.input.text);
             // reply 附带的按钮/选单也进历史（否则用户不在直播那刻就看不到按钮）
             replyComponents.push(...sanitizeComponents(b.input?.components));
+            // 出站附件（agent 发给用户的图/文件）：jsonl 里是绝对路径,取 basename
+            // ——bridge 投递时已拷贝到 inbox（时间戳前缀）,取回走后缀匹配兜底
+            if (Array.isArray(b.input?.files)) {
+              for (const f of b.input.files) {
+                if (typeof f === "string" && f.trim()) {
+                  const base = f.trim().split("/").pop();
+                  if (base) replyFiles.push(base);
+                }
+              }
+            }
           } else {
             tools.push({ name: b.name, summary: fmt(b.name, b.input) });
           }
@@ -359,6 +372,7 @@ export async function readSessionHistory(
       const msg: HistoryMessage = { seq: i, ts, role: "assistant", text: texts.join("\n") };
       if (replyTexts.length) msg.replyText = replyTexts.join("\n");
       if (replyComponents.length) msg.replyComponents = replyComponents;
+      if (replyFiles.length) msg.replyFiles = replyFiles;
       if (tools.length) msg.tools = tools;
       if (typeof rec.message?.model === "string") msg.model = rec.message.model;
       all.push(msg);

@@ -53,8 +53,14 @@ export type WebStreamEvent =
   /** 助手文本段（过程叙述，追加到当前流式助手消息的 content） */
   | { t: "text"; text: string }
   /** [fork] reply() 的最终回复（挂到当前 assistant 气泡的 replyText，与叙述分区渲染）。
-   *  components：reply 附带的按钮/选单（点击回投 [button:<id>] / [select:<id>:<value>]）。 */
-  | { t: "reply"; text: string; components?: WebComponentRow[] }
+   *  components：reply 附带的按钮/选单（点击回投 [button:<id>] / [select:<id>:<value>]）。
+   *  attachments：agent 出站附件（图片内联显示,文件给 chip）——url 指向 BFF 附件端点。 */
+  | {
+      t: "reply";
+      text: string;
+      components?: WebComponentRow[];
+      attachments?: { name: string; kind: "image" | "file"; url: string }[];
+    }
   /** 本轮结束 */
   | { t: "done" }
   | { t: "error"; error: string }

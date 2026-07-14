@@ -521,6 +521,12 @@ const Message = memo(function Message({
         <ToolCallsBlock tools={m.toolCalls} streamingLast={streamingLast} />
       )}
       <AssistantBody m={m} liveEmpty={liveEmpty} streamingLast={streamingLast} />
+      {/* agent 出站附件(reply files):图片内联、文件 chip,与 user 气泡同一渲染 */}
+      {!!m.attachments?.length && (
+        <div className="mt-2">
+          <AttachmentStrip items={m.attachments} />
+        </div>
+      )}
       {!!m.replyComponents?.length && <ReplyComponents m={m} />}
     </div>
   );
