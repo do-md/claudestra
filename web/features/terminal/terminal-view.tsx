@@ -536,8 +536,26 @@ export function TerminalView({
       </div>
       <ControlBar
         onKeys={(seq) => {
-          // 「⤓ 底」(End):除了发给 CC(转录视图 pager 跳底),前端视口也同步滚到底
-          if (seq === "\x1b[F") termRef.current?.scrollToBottom();
+          // 「⤓ 底」:CC 转录视图是 vi 键位(? 帮助实测:g/G=top/bottom,End 不在
+          // 表里,首版发 End 被 owner 实测「按了没用」)。但裸发 G 有毒——主界面
+          // 下会把字母 G 打进输入框(实验中真发生了 ❯ GG)。镜像画面就在 xterm
+          // buffer 里:底部状态栏含 "transcript" 才发 G,否则 End 无害兜底。
+          if (seq === "\x1b[F") {
+            const term = termRef.current;
+            term?.scrollToBottom();
+            let inTranscript = false;
+            if (term) {
+              const buf = term.buffer.active;
+              for (let y = Math.max(0, buf.length - 8); y < buf.length; y++) {
+                if (/transcript/i.test(buf.getLine(y)?.translateToString() || "")) {
+                  inTranscript = true;
+                  break;
+                }
+              }
+            }
+            queueInputRef.current(inTranscript ? "G" : "\x1b[F");
+            return;
+          }
           queueInputRef.current(seq);
         }}
         onFocusTerm={() => termRef.current?.focus()}
