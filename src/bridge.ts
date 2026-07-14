@@ -124,6 +124,7 @@ import { startPermissionWatcher, permissionMessages, clearPermissionMessage } fr
 import { startWedgeWatcher, clearWedgeState } from "./bridge/wedge-watcher.js";
 import { updateStatsDashboard, initStatsDashboard, handleStatsRequest, forceRefreshStatsDashboard } from "./bridge/stats-dashboard.js";
 import { recordMetric } from "./lib/metrics.js";
+import { readRegistryAgents } from "./lib/registry.js";
 import {
   tmuxCapture,
   windowTarget,
@@ -524,6 +525,10 @@ async function mirrorApiExchange(to: RouterApiUserEndpoint, agentChannelId: stri
 }
 
 /** 投递到本地 Claude Code session —— 通过 ws 注入一条 "message" 事件 */
+/** 人类连发抢占的每频道冷却：C-c 后短窗内不再重复打断（防打断叠加 + 双 C-c 风险）。 */
+const lastPreemptAt = new Map<string, number>();
+const PREEMPT_COOLDOWN_MS = 4_000;
+
 async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Promise<RouterDelivery> {
   const content = await renderContentForLocal(env);
   // chat_id 是 agent reply() 时要传回的 id：消息从哪个 Discord 频道来，回复就发回那里。
@@ -565,14 +570,48 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
     meta.attachment_count = String(env.meta.attachments.length);
     meta.attachments = env.meta.attachments.join(";");
   }
+  const evAgent = to.agentName || agentLabelForChannel(to.channelId);
+  // ── 人类连发抢占（owner 2026-07-14:「后一条消息应该直接打断前一条,优先处理
+  // 后面的,这样用户可以随时补充」）──目标正在回合中时,先 C-c 掐掉当前回合再投递:
+  // 上下文都在,agent 带着前一条的进度优先响应补充,而不是把补充压到回复之后。
+  // 只对人类的 request 生效(Discord user / API user);agent↔agent、peer、bridge
+  // 系统消息、response 回执不抢占目标的工作。
+  // 防线:①tmux 实测 pane 出现 "esc to interrupt" 才算工作中(唯一真值——hook 状态
+  // 表 bridge 重启即空,paneLooksIdle 对工作中的空 `❯` 输入行会假阳性;空闲 prompt
+  // 下绝不发 C-c,连两下会直接退出 CC;权限弹窗时该文案也不在,不误伤弹窗);
+  // ②同频道 4s 冷却,三连发不叠加打断。
+  if (
+    (env.from.kind === "user" || env.from.kind === "api") &&
+    env.intent === "request" &&
+    Date.now() - (lastPreemptAt.get(to.channelId) ?? 0) > PREEMPT_COOLDOWN_MS
+  ) {
+    try {
+      let win: string | null = null;
+      if (to.channelId === CONTROL_CHANNEL_ID) win = `${MASTER_SESSION}:0`;
+      else {
+        const reg = (await readRegistryAgents()).find((a) => a.channelId === to.channelId);
+        if (reg) win = windowTarget(reg.name);
+      }
+      const tail10 = win
+        ? (await tmuxRaw(["capture-pane", "-t", win, "-p"])).split("\n").slice(-10).join("\n")
+        : "";
+      if (win && /esc to interrupt/i.test(tail10)) {
+        lastPreemptAt.set(to.channelId, Date.now());
+        await tmuxRaw(["send-keys", "-t", win, "C-c"]);
+        recordMetric("agent_interrupt", { channelId: to.channelId, agent: evAgent, meta: { trigger: "preempt" } });
+        console.log(`⚡ 抢占打断 ${evAgent}（人类补充消息优先处理）`);
+        // CC 中断收尾需要一拍;立刻投递会混进垂死回合的尾流
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    } catch (e) {
+      console.log(`⚠️ 抢占打断失败,按常规投递: ${(e as Error).message}`);
+    }
+  }
   try {
     to.ws.send(JSON.stringify({ type: "message", content, meta }));
     // v2.6.0+ 事件埋点：入站消息镜像 + agent 进入思考态（旁路，不影响主流程）
-    {
-      const evAgent = to.agentName || agentLabelForChannel(to.channelId);
-      emitEvent({ agent: evAgent, chatId: to.channelId, type: "chat_message", data: { direction: "in", from: meta.user || "?", text: env.content, threadId: env.meta.threadId } });
-      emitEvent({ agent: evAgent, chatId: to.channelId, type: "agent_status", data: { status: "thinking" } });
-    }
+    emitEvent({ agent: evAgent, chatId: to.channelId, type: "chat_message", data: { direction: "in", from: meta.user || "?", text: env.content, threadId: env.meta.threadId } });
+    emitEvent({ agent: evAgent, chatId: to.channelId, type: "agent_status", data: { status: "thinking" } });
     // intent=request 挂 pending + thread 追踪。response 端到端，不挂新 pending。
     if (env.intent === "request") {
       pendingReplies.set(replyBackChannel, {
