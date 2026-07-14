@@ -819,11 +819,12 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         break;
       }
       // thinking 期被抢占:回合还没吐出任何流式气泡,无处标黄 → 插一条与历史
-      // 同款的中断系统线(SystemDivider 渲染成黄⊘)。插在末尾连续的 user 消息
-      // 之前——打断发生在旧回合,触发打断的新消息在时间序上晚于它。
+      // 同款的中断系统线(SystemDivider 渲染成黄⊘)。只跳过触发打断的最后一条
+      // user——连发场景第 N 条打断的是第 N-1 条开启的回合,线要落在两条之间;
+      // 跳过整个 user 块会把线错插到第一条之前(2026-07-14 temp 实测)。
       if (interrupted && !marked) {
         let idx = s.messages.length;
-        while (idx > 0 && s.messages[idx - 1].role === "user") idx--;
+        if (idx > 0 && s.messages[idx - 1].role === "user") idx--;
         s.messages.splice(idx, 0, {
           id: this.nextId(),
           role: "system",
