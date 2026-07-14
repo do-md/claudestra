@@ -26,4 +26,12 @@ export function runSettingsMigrations(db: Database.Database) {
       updated_at TEXT NOT NULL
     )
   `);
+  // Claude 侧也可自定义头像+名称(owner 同日追加)。ALTER 幂等:查列缺才加。
+  const cols = (db.prepare("PRAGMA table_info(user_profile)").all() as { name: string }[]).map((c) => c.name);
+  if (!cols.includes("claude_nickname")) {
+    db.exec("ALTER TABLE user_profile ADD COLUMN claude_nickname TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.includes("claude_avatar")) {
+    db.exec("ALTER TABLE user_profile ADD COLUMN claude_avatar TEXT NOT NULL DEFAULT ''");
+  }
 }

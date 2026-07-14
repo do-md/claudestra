@@ -44,8 +44,8 @@ interface ChatState {
   pendingAsk: PendingAsk | null;
   /** 当前会话的后台任务（subagent / bg shell）跟踪面板，按到达顺序。 */
   bgTasks: BgTaskView[];
-  /** 用户个人资料（头像 data URL + 昵称）——显示在自己的消息气泡旁。 */
-  profile: { nickname: string; avatar: string };
+  /** 个人资料：用户头像+昵称（显示在自己消息上方）与 Claude 头像+名称。 */
+  profile: { nickname: string; avatar: string; claudeNickname: string; claudeAvatar: string };
 }
 
 /**
@@ -97,7 +97,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       pendingPermission: null,
       pendingAsk: null,
       bgTasks: [],
-      profile: { nickname: "", avatar: "" },
+      profile: { nickname: "", avatar: "", claudeNickname: "", claudeAvatar: "" },
     });
   }
 
@@ -106,9 +106,16 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     try {
       const res = await fetch("/api/profile");
       if (!res.ok) return;
-      const json = (await res.json()) as { data?: { nickname?: string; avatar?: string } };
+      const json = (await res.json()) as {
+        data?: { nickname?: string; avatar?: string; claudeNickname?: string; claudeAvatar?: string };
+      };
       this.produce((s) => {
-        s.profile = { nickname: json.data?.nickname ?? "", avatar: json.data?.avatar ?? "" };
+        s.profile = {
+          nickname: json.data?.nickname ?? "",
+          avatar: json.data?.avatar ?? "",
+          claudeNickname: json.data?.claudeNickname ?? "",
+          claudeAvatar: json.data?.claudeAvatar ?? "",
+        };
       });
     } catch {
       /* 非关键 */
@@ -116,16 +123,21 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   }
 
   /** 保存个人资料并更新本地状态。返回是否成功（设置面板据此提示）。 */
-  public async saveProfile(nickname: string, avatar: string): Promise<boolean> {
+  public async saveProfile(p: ChatState["profile"]): Promise<boolean> {
     try {
       const res = await fetch("/api/profile", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ nickname, avatar }),
+        body: JSON.stringify(p),
       });
       if (!res.ok) return false;
       this.produce((s) => {
-        s.profile = { nickname: nickname.trim().slice(0, 32), avatar };
+        s.profile = {
+          nickname: p.nickname.trim().slice(0, 32),
+          avatar: p.avatar,
+          claudeNickname: p.claudeNickname.trim().slice(0, 32),
+          claudeAvatar: p.claudeAvatar,
+        };
       });
       return true;
     } catch {

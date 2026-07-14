@@ -251,14 +251,23 @@ function ThinkingDots() {
   );
 }
 
-/** ✦ Claude 头（assistant 消息 / 独立思考态共用）。 */
+/** ✦ Claude 头（assistant 消息 / 独立思考态共用）。头像/名称可在设置里
+ *  自定义(owner 2026-07-14),未设置回落 ✦ + Claude。 */
 function ClaudeHeader() {
+  const profile = useChatStore((s) => s.state.profile);
   return (
     <div className="mb-[9px] flex items-center gap-2">
-      <span className="flex size-[21px] items-center justify-center rounded-md bg-accent text-[11px] text-white">
-        ✦
+      {profile.claudeAvatar ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={profile.claudeAvatar} alt="" className="size-[21px] rounded-md object-cover" />
+      ) : (
+        <span className="flex size-[21px] items-center justify-center rounded-md bg-accent text-[11px] text-white">
+          ✦
+        </span>
+      )}
+      <span className="text-xs font-semibold text-base-content/60">
+        {profile.claudeNickname || "Claude"}
       </span>
-      <span className="text-xs font-semibold text-base-content/60">Claude</span>
     </div>
   );
 }
@@ -614,13 +623,22 @@ const Message = memo(function Message({
     const isSelf = !m.from;
     const showAvatar = isSelf && !!profile.avatar;
     const label = m.from || (isSelf ? profile.nickname : "");
-    const body = (
-      <div className="flex min-w-0 flex-col items-end gap-2">
-        {label && <div className="pr-1 text-[10px] opacity-50">{label}</div>}
+    return (
+      <div className="chat-msg-in mb-[22px] flex flex-col items-end gap-2">
+        {/* 头行:昵称 + 头像落在气泡上方,不占气泡宽度(owner 2026-07-14) */}
+        {(label || showAvatar) && (
+          <div className="flex items-center gap-1.5">
+            {label && <span className="text-[10px] opacity-50">{label}</span>}
+            {showAvatar && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={profile.avatar} alt="" className="size-[22px] rounded-full object-cover" />
+            )}
+          </div>
+        )}
         {atts.length > 0 && <AttachmentStrip items={atts} />}
         {m.content && (
           <div
-            className="max-w-full cursor-pointer whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90"
+            className="max-w-[85%] cursor-pointer whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90"
             onClick={() => setShowTs((v) => !v)}
           >
             {m.content}
@@ -628,19 +646,6 @@ const Message = memo(function Message({
         )}
         {showTs && m.ts && (
           <div className="pr-1 font-mono text-[10px] tabular-nums opacity-40">{fmtTs(m.ts)}</div>
-        )}
-      </div>
-    );
-    return (
-      <div className="chat-msg-in mb-[22px] flex justify-end gap-2">
-        <div className="flex max-w-[85%] justify-end">{body}</div>
-        {showAvatar && (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={profile.avatar}
-            alt=""
-            className={`size-7 shrink-0 rounded-full object-cover ${label ? "mt-4" : "mt-0.5"}`}
-          />
         )}
       </div>
     );
