@@ -530,8 +530,10 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     const { readdirSync } = await import("fs");
     const { ARCHIVE_ROOT } = await import("../lib/session-archive.js");
     // scope 内的候选 agent：registry 全量 + 归档目录（已删 agent）+ master（须显式 scope）
+    const regAgents = await readRegistryAgents();
+    const regMap = new Map(regAgents.map((a) => [a.name, a]));
     const candidates = new Set<string>();
-    for (const a of await readRegistryAgents()) {
+    for (const a of regAgents) {
       if (agentInScope(principal, a.name)) candidates.add(a.name);
     }
     try {
@@ -553,22 +555,47 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     const { searchSessionHistory } = await import("../lib/session-history.js");
     const all: Hit[] = [];
     const collectBudget = limit * 3;
-    // 全部候选 session 拉平后按 mtime 降序——最近的对话最可能是要找的
+    // 全部候选 session 拉平后按 mtime 降序——最近的对话最可能是要找的。
+    // cwd/sessionId 直接取 registry（已在手）——findApiAgent 对非 master 每次
+    // 起一个 manager 子进程,17 个 agent 就是 ~2.5s,曾是本端点的真正大头
+    // (2026-07-14 bench:枚举+清单本身只要 4ms,扫描 1.2s)。
     const files: { agent: string; sessionId: string; source: string; path: string; mtime: string }[] = [];
     for (const n of names) {
-      const agent = await findApiAgent(n.replace(/^agent-/, ""));
-      const canonical = agent?.name ?? n;
-      const sessions = await listAgentSessions(canonical, { cwd: agent?.cwd, currentSessionId: agent?.sessionId });
-      for (const s of sessions) files.push({ agent: canonical, sessionId: s.sessionId, source: s.source, path: s.path, mtime: s.mtime });
+      let cwd: string | undefined;
+      let sessionId: string | undefined;
+      if (n === "master") {
+        const m = await findApiAgent("master"); // master 分支不起子进程
+        cwd = m?.cwd;
+        sessionId = m?.sessionId;
+      } else {
+        const a = regMap.get(n);
+        cwd = a?.cwd;
+        sessionId = a?.sessionId;
+      }
+      const sessions = await listAgentSessions(n, { cwd, currentSessionId: sessionId });
+      for (const s of sessions) files.push({ agent: n, sessionId: s.sessionId, source: s.source, path: s.path, mtime: s.mtime });
     }
     files.sort((a, b) => b.mtime.localeCompare(a.mtime));
-    for (const f of files) {
-      if (all.length >= collectBudget) break;
-      try {
-        const hits = await searchSessionHistory(f.path, q, { maxHits: Math.min(20, collectBudget - all.length) });
-        for (const h of hits) all.push({ agent: f.agent, sessionId: f.sessionId, source: f.source, ...h });
-      } catch { /* 单文件失败不影响整体 */ }
-    }
+    // 并发扫描（owner 2026-07-14「免费优化」）：6 路并发重叠 IO 与解析,
+    // 领任务顺序保持 mtime 降序;收集超预算后不再领新文件（在扫的照常收尾）。
+    const perFile: Hit[][] = new Array(files.length);
+    let cursor = 0;
+    let collected = 0;
+    const scanWorker = async () => {
+      while (cursor < files.length && collected < collectBudget) {
+        const idx = cursor++;
+        const f = files[idx];
+        try {
+          const hits = await searchSessionHistory(f.path, q, { maxHits: 20 });
+          perFile[idx] = hits.map((h) => ({ agent: f.agent, sessionId: f.sessionId, source: f.source, ...h }));
+          collected += hits.length;
+        } catch {
+          perFile[idx] = []; // 单文件失败不影响整体
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, files.length) }, scanWorker));
+    for (const part of perFile) if (part) all.push(...part);
     all.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
     return apiJson(200, { ok: true, query: q, hits: all.slice(0, limit), scanned: files.length });
   }

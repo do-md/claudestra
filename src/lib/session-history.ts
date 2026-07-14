@@ -476,12 +476,20 @@ export async function searchSessionHistory(
   const q = query.toLowerCase();
   if (!q) return [];
   const raw = await Bun.file(filePath).text();
+  // 性能梯次（2026-07-14 owner:「先把免费优化做了」）：
+  // ① 文件级预筛——整个文件不含词直接出局，多数归档文件在这里零解析返回；
+  // ② 单次 toLowerCase——53MB 文件逐行 toLowerCase 是 10 万次小分配 + GC 压力，
+  //    整体一次快得多。\n 无大小写形态，两个 split 的行号严格对齐（个别 Unicode
+  //    字符 lower 后长度会变，但只影响行内 offset，不影响行对齐与 includes 判断）。
+  const lowerRaw = raw.toLowerCase();
+  if (!lowerRaw.includes(q)) return [];
   const lines = raw.split("\n");
+  const lowerLines = lowerRaw.split("\n");
   const hits: HistorySearchHit[] = [];
 
   for (let i = 0; i < lines.length && hits.length < maxHits; i++) {
     const line = lines[i];
-    if (!line.trim() || !line.toLowerCase().includes(q)) continue;
+    if (!line.trim() || !lowerLines[i].includes(q)) continue;
     let rec: any;
     try {
       rec = JSON.parse(line);
