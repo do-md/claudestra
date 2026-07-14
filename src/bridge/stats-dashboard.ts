@@ -75,7 +75,9 @@ function parseUsagePanel(raw: string): AccountUsage {
         ? "week"
         : null;
     if (!anchor) continue;
-    for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+    // 搜索窗放宽到 +7:窄窗口(手机终端页把 tmux 钳到 ~52 列)下锚行/进度条
+    // 折行,"% used" 会掉到 +4 之外(2026-07-14 weekPct null 实锤)
+    for (let j = i + 1; j < Math.min(i + 7, lines.length); j++) {
       const pm = lines[j].match(/(\d+)%\s*used/);
       const rm = lines[j].match(/Resets\s+(.+?)\s*$/);
       if (anchor === "session") {
@@ -89,8 +91,8 @@ function parseUsagePanel(raw: string): AccountUsage {
   }
   const cost = raw.match(/Total cost:\s*\$([\d.,]+)/);
   const durApi = raw.match(/Total duration \(API\):\s*([^\n]+)/);
-  // raw 只留 Usage 面板本身（capture -S -80 会带进上方的对话 scrollback，切掉）
-  let startIdx = lines.findIndex((l) => /Settings\s+Status\s+Config\s+Usage/.test(l));
+  // raw 只留 Usage 面板本身;取「最后一个」tab 行起——万一仍有残留,后者才是当前面板
+  let startIdx = lines.findLastIndex((l) => /Settings\s+Status\s+Config\s+Usage/.test(l));
   if (startIdx < 0) startIdx = lines.findIndex((l) => /^\s*Session\s*$/.test(l));
   if (startIdx < 0) startIdx = 0;
   const cleaned = lines
@@ -160,8 +162,11 @@ async function scrapeAccountUsage(): Promise<AccountUsage | null> {
     let panel = "";
     let found = false;
     for (let i = 0; i < 6; i++) {
-      panel = await tmuxRaw(["capture-pane", "-t", target, "-p", "-S", "-80"]).catch(() => "");
-      if (/Current session/.test(panel) && /%\s*used/.test(panel)) {
+      // ⚠ 只抓可视屏,不带 scrollback(-S -80 会带出上一次 /status 的旧面板文本,
+      // 锚在 Status tab 就假命中 → 解析到旧 session 值、week 被窗口切没
+      // (2026-07-14 周用量「?%」实锤);锚定加 Current week——Usage tab 两条同屏
+      panel = await tmuxRaw(["capture-pane", "-t", target, "-p"]).catch(() => "");
+      if (/Current session/.test(panel) && /Current week/.test(panel) && /%\s*used/.test(panel)) {
         found = true;
         break;
       }
@@ -175,8 +180,8 @@ async function scrapeAccountUsage(): Promise<AccountUsage | null> {
     // 用刷新后的帧解析（实测 15%/20% 冻结值 vs 等待后 74%/40% 真值）。
     if (found) {
       await sleep(1800);
-      const refreshed = await tmuxRaw(["capture-pane", "-t", target, "-p", "-S", "-80"]).catch(() => "");
-      if (/Current session/.test(refreshed) && /%\s*used/.test(refreshed)) panel = refreshed;
+      const refreshed = await tmuxRaw(["capture-pane", "-t", target, "-p"]).catch(() => "");
+      if (/Current session/.test(refreshed) && /Current week/.test(refreshed) && /%\s*used/.test(refreshed)) panel = refreshed;
     }
     // 关闭面板恢复会话
     await tmuxRaw(["send-keys", "-t", target, "Escape"]);

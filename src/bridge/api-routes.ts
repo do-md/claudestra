@@ -273,12 +273,16 @@ async function sessionTailInfo(path: string): Promise<SessionTailInfo | null> {
           if (typeof post === "number") ctxTokens = post;
         }
         // 上下文占用:最近一条带 usage 的 assistant——input + cache 读写就是
-        // 本轮进模型的全部上下文(web 端「context 快满」指示的数据源)
+        // 本轮进模型的全部上下文(web 端「context 快满」指示的数据源)。
+        // 合计为 0 的跳过:restart 回放命令产生的「No response requested.」等
+        // 合成记录 usage 全 0,采纳它会让全列表 ctx 归零(2026-07-14 CC 升级
+        // 全量 restart 后「各会话上下文占用只剩一个」的根因)
         if (ctxTokens === null && rec.type === "assistant") {
           const u = rec.message?.usage;
           if (u && typeof u.input_tokens === "number") {
-            ctxTokens =
+            const total =
               u.input_tokens + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+            if (total > 0) ctxTokens = total;
           }
         }
         if (convTs === null && (rec.type === "user" || rec.type === "assistant") && typeof rec.timestamp === "string") {
