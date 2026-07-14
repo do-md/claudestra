@@ -201,15 +201,41 @@ export function TerminalView({
       ctx.font = `${fs0}px ${term.options.fontFamily}`;
       const ratio = ctx.measureText("W").width / fs0;
       if (!ratio || !isFinite(ratio)) return;
-      const fs = Math.max(8, Math.min(16, Math.floor((avail - 2) / cc / ratio)));
+      // 字号整数 floor 的余量摊进 letterSpacing——52 列的取整损失能到几十 px,
+      // 右侧一条空白很显眼(owner 2026-07-15:「右边没有填充满」)
+      const cellW = (avail - 2) / cc;
+      const fs = Math.max(8, Math.min(16, Math.floor(cellW / ratio)));
+      const ls = Math.max(0, Math.min(3, cellW - fs * ratio));
       if (fs !== fs0) term.options.fontSize = fs;
-      requestAnimationFrame(() => {
-        if (disposed) return;
-        const screen = container.querySelector(".xterm-screen") as HTMLElement | null;
-        if (screen && screen.offsetWidth > avail && (term.options.fontSize ?? 8) > 8) {
-          term.options.fontSize = (term.options.fontSize ?? 9) - 1;
-        }
-      });
+      term.options.letterSpacing = ls;
+      // 多轮 rAF 链式收敛(measureText 估算与 renderer 实测有偏差,一轮定不准):
+      // 溢出 → 先清字距 → 仍溢出缩字号;有空隙 → 幂等公式(实测反推真实字符宽)
+      // 把空隙精确摊进字间距。上限 6 轮防振荡。
+      const settle = (n: number) => {
+        if (n <= 0) return;
+        requestAnimationFrame(() => {
+          if (disposed) return;
+          const screen = container.querySelector(".xterm-screen") as HTMLElement | null;
+          if (!screen || !screen.offsetWidth) return;
+          const lsNow = term.options.letterSpacing ?? 0;
+          if (screen.offsetWidth > avail + 1) {
+            if (lsNow > 0.05) term.options.letterSpacing = 0;
+            else if ((term.options.fontSize ?? 8) > 8) {
+              term.options.fontSize = (term.options.fontSize ?? 9) - 1;
+            } else return;
+            settle(n - 1);
+            return;
+          }
+          const rawCell = screen.offsetWidth / cc - lsNow;
+          if (rawCell <= 0) return;
+          const lsT = Math.max(0, Math.min(4, (avail - 2) / cc - rawCell));
+          if (Math.abs(lsT - lsNow) > 0.05) {
+            term.options.letterSpacing = lsT;
+            settle(n - 1);
+          }
+        });
+      };
+      settle(6);
     };
 
     term.onData((data) => queueInputRef.current(data));
@@ -501,7 +527,7 @@ export function TerminalView({
           画布自然高超出可用高时（52×44 真机），容器被压缩、画布底对齐、裁的
           是**顶部**——CC 的输入框/状态栏全在底部，裁顶无感;之前 shrink-0
           会把键条下的提示行挤出屏（「底部截断」）。 */}
-      <div className={mobile ? "relative flex min-h-0 shrink flex-col justify-end overflow-hidden px-2 pt-2" : "relative min-h-0 flex-1 px-2 pt-2"}>
+      <div className={mobile ? "relative flex min-h-0 shrink flex-col items-center justify-end overflow-hidden px-2 pt-2" : "relative min-h-0 flex-1 px-2 pt-2"}>
         {/* touchAction:none —— 触摸手势全归我们处理（合成 wheel 滚动），
             iOS 才不会在 preventDefault 前先把首个 move 吃成原生滚动/橡皮筋 */}
         <div
