@@ -80,3 +80,34 @@ describe("readFileStats compact 感知", () => {
     expect(s.contextTokens).toBe(POST_COMPACT_BASE_TOKENS + 1000);
   });
 });
+
+// [fork] costOfUsage：模型计价（2026-07 API 牌价折算,web 看板全机成本数据源）
+import { costOfUsage } from "../src/lib/agent-stats.js";
+
+describe("costOfUsage", () => {
+  test("fable: in 10 / out 50 / cw 12.5 / cr 1 per Mtok", () => {
+    const c = costOfUsage("claude-fable-5", {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_creation_input_tokens: 1_000_000,
+      cache_read_input_tokens: 1_000_000,
+    });
+    expect(c).toBeCloseTo(10 + 50 + 12.5 + 1, 6);
+  });
+
+  test("opus-4-8 命中专价而不是老 opus 价", () => {
+    expect(costOfUsage("claude-opus-4-8", { input_tokens: 1_000_000 })).toBeCloseTo(5, 6);
+  });
+
+  test("老 opus 走 15/75", () => {
+    expect(costOfUsage("claude-opus-4-1-20250805", { output_tokens: 1_000_000 })).toBeCloseTo(75, 6);
+  });
+
+  test("haiku cache read 0.1", () => {
+    expect(costOfUsage("claude-haiku-4-5-20251001", { cache_read_input_tokens: 10_000_000 })).toBeCloseTo(1, 6);
+  });
+
+  test("未知模型不计价（宁少报不虚报）", () => {
+    expect(costOfUsage("<synthetic>", { input_tokens: 5_000_000 })).toBe(0);
+  });
+});

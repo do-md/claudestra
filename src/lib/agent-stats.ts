@@ -18,6 +18,39 @@ import { projectJsonlPath, findJsonlBySessionId } from "./jsonl-cost.js";
 export interface UsageWindow {
   tokens: number;
   requests: number;
+  /** 按 API 牌价折算的成本（USD）。订阅制不按此扣费，仅供参考。 */
+  costUsd: number;
+}
+
+/**
+ * API 牌价（USD / Mtok），2026-07 官网口径：[input, output, cacheWrite(5m), cacheRead]。
+ * 顺序敏感：先匹配更具体的（opus-4-8 在 opus 之前）。未知模型不计价（0），
+ * 宁可少报不虚报。
+ */
+const MODEL_PRICES: Array<{ match: RegExp; in_: number; out: number; cw: number; cr: number }> = [
+  { match: /fable|mythos/i, in_: 10, out: 50, cw: 12.5, cr: 1 },
+  { match: /opus-4-8/i, in_: 5, out: 25, cw: 6.25, cr: 0.5 },
+  { match: /opus/i, in_: 15, out: 75, cw: 18.75, cr: 1.5 },
+  { match: /sonnet/i, in_: 3, out: 15, cw: 3.75, cr: 0.3 },
+  { match: /haiku/i, in_: 1, out: 5, cw: 1.25, cr: 0.1 },
+];
+
+/** 一条 assistant usage 记录的折算成本（USD）。model 用记录自己的（中途换过模型的历史按各自计价）。 */
+export function costOfUsage(model: string, u: {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}): number {
+  const p = MODEL_PRICES.find((x) => x.match.test(model));
+  if (!p) return 0;
+  return (
+    (Number(u.input_tokens || 0) * p.in_ +
+      Number(u.output_tokens || 0) * p.out +
+      Number(u.cache_creation_input_tokens || 0) * p.cw +
+      Number(u.cache_read_input_tokens || 0) * p.cr) /
+    1_000_000
+  );
 }
 
 export interface AgentStat {
@@ -88,8 +121,8 @@ export async function readFileStats(path: string): Promise<FileStats> {
   const empty: FileStats = {
     contextTokens: 0,
     contextEstimated: false,
-    today: { tokens: 0, requests: 0 },
-    week: { tokens: 0, requests: 0 },
+    today: { tokens: 0, requests: 0, costUsd: 0 },
+    week: { tokens: 0, requests: 0, costUsd: 0 },
     model: "",
   };
   if (!existsSync(path)) return empty;
@@ -103,8 +136,8 @@ export async function readFileStats(path: string): Promise<FileStats> {
 
   const text = await Bun.file(path).text();
   const lines = text.split("\n");
-  const today: UsageWindow = { tokens: 0, requests: 0 };
-  const week: UsageWindow = { tokens: 0, requests: 0 };
+  const today: UsageWindow = { tokens: 0, requests: 0, costUsd: 0 };
+  const week: UsageWindow = { tokens: 0, requests: 0, costUsd: 0 };
   let contextTokens = 0;
   let contextEstimated = false;
   let model = "";
@@ -151,11 +184,15 @@ export async function readFileStats(path: string): Promise<FileStats> {
       Number(u.cache_creation_input_tokens || 0) +
       Number(u.cache_read_input_tokens || 0) +
       Number(u.output_tokens || 0);
+    // 折算成本按**该条记录自己的 model** 计价——会话中途换过模型的历史各按各价
+    const cost = costOfUsage(String(rec?.message?.model || ""), u);
     week.tokens += tok;
     week.requests += 1;
+    week.costUsd += cost;
     if (ts >= dayTs) {
       today.tokens += tok;
       today.requests += 1;
+      today.costUsd += cost;
     }
   }
   const stats: FileStats = { contextTokens, contextEstimated, today, week, model };
@@ -181,7 +218,7 @@ export async function computeAgentStats(agents: AgentLike[]): Promise<AgentStat[
     const jsonl = resolveJsonl(a);
     const fs = jsonl
       ? await readFileStats(jsonl)
-      : { contextTokens: 0, contextEstimated: false, today: { tokens: 0, requests: 0 }, week: { tokens: 0, requests: 0 }, model: "" };
+      : { contextTokens: 0, contextEstimated: false, today: { tokens: 0, requests: 0, costUsd: 0 }, week: { tokens: 0, requests: 0, costUsd: 0 }, model: "" };
     out.push({
       name: a.name,
       channelId: a.channelId || "",

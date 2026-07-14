@@ -34,6 +34,19 @@ function Bar({ pct, tone }: { pct: number; tone: string }) {
   );
 }
 
+/** bridge /stats agents 项（只取本面板要用的字段） */
+interface StatAgent {
+  name: string;
+  today?: { tokens: number; costUsd?: number };
+  week?: { tokens: number; costUsd?: number };
+}
+
+function fmtTok(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1000)}k`;
+  return String(n);
+}
+
 function fmtRel(ts?: number | null): string {
   if (!ts) return "";
   const d = new Date(ts);
@@ -46,13 +59,17 @@ function fmtRel(ts?: number | null): string {
 export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const agents = useChatStore((s) => s.state.agents);
   const [g, setG] = useState<GlobalStats | null>(null);
+  const [statAgents, setStatAgents] = useState<StatAgent[]>([]);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = (force: boolean) => {
     if (force) setRefreshing(true);
     fetch(force ? "/api/stats?refresh=1" : "/api/stats")
       .then((r) => r.json())
-      .then((j: { global?: GlobalStats }) => setG(j.global ?? null))
+      .then((j: { global?: GlobalStats; agents?: StatAgent[] }) => {
+        setG(j.global ?? null);
+        setStatAgents(Array.isArray(j.agents) ? j.agents : []);
+      })
       .catch(() => {})
       .finally(() => setRefreshing(false));
   };
@@ -138,12 +155,34 @@ export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => vo
                 </div>
                 <Bar pct={g.weekPct ?? 0} tone={(g.weekPct ?? 0) >= 80 ? "bg-error" : "bg-primary"} />
               </div>
-              {g.totalCost && (
-                <div className="flex justify-between text-xs">
-                  <span className="text-base-content/60">累计成本</span>
-                  <span className="font-mono tabular-nums">${g.totalCost}</span>
-                </div>
-              )}
+              {/* 全机折算成本（owner 2026-07-14 点选替换掉误导性的「累计成本」——
+                  旧值是被借去抓 /status 的那个窗口单会话的数）：Σ 所有活跃 agent
+                  的今日/本周 token × 各模型 API 牌价。订阅制不按此扣费,仅参考。 */}
+              {statAgents.length > 0 && (() => {
+                const td = statAgents.reduce((s, a) => s + (a.today?.costUsd || 0), 0);
+                const wk = statAgents.reduce((s, a) => s + (a.week?.costUsd || 0), 0);
+                const tdTok = statAgents.reduce((s, a) => s + (a.today?.tokens || 0), 0);
+                const wkTok = statAgents.reduce((s, a) => s + (a.week?.tokens || 0), 0);
+                return (
+                  <>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-base-content/60">今日全机用量</span>
+                      <span className="font-mono tabular-nums">
+                        {fmtTok(tdTok)} tok · ${td.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-base-content/60">本周全机用量</span>
+                      <span className="font-mono tabular-nums">
+                        {fmtTok(wkTok)} tok · ${wk.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="text-[10.5px] text-base-content/35">
+                      成本为 API 牌价折算（订阅制实际不按此扣费）· 活跃 agent 合计
+                    </div>
+                  </>
+                );
+              })()}
               {typeof g.scrapedAt === "number" && g.scrapedAt > 0 && (
                 <div className="text-[10.5px] text-base-content/35">
                   账号用量抓取于 {fmtAge(g.scrapedAt)}
