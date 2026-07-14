@@ -535,7 +535,11 @@ export function TerminalView({
         )}
       </div>
       <ControlBar
-        onKeys={(seq) => queueInputRef.current(seq)}
+        onKeys={(seq) => {
+          // 「⤓ 底」(End):除了发给 CC(转录视图 pager 跳底),前端视口也同步滚到底
+          if (seq === "\x1b[F") termRef.current?.scrollToBottom();
+          queueInputRef.current(seq);
+        }}
         onFocusTerm={() => termRef.current?.focus()}
         disabled={status !== "connected"}
         mobile={mobile}

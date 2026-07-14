@@ -25,6 +25,10 @@ const KEYS: { label: string; seq: string; title?: string }[] = [
   // 比滑动快得多;主界面下由 TUI 自行决定响应
   { label: "PgUp", seq: "\x1b[5~", title: "PageUp（快速上翻一页）" },
   { label: "PgDn", seq: "\x1b[6~", title: "PageDown（快速下翻一页）" },
+  // 跳到底部(owner 2026-07-14「Command+End 跳到最下面」):发 End——^O 转录视图
+  // 的标准 pager 跳底;terminal-view 对这个 seq 还会顺带 xterm.scrollToBottom()。
+  // copy-mode 里 End 只到行尾——那里往下滑到底会自动退出,不归这颗键管。
+  { label: "⤓ 底", seq: "\x1b[F", title: "End（跳到最新输出/底部）" },
   { label: "⏎", seq: "\r", title: "Enter" },
   { label: "^C", seq: "\x03", title: "Ctrl+C（中断）" },
   // 看更早的转录用 CC 原生 Ctrl+O（进入后配合滑动/↑↓ 可滚完整会话记录）
