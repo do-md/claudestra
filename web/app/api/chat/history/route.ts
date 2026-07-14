@@ -26,6 +26,8 @@ interface NeutralMessage {
   replyComponents?: WebComponentRow[];
   /** [fork] reply() 出站附件文件名（basename;取回走 /api/chat/attachment 的 inbox 后缀兜底） */
   replyFiles?: string[];
+  /** [fork] 回合耗时 ms(正常收尾的回合才有)——历史尾轮据此渲染完成标记 */
+  turnMs?: number;
   compactSummary?: boolean;
   /** 入站消息发送者标签（<channel> user 属性：API token 名 / Discord 用户名 / 来源 agent） */
   from?: string;
@@ -187,6 +189,7 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
       if (m.replyComponents?.length) group.replyComponents = [...(group.replyComponents ?? []), ...m.replyComponents];
       if (replyAtts.length) group.attachments = [...(group.attachments ?? []), ...replyAtts];
     }
+    if (typeof m.turnMs === "number") group.turnMs = m.turnMs;
     // reply 的时间与气泡开场 ts 分开记（长回合里回复晚得多），取首条 reply 记录的 ts
     if (m.replyText && !group.replyTs && m.ts) group.replyTs = m.ts;
     const segs = group.segments as AssistantSegment[];
@@ -204,6 +207,11 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
     }
     if (group.replyComponents?.length) lastWithComponents = group;
   }
+  // 完成标记只给「历史尾轮」:最后一条消息是 assistant 且回合正常收尾
+  // (turnMs 来自 turn_duration,进行中/被打断的回合没有)。切后台错过 done
+  // 事件后刷新重载,完成态不再蒸发;中间轮不标,不刷屏。
+  const tail = out[out.length - 1];
+  if (tail?.role === "assistant" && typeof tail.turnMs === "number") tail.turnDone = true;
   return out;
 }
 

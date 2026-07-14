@@ -41,6 +41,8 @@ export interface HistoryMessage {
   replyComponents?: ReplyComponentRow[];
   /** [fork] reply() 附带的出站附件文件名（basename;取回走 inbox 后缀匹配兜底） */
   replyFiles?: string[];
+  /** [fork] 回合耗时 ms(system/turn_duration 回填)——只有正常收尾的回合才有 */
+  turnMs?: number;
   /** compact 产生的摘要条目（不是真实用户输入） */
   compactSummary?: boolean;
   model?: string;
@@ -285,6 +287,20 @@ export async function readSessionHistory(
     if (rec.type === "system" && rec.subtype === "compact_boundary") {
       // 纯文本不带装饰——system 条目的分隔线样式由各前端自己渲染
       all.push({ seq: i, ts, role: "system", text: "上下文已压缩（compact）" });
+      continue;
+    }
+
+    // [fork] turn_duration → 回填到刚结束的那轮 assistant 的 turnMs。
+    // 只有正常收尾的回合才有这条(被打断的没有),前端据此给历史尾轮
+    // 渲染「✓ 完成 · 12.3s」——切后台错过 done 事件后刷新也能看到完成态。
+    if (rec.type === "system" && rec.subtype === "turn_duration" && typeof rec.durationMs === "number") {
+      for (let j = all.length - 1; j >= 0; j--) {
+        if (all[j].role === "assistant") {
+          all[j].turnMs = rec.durationMs;
+          break;
+        }
+        if (all[j].role === "user") break; // 中间隔了用户消息就不回填
+      }
       continue;
     }
 
