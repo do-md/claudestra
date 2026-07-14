@@ -231,7 +231,9 @@ async function shareImage(url: string, name: string): Promise<void> {
   }
 }
 
-/** 回合结束标记:三态同构(圆圈图标 + 文字),绿=完成 / 黄=已打断 / 红=出错。 */
+/** 回合结束标记:居中分隔线样式(owner 2026-07-14:「像中段一样居中、横线
+ *  隔开、带颜色和 tick 图标」),三态同构:绿=完成 / 黄=已打断 / 红=出错。
+ *  横线用 currentColor 低透明度,自动跟随态色。 */
 function TurnMark({ kind, ms }: { kind: "done" | "interrupted" | "error"; ms?: number }) {
   const conf = {
     done: { cls: "text-success", label: "完成", icon: <path d="M8.5 12.5l2.5 2.5 5-5.5" /> },
@@ -239,17 +241,21 @@ function TurnMark({ kind, ms }: { kind: "done" | "interrupted" | "error"; ms?: n
     error: { cls: "text-error", label: "出错", icon: <path d="M8.5 8.5l7 7M15.5 8.5l-7 7" /> },
   }[kind];
   return (
-    <div className={`chat-msg-in mt-2 flex items-center gap-1.5 text-[11.5px] font-medium ${conf.cls}`}>
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="12" r="9" />
-        {conf.icon}
-      </svg>
-      {conf.label}
-      {kind === "done" && typeof ms === "number" && (
-        <span className="font-mono text-[10.5px] font-normal tabular-nums opacity-70">
-          · {(ms / 1000).toFixed(ms >= 60_000 ? 0 : 1)}s
-        </span>
-      )}
+    <div className={`chat-msg-in my-3.5 flex select-none items-center gap-3 ${conf.cls}`}>
+      <span className="h-px flex-1 bg-current opacity-20" />
+      <span className="flex shrink-0 items-center gap-1.5 text-[11.5px] font-medium">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="9" />
+          {conf.icon}
+        </svg>
+        {conf.label}
+        {kind === "done" && typeof ms === "number" && (
+          <span className="font-mono text-[10.5px] font-normal tabular-nums opacity-70">
+            · {(ms / 1000).toFixed(ms >= 60_000 ? 0 : 1)}s
+          </span>
+        )}
+      </span>
+      <span className="h-px flex-1 bg-current opacity-20" />
     </div>
   );
 }
@@ -329,6 +335,8 @@ function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
  *  与消息气泡视觉解耦：无头像无名字，两侧细线 + 小灰字；点击附带秒级时间。 */
 const SystemDivider = memo(function SystemDivider({ m }: { m: ChatMessage }) {
   const [showTs, setShowTs] = useState(false);
+  // 历史里的中断记录统一成 TurnMark 同款黄色分隔线(直播/历史视觉一致)
+  if (/^已被用户中断/.test(m.content)) return <TurnMark kind="interrupted" />;
   return (
     <div
       className="chat-msg-in mb-[22px] flex cursor-pointer select-none items-center gap-3"
