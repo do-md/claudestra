@@ -15,6 +15,7 @@ import { Composer } from "./composer";
 import { Splash } from "./splash";
 import { AgentActions } from "./agent-actions";
 import { TerminalButton } from "../../terminal/terminal-button";
+import { SessionSearchButton } from "./session-search";
 import { ManagePanel } from "./manage-panel";
 import { ctxLevel } from "../ctx-level";
 
@@ -114,6 +115,7 @@ function TopBar() {
               管理
             </button>
           )}
+          <SessionSearchButton agentName={info.name} />
           <TerminalButton agent={info} />
           <AgentActions agent={info} />
         </span>

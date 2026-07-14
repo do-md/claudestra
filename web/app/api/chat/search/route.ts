@@ -28,9 +28,14 @@ export async function GET(request: Request) {
   if (q.length < 2) {
     return NextResponse.json({ error: "至少 2 个字符" }, { status: 400 });
   }
+  // agent 参数:只搜这一个 agent(会话内搜索);前端名 __master__ ↔ master
+  const agent = (url.searchParams.get("agent") || "").trim();
+  const agentQ = agent
+    ? `&agent=${encodeURIComponent(agent === "__master__" ? "master" : agent)}`
+    : "";
   try {
     const result = await bridgeGet<{ ok: boolean; hits: BridgeSearchHit[] }>(
-      `/history/search?q=${encodeURIComponent(q)}&limit=30`,
+      `/history/search?q=${encodeURIComponent(q)}&limit=30${agentQ}`,
       { timeoutMs: 30_000 }
     );
     // agent 名映射成前端会话名（agent-xxx → xxx，master → __master__）
