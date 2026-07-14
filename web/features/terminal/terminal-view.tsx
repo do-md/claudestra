@@ -536,24 +536,39 @@ export function TerminalView({
       </div>
       <ControlBar
         onKeys={(seq) => {
-          // 「⤓ 底」:CC 转录视图是 vi 键位(? 帮助实测:g/G=top/bottom,End 不在
-          // 表里,首版发 End 被 owner 实测「按了没用」)。但裸发 G 有毒——主界面
-          // 下会把字母 G 打进输入框(实验中真发生了 ❯ GG)。镜像画面就在 xterm
-          // buffer 里:底部状态栏含 "transcript" 才发 G,否则 End 无害兜底。
+          // 「⤓ 底」按场景分流(镜像画面就在 xterm buffer 里,按画面特征判断):
+          //  1. tmux copy-mode:右上角有右对齐 [n/m] 指示器 → 发 q 退出,回实时底部
+          //  2. CC 转录视图(^O):底部状态栏含 "transcript" → 发 G(vi 键位,
+          //     ? 帮助实测 g/G=top/bottom;End 不在表里,首版栽在这)
+          //  3. 主界面(owner 的高频场景,前两版「一点用没有」的真因):PgUp 翻
+          //     上去的 CC 内部滚动,End/Esc/wheel 都拉不回来(逐一实测),唯一
+          //     可靠的是连发 PageDown——到底后多余的是无操作,天然无害
+          //  裸发 q/G 有毒(主界面会打进输入框,实验真打出过 ❯ GG),必须先验画面。
           if (seq === "\x1b[F") {
             const term = termRef.current;
             term?.scrollToBottom();
-            let inTranscript = false;
+            let out: string | null = null;
             if (term) {
               const buf = term.buffer.active;
-              for (let y = Math.max(0, buf.length - 8); y < buf.length; y++) {
-                if (/transcript/i.test(buf.getLine(y)?.translateToString() || "")) {
-                  inTranscript = true;
+              const line = (y: number) => buf.getLine(y)?.translateToString() || "";
+              // copy-mode 指示器:屏幕区(非 scrollback)顶部两行、右对齐的 [n/m]
+              const top = Math.max(0, buf.length - term.rows);
+              for (let y = top; y < Math.min(top + 2, buf.length); y++) {
+                if (/\[\d+\/\d+\]\s*$/.test(line(y).trimEnd())) {
+                  out = "q";
                   break;
                 }
               }
+              if (out === null) {
+                for (let y = Math.max(0, buf.length - 8); y < buf.length; y++) {
+                  if (/transcript/i.test(line(y))) {
+                    out = "G";
+                    break;
+                  }
+                }
+              }
             }
-            queueInputRef.current(inTranscript ? "G" : "\x1b[F");
+            queueInputRef.current(out ?? "\x1b[6~".repeat(12));
             return;
           }
           queueInputRef.current(seq);
