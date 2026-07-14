@@ -217,8 +217,28 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     return this.lifecycleAction("restart", name);
   }
 
+  /** 永久移除(kill + registry 条目删除,归档保留)——列表左滑删除的后端。
+   *  成功后本地立即剔除,activeAgent 恰好是它则清空回列表。 */
+  public async removeAgent(
+    name: string
+  ): Promise<{ ok: boolean; error?: string }> {
+    const r = await this.lifecycleAction("remove", name);
+    if (r.ok) {
+      this.messageCache.delete(name);
+      this.produce((s) => {
+        s.agents = s.agents.filter((a) => a.name !== name);
+        if (s.activeAgent === name) {
+          s.activeAgent = "";
+          s.messages = [];
+          s.streaming = false;
+        }
+      });
+    }
+    return r;
+  }
+
   private async lifecycleAction(
-    action: "kill" | "restart",
+    action: "kill" | "restart" | "remove",
     name: string
   ): Promise<{ ok: boolean; error?: string }> {
     try {

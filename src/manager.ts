@@ -967,6 +967,51 @@ async function cmdKill(name: string) {
 }
 
 /**
+ * v2.10+ 永久移除（owner 2026-07-14:「临时起的 agent 不想在列表里污染我」）:
+ * kill 收尾(归档 session/删频道/清 pending) + registry 条目整个删除——列表不再
+ * 显示。归档文件保留(~/.claude-orchestrator/archive/):删列表 ≠ 删档案,
+ * 会话历史仍可人工翻查;误删的 agent 用 create + resume --fork 可以重建。
+ */
+async function cmdRemove(name: string) {
+  const tmuxName = normalizeName(name);
+  const reg = await loadRegistry();
+  const info = reg.agents[tmuxName];
+  if (!info && !(await windowExists(tmuxName))) {
+    output({ ok: false, error: `${tmuxName} 不存在` });
+    return;
+  }
+  if (await windowExists(tmuxName)) {
+    await tmuxRaw(["kill-window", "-t", windowTarget(tmuxName)]);
+  }
+  if (info?.sessionId) {
+    await archiveSession(tmuxName, info.cwd, info.sessionId).catch(() => {});
+  }
+  if (info?.channelId) {
+    try {
+      await bridgeRequest({ type: "delete_channel", channelId: info.channelId });
+    } catch { /* 已 kill 过的频道早删了,静默 */ }
+  }
+  delete reg.agents[tmuxName];
+  for (const key of Object.keys(reg.agents)) {
+    if (key.toLowerCase() === tmuxName && key !== tmuxName) delete reg.agents[key];
+  }
+  await saveRegistry(reg);
+  await triggerSkillsRescan("remove", tmuxName);
+  if (info?.channelId) {
+    const port = process.env.BRIDGE_PORT || "3847";
+    try {
+      await fetch(`http://localhost:${port}/agent/cleanup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channelId: info.channelId }),
+        signal: AbortSignal.timeout(3000),
+      });
+    } catch { /* bridge 可能未运行 */ }
+  }
+  output({ ok: true, agent: tmuxName, message: `${tmuxName} 已永久移除（会话归档保留）。` });
+}
+
+/**
  * 重命名一个 agent：tmux window 名 + registry key + Discord 频道名 + displayName 全部同步。
  * 不重启 Claude Code（内部显示名会在下次 restart 时更新到新名）。
  */
@@ -3008,6 +3053,16 @@ switch (cmd) {
       break;
     }
     await cmdKill(name);
+    break;
+  }
+
+  case "remove": {
+    const [name] = args;
+    if (!name) {
+      output({ ok: false, error: "用法: remove <name>（kill + 从列表永久移除,归档保留）" });
+      break;
+    }
+    await cmdRemove(name);
     break;
   }
 

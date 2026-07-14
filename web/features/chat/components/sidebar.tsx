@@ -1,5 +1,5 @@
 "use client";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
 import { SettingsModal } from "./settings-modal";
@@ -56,6 +56,18 @@ function AgentRow({
 }) {
   const store = useChatStoreApi();
   const lastAt = fmtLastActive(a.lastActivityTs);
+  // 左滑删除(owner 2026-07-14:「临时起的 agent 污染列表,永久删除」):
+  // 横滑露出红色删除钮,二次点击确认后 removeAgent(kill + registry 条目删,
+  // 归档保留)。纵向意图让路给列表滚动;master/mock 不可删。
+  const canRemove = !a.pinnedMaster && !a.mock;
+  const [swipeX, setSwipeX] = useState(0);
+  const [confirmDel, setConfirmDel] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const touchRef = useRef<{ x: number; y: number; startX: number; swiping: boolean } | null>(null);
+  const closeSwipe = () => {
+    setSwipeX(0);
+    setConfirmDel(false);
+  };
   // ctx 用量背景条（owner 2026-07-14:用量看板藏太深,列表行内直接可视化）:
   // 行背景自左向右填充,宽=占 1M 窗口比例;色阶同顶栏 ctx 徽章
   // (≥750k 深红 / ≥500k 红 / ≥200k 黄 / 其余中性淡灰),平时几乎隐形,超标一眼看见。
@@ -70,11 +82,85 @@ function AgentRow({
 
   return (
     <li>
-      <div
-        className={`relative flex items-center gap-2.5 overflow-hidden rounded-lg px-2 py-2.5 sm:gap-2 sm:py-1.5 ${
-          active ? "bg-base-300" : "hover:bg-base-300/60"
-        }`}
-      >
+      <div className="relative overflow-hidden rounded-lg">
+        {/* 左滑露出的删除钮(在滑动层下面) */}
+        {swipeX < 0 && (
+          <button
+            className="absolute inset-y-0 right-0 z-0 flex w-[88px] items-center justify-center bg-error text-[13px] font-medium text-error-content"
+            onClick={async () => {
+              if (removing) return;
+              if (!confirmDel) {
+                setConfirmDel(true);
+                return;
+              }
+              setRemoving(true);
+              const r = await store.removeAgent(a.name);
+              if (!r.ok) {
+                setRemoving(false);
+                closeSwipe();
+                alert(`删除失败:${r.error}`);
+              }
+              // 成功时本行随列表数据一起消失,无需复位
+            }}
+          >
+            {removing ? "删除中…" : confirmDel ? "确认删除?" : "删除"}
+          </button>
+        )}
+        <div
+          className={`relative z-[1] flex items-center gap-2.5 overflow-hidden rounded-lg px-2 py-2.5 sm:gap-2 sm:py-1.5 ${
+            active ? "bg-base-300" : "bg-base-200 hover:bg-base-300/60"
+          }`}
+          style={{
+            transform: swipeX ? `translateX(${swipeX}px)` : undefined,
+            transition: touchRef.current?.swiping ? "none" : "transform 0.18s ease",
+          }}
+          onTouchStart={
+            canRemove
+              ? (e) => {
+                  touchRef.current = {
+                    x: e.touches[0].clientX,
+                    y: e.touches[0].clientY,
+                    startX: swipeX,
+                    swiping: false,
+                  };
+                }
+              : undefined
+          }
+          onTouchMove={
+            canRemove
+              ? (e) => {
+                  const t = touchRef.current;
+                  if (!t) return;
+                  const dx = e.touches[0].clientX - t.x;
+                  const dy = e.touches[0].clientY - t.y;
+                  // 纵向意图让路给列表滚动;横向位移 >8px 才认定滑动
+                  if (!t.swiping) {
+                    if (Math.abs(dy) > Math.abs(dx)) {
+                      touchRef.current = null;
+                      return;
+                    }
+                    if (Math.abs(dx) < 8) return;
+                    t.swiping = true;
+                  }
+                  setSwipeX(Math.max(-88, Math.min(0, t.startX + dx)));
+                }
+              : undefined
+          }
+          onTouchEnd={
+            canRemove
+              ? () => {
+                  const t = touchRef.current;
+                  touchRef.current = null;
+                  if (!t?.swiping) return;
+                  setSwipeX((x) => {
+                    const snap = x < -44 ? -88 : 0;
+                    if (snap === 0) setConfirmDel(false);
+                    return snap;
+                  });
+                }
+              : undefined
+          }
+        >
         {ctx > 0 && (
           <span
             aria-hidden
@@ -85,6 +171,11 @@ function AgentRow({
         <button
           className="relative flex min-w-0 flex-1 items-center gap-2.5 text-left sm:gap-2"
           onClick={() => {
+            // 滑开状态下点行 = 收起,不进会话
+            if (swipeX !== 0) {
+              closeSwipe();
+              return;
+            }
             store.openAgent(a.name);
             onSelect();
           }}
@@ -115,6 +206,7 @@ function AgentRow({
             </span>
           )}
         </button>
+        </div>
       </div>
     </li>
   );

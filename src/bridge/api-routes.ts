@@ -954,8 +954,9 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     return apiJson(r?.ok ? 200 : 500, r ?? { ok: false, error: "manager create failed" });
   }
 
-  // [fork] POST /api/v1/agents/:name/kill | /restart —— 生命周期（仅全权 token）
-  const lifecycleMatch = path.match(/^\/agents\/([^/]+)\/(kill|restart)$/);
+  // [fork] POST /api/v1/agents/:name/kill | /restart | /remove —— 生命周期（仅全权 token）
+  // remove = kill + registry 条目删除(列表永久移除,归档保留)
+  const lifecycleMatch = path.match(/^\/agents\/([^/]+)\/(kill|restart|remove)$/);
   if (lifecycleMatch && req.method === "POST") {
     if (!principal.agents.includes("*")) {
       return apiJson(403, { ok: false, error: `${lifecycleMatch[2]} requires a full-scope token` });
