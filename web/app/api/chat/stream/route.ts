@@ -111,6 +111,9 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
       return { t: "bg-update", id: String(d.id ?? ""), items: (d.items as unknown[]).map(String) };
     case "bg_task_completed":
       return { t: "bg-done", id: String(d.id ?? ""), durationMs: typeof d.durationMs === "number" ? d.durationMs : undefined };
+    case "turn_duration":
+      // 回合耗时 → 完成标记行的「· 12.3s」(2026-07-14 owner:完成要有明确提示)
+      return typeof d.durationMs === "number" ? { t: "turn", ms: d.durationMs } : null;
     case "compact_done":
       // jsonl compact_boundary → 系统分隔线 + ctx 徽章即时回落（不等 15s 轮询）
       return {

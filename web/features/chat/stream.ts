@@ -22,6 +22,8 @@ export interface StreamSink {
   ): void;
   setStatus(status: "running" | "done"): void;
   endTurn(): void;
+  /** 回合耗时——补到最后一条 assistant 气泡的完成标记上。 */
+  turnDuration(ms: number): void;
   /** Phase 2：待处理交互卡（null=清卡）。 */
   setPermission(p: PendingPermission | null): void;
   setAsk(a: PendingAsk | null): void;
@@ -52,6 +54,9 @@ export function processStreamEvent(sink: StreamSink, evt: WebStreamEvent) {
       break;
     case "done":
       sink.endTurn();
+      break;
+    case "turn":
+      sink.turnDuration(evt.ms);
       break;
     case "error":
       sink.appendAssistantText(`\n[Error: ${evt.error}]`);

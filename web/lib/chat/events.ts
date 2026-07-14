@@ -63,6 +63,8 @@ export type WebStreamEvent =
     }
   /** 本轮结束 */
   | { t: "done" }
+  /** 回合耗时(jsonl turn_duration)——完成标记行附带「· 12.3s」 */
+  | { t: "turn"; ms: number }
   | { t: "error"; error: string }
   // Phase 2 富交互：需要用户抉择的「待处理卡」。回传经 BFF → bridge → tmux 按键。
   | {

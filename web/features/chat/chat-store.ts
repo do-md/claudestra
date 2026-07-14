@@ -756,9 +756,27 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     this.flushPendingText(); // 定稿前落掉缓冲文本
     this.produce((s) => {
       const last = s.messages[s.messages.length - 1];
-      if (last?.role === "assistant") last.streamed = false; // 定稿
+      if (last?.role === "assistant") {
+        // 定稿 + 完成标记(owner 2026-07-14:「工作完成给个更明确的提示」)——
+        // 气泡底部渲染绿色「✓ 完成」行;仅直播回合,历史消息不带(本来就都完成了)
+        if (last.streamed) last.turnDone = true;
+        last.streamed = false;
+      }
       s.streaming = false;
       s.awaitingChunk = false;
+    });
+  }
+
+  /** 回合耗时(jsonl turn_duration)——补到完成标记上:「✓ 完成 · 12.3s」 */
+  public turnDuration(ms: number) {
+    this.produce((s) => {
+      for (let i = s.messages.length - 1; i >= 0; i--) {
+        const m = s.messages[i];
+        if (m.role === "assistant") {
+          m.turnMs = ms;
+          break;
+        }
+      }
     });
   }
 

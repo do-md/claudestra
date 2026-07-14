@@ -533,6 +533,21 @@ const Message = memo(function Message({
         </div>
       )}
       {!!m.replyComponents?.length && <ReplyComponents m={m} />}
+      {/* 直播回合完成标记(owner 2026-07-14:「完成给个更明确的提示」)——绿色小字
+          跟着本回合气泡走,不刷屏不打扰;历史消息不渲染(本来就都完成了)。 */}
+      {m.turnDone && !streamingLast && (
+        <div className="chat-msg-in mt-2 flex items-center gap-1.5 text-[11.5px] font-medium text-success">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20 6L9 17l-5-5" />
+          </svg>
+          完成
+          {typeof m.turnMs === "number" && (
+            <span className="font-mono text-[10.5px] font-normal tabular-nums text-success/70">
+              · {(m.turnMs / 1000).toFixed(m.turnMs >= 60_000 ? 0 : 1)}s
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 });

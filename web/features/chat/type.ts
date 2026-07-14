@@ -80,6 +80,10 @@ export interface ChatMessage {
   wire?: string;
   /** 由本轮流式生成（区别于历史加载） */
   streamed?: boolean;
+  /** 直播回合已完成——气泡底部渲染绿色「✓ 完成」行(历史消息不带,不刷屏)。 */
+  turnDone?: boolean;
+  /** 回合耗时 ms(jsonl turn_duration)——完成行显示「· 12.3s」。 */
+  turnMs?: number;
   /** ISO 时间戳（历史来自 session jsonl，实时由前端 stamp）。 */
   ts?: string;
   /** 附件:user 气泡=用户上传回显;assistant 气泡=agent 出站附件(reply files)。 */
