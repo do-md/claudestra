@@ -58,7 +58,7 @@ export function ControlBar({
       {/* touch-action: pan-x —— 键条只许横滑;不锁的话 iOS 会把纵向拖动
           当滚动/橡皮筋处理,键条跟着上下晃(owner 2026-07-15 实测) */}
       <div
-        className="flex items-center gap-1.5 overflow-x-auto overflow-y-hidden"
+        className="flex items-center gap-1.5 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         style={{ touchAction: "pan-x" }}
       >
         {/* 唤起软键盘：聚焦 xterm 隐藏 textarea（iOS 必须在手势内 focus） */}
