@@ -814,6 +814,18 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     });
   }
 
+  /** 活跃任务全集快照（连流后 BFF 下发）：不在 ids 里的 running 卡标完成。
+   *  bridge 重启会丢 bg_task_completed 事件——幽灵「working」卡靠这里收敛
+   *  （owner 2026-07-14:「为什么还有一个 Background task 在 working」）。 */
+  public bgTaskSync(ids: string[]) {
+    const live = new Set(ids);
+    this.produce((s) => {
+      for (const t of s.bgTasks) {
+        if (t.status === "running" && !live.has(t.id)) t.status = "done";
+      }
+    });
+  }
+
   /** compact 完成（bridge compact_done 事件）：聊天流里插一条系统分隔线，并把该
    *  agent 的 contextTokens 即时改成 post——ctx 徽章/警示条不用等 15s 轮询回落。
    *  此前「压缩完没完」全靠用户亲自去验证（owner 2026-07-14），这条就是完成回执。 */

@@ -21,6 +21,10 @@ const KEYS: { label: string; seq: string; title?: string }[] = [
   { label: "⇧Tab", seq: "\x1b[Z", title: "Shift+Tab（切换权限模式）" },
   { label: "↑", seq: "\x1b[A", title: "上选（菜单/选项）" },
   { label: "↓", seq: "\x1b[B", title: "下选（菜单/选项）" },
+  // 快速翻页（owner 2026-07-14）：^O 转录视图 / copy-mode 里整页整页翻,
+  // 比滑动快得多;主界面下由 TUI 自行决定响应
+  { label: "PgUp", seq: "\x1b[5~", title: "PageUp（快速上翻一页）" },
+  { label: "PgDn", seq: "\x1b[6~", title: "PageDown（快速下翻一页）" },
   { label: "⏎", seq: "\r", title: "Enter" },
   { label: "^C", seq: "\x03", title: "Ctrl+C（中断）" },
   // 看更早的转录用 CC 原生 Ctrl+O（进入后配合滑动/↑↓ 可滚完整会话记录）

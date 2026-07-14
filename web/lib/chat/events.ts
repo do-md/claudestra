@@ -75,6 +75,9 @@ export type WebStreamEvent =
   | { t: "bg-start"; id: string; kind: "subagent" | "shell"; title: string }
   | { t: "bg-update"; id: string; items: string[] }
   | { t: "bg-done"; id: string; durationMs?: number }
+  /** 连流后的活跃任务全集快照：不在 ids 里的 running 卡应标记完成——
+   *  bridge 重启会丢 bg-done 事件,幽灵「working」卡靠它收敛。 */
+  | { t: "bg-sync"; ids: string[] }
   /** compact 完成（jsonl compact_boundary）：插系统分隔线 + ctx 徽章即时回落。 */
   | { t: "compact"; pre: number; post: number };
 

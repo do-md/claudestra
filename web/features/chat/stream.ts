@@ -24,6 +24,8 @@ export interface StreamSink {
   bgTaskStart(id: string, kind: "subagent" | "shell", title: string): void;
   bgTaskUpdate(id: string, items: string[]): void;
   bgTaskDone(id: string, durationMs?: number): void;
+  /** 活跃任务全集快照：不在 ids 里的 running 卡标完成（bridge 重启丢事件兜底）。 */
+  bgTaskSync(ids: string[]): void;
   /** compact 完成：插系统分隔线 + 该 agent contextTokens 即时更新为 post。 */
   compactDone(pre: number, post: number): void;
 }
@@ -75,6 +77,9 @@ export function processStreamEvent(sink: StreamSink, evt: WebStreamEvent) {
       break;
     case "bg-done":
       sink.bgTaskDone(evt.id, evt.durationMs);
+      break;
+    case "bg-sync":
+      sink.bgTaskSync(evt.ids);
       break;
     case "compact":
       sink.compactDone(evt.pre, evt.post);

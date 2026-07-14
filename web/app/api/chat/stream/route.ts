@@ -187,6 +187,9 @@ export async function GET(request: Request) {
           send({ t: "bg-start", id: t.id, kind: t.kind, title: t.title });
           if (t.lines?.length) send({ t: "bg-update", id: t.id, items: t.lines });
         }
+        // 快照全集下发（空数组也发）：前端把不在此列的 running 卡标完成——
+        // bridge 重启丢 bg_task_completed 事件时,幽灵「working」卡靠它收敛
+        send({ t: "bg-sync", ids: (bg.tasks || []).map((t) => t.id) });
       } catch {
         /* bg 补拉失败不阻塞流 */
       }
