@@ -32,26 +32,47 @@ interface NeutralMessage {
 /** 本前端自己的 token 名（manager token-add web-ui）——自己发的消息不用再标来源。 */
 const SELF_FROM = new Set(["web-ui"]);
 
-const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "heic"]);
+const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "avif", "svg"]);
+
+/** 绝对路径 → 附件视图（图片走 /api/chat/attachment/<name> 内联显示,其它给文件 chip）。
+ *  web 上传落在 ~/.claude-orchestrator/web/uploads/<日期>/ 按天分目录,URL 带 ?d=<日期>
+ *  让服务端 O(1) 定位（无 d 时服务端兜底扫描日期目录）。 */
+function attachmentFromPath(p: string): ChatAttachmentView | null {
+  const file = p.trim().split("/").pop() || "";
+  if (!file) return null;
+  const ext = file.split(".").pop()?.toLowerCase() || "";
+  const dateDir = p.match(/\/web\/uploads\/(\d{4}-\d{2}-\d{2})\//);
+  return {
+    // 展示名去掉雪花 id（Discord 下载）/ uuid（web 上传）前缀
+    name: file.replace(/^\d+_/, "").replace(/^[0-9a-f]{8}-/, ""),
+    kind: IMG_EXT.has(ext) ? "image" : "file",
+    url: `/api/chat/attachment/${encodeURIComponent(file)}${dateDir ? `?d=${dateDir[1]}` : ""}`,
+  };
+}
 
 /**
- * 用户消息文本里的 [attachment: /path] 标记 → attachments 数组（图片走
- * /api/chat/attachment/<name> 内联显示,其它给文件 chip），正文剥掉标记行。
- * 之前裸渲染成一行路径文字（2026-07-13 owner:图片要显示/预览/保存）。
+ * 用户消息文本里的附件标记 → attachments 数组，正文剥掉标记（2026-07-13 owner:
+ * 图片要显示/预览/保存）。两种格式：
+ *  - Bridge 注入（Discord 附件下载）：[attachment: /path] 每文件一行
+ *  - BFF 注入（web 上传, lib/uploads.ts attachmentBlock）：
+ *    [用户上传了 N 个文件（…）:\n- /path\n…\n]
+ * 之前只认前者——web 上传的图片刷新后整块原样渲染成路径文字（2026-07-14 真机截图）。
  */
 function extractAttachments(text: string): { content: string; attachments?: ChatAttachmentView[] } {
   const atts: ChatAttachmentView[] = [];
+  const push = (p: string) => {
+    const a = attachmentFromPath(p);
+    if (a) atts.push(a);
+  };
   const content = text
     .replace(/\n?\s*\[attachment:\s*([^\]]+)\]/g, (_m, p: string) => {
-      const file = p.trim().split("/").pop() || "";
-      if (file) {
-        const ext = file.split(".").pop()?.toLowerCase() || "";
-        atts.push({
-          // 展示名去掉雪花 id 前缀
-          name: file.replace(/^\d+_/, ""),
-          kind: IMG_EXT.has(ext) ? "image" : "file",
-          url: `/api/chat/attachment/${encodeURIComponent(file)}`,
-        });
+      push(p);
+      return "";
+    })
+    .replace(/\n?\s*\[用户上传了 \d+ 个文件[^\n\]]*:\s*\n((?:\s*- [^\n]+\n?)+)\s*\]/g, (_m, lines: string) => {
+      for (const line of lines.split("\n")) {
+        const m = line.match(/^\s*- (.+)$/);
+        if (m) push(m[1]);
       }
       return "";
     })
