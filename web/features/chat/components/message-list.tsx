@@ -7,6 +7,7 @@ import { PermissionCard } from "./permission-card";
 import { AskQuestionCard } from "./ask-question-card";
 import { ReplyComponents } from "./reply-components";
 import { BgTaskPanel } from "./bg-task-panel";
+import { highlightCode, langForPath } from "../highlight";
 
 /* 复刻 Claude OS features/chat 的对话观感：assistant 全宽 + ✦ Claude 头，
    user 右对齐圆角矩形，工具调用 active（转圈）/ history（可展开）两态。
@@ -90,9 +91,13 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
       </div>
       {open && (
         <div className="px-2.5 pb-2 pt-0.5">
-          <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-base-content/50">
-            {tool.detail || summary || tool.name}
-          </pre>
+          {tool.detail ? (
+            <ToolDetailView name={tool.name} detail={tool.detail} />
+          ) : (
+            <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-base-content/50">
+              {summary || tool.name}
+            </pre>
+          )}
         </div>
       )}
     </div>
@@ -127,13 +132,89 @@ const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallVi
             🕐 {fmtTs(tool.ts)}
           </div>
         )}
-        <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-base-content/50">
-          {tool.detail || summary || tool.name}
-        </pre>
+        {tool.detail ? (
+          <ToolDetailView name={tool.name} detail={tool.detail} />
+        ) : (
+          <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-base-content/50">
+            {summary || tool.name}
+          </pre>
+        )}
       </div>
     </details>
   );
 });
+
+/** diff 风格代码块:浅底色 + 左边框标识增删(红=删 / 绿=增),内容语法高亮。
+ *  不逐行加 +/- 前缀——高亮 HTML 拆行会截断跨行 token(字符串/注释)。 */
+function DiffBlock({ text, kind, lang }: { text: string; kind: "del" | "add"; lang?: string }) {
+  const tone = kind === "del" ? "border-error bg-error/10" : "border-success bg-success/10";
+  const body = text.replace(/\n+$/, "");
+  return (
+    <pre
+      className={`whitespace-pre-wrap break-all rounded border-l-2 px-1.5 py-1 ${tone}`}
+      dangerouslySetInnerHTML={{ __html: highlightCode(body, lang) }}
+    />
+  );
+}
+
+/** 语法高亮代码块（无增删语义的普通详情）。 */
+function CodeBlock({ text, lang }: { text: string; lang?: string }) {
+  return (
+    <pre
+      className="whitespace-pre-wrap break-all rounded bg-base-300/40 px-1.5 py-1"
+      dangerouslySetInnerHTML={{ __html: highlightCode(text.replace(/\n+$/, ""), lang) }}
+    />
+  );
+}
+
+/** 工具详情渲染:Edit → 红删绿增 diff,Write → 全绿新增,Bash → 命令高亮,
+ *  JSON 入参 → json 高亮;全部带语法高亮(按 file_path 扩展名推语言)。
+ *  detail 是后端 formatToolDetail 拼的字符串,按自家分隔符解析;截断/格式
+ *  不符一律走兜底(owner 2026-07-14:「绿色增加红色删减 + 语法高亮」)。 */
+function ToolDetailView({ name, detail }: { name: string; detail: string }) {
+  if (name === "Edit") {
+    const m = detail.match(/^([\s\S]*?)─── old ───\n([\s\S]*?)\n─── new ───\n([\s\S]*)$/);
+    if (m) {
+      const lang = langForPath(m[1]);
+      return (
+        <div className="max-h-72 space-y-1 overflow-y-auto font-mono text-[11px]">
+          <div className="break-all text-base-content/50">{m[1].trim()}</div>
+          <DiffBlock text={m[2]} kind="del" lang={lang} />
+          <DiffBlock text={m[3]} kind="add" lang={lang} />
+        </div>
+      );
+    }
+  }
+  if (name === "Write") {
+    const idx = detail.indexOf("\n───\n");
+    if (idx >= 0) {
+      const head = detail.slice(0, idx).trim();
+      return (
+        <div className="max-h-72 space-y-1 overflow-y-auto font-mono text-[11px]">
+          <div className="break-all text-base-content/50">{head}</div>
+          <DiffBlock text={detail.slice(idx + 5)} kind="add" lang={langForPath(head)} />
+        </div>
+      );
+    }
+  }
+  if (name === "Bash") {
+    // description ─── command 或纯 command
+    const idx = detail.indexOf("\n───\n");
+    return (
+      <div className="max-h-72 space-y-1 overflow-y-auto font-mono text-[11px]">
+        {idx >= 0 && <div className="break-all text-base-content/50">{detail.slice(0, idx).trim()}</div>}
+        <CodeBlock text={idx >= 0 ? detail.slice(idx + 5) : detail} lang="bash" />
+      </div>
+    );
+  }
+  // MCP 工具等:入参 pretty JSON → json 高亮;其余纯文本
+  const looksJson = /^[{[]/.test(detail.trimStart());
+  return (
+    <div className="max-h-64 overflow-y-auto font-mono text-[11px]">
+      <CodeBlock text={detail} lang={looksJson ? "json" : undefined} />
+    </div>
+  );
+}
 
 function ToolCallsBlock({
   tools,

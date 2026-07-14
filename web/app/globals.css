@@ -310,3 +310,51 @@ html.canvas-list {
     font-size: inherit;
     color: inherit;
 }
+
+/*
+ * ── 工具详情语法高亮 token 色（highlight.js,owner 2026-07-14） ──────
+ * 不引官方主题 CSS——用 daisyUI 主题变量手写,亮暗主题自动跟随。
+ * 只覆盖常见 token;没规则的 token 继承外层颜色(不花不闹)。
+ */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-type {
+    color: var(--color-accent);
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-addition {
+    color: var(--color-success);
+}
+.hljs-number,
+.hljs-literal,
+.hljs-symbol,
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable {
+    color: var(--color-warning);
+}
+.hljs-comment,
+.hljs-quote,
+.hljs-meta {
+    color: color-mix(in srgb, currentColor 45%, transparent);
+    font-style: italic;
+}
+.hljs-title,
+.hljs-name,
+.hljs-section,
+.hljs-selector-id,
+.hljs-selector-class {
+    color: var(--color-info);
+}
+.hljs-deletion {
+    color: var(--color-error);
+}
+.hljs-emphasis {
+    font-style: italic;
+}
+.hljs-strong {
+    font-weight: 650;
+}
