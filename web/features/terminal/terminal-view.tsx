@@ -54,6 +54,8 @@ export function TerminalView({
   // [mobile] 当前镜像尺寸——留白区显示一行说明（视口高被桌面端 iTerm 钳住时,
   // 画布只有 window 那么高,下方空白需要「有解释」而不是像没加载完）
   const [mirror, setMirror] = useState<{ cols: number; rows: number } | null>(null);
+  /** 最外层列容器——mobile 字号自适应量可用高用（列高 - 键条等固定件）。 */
+  const rootRef = useRef<HTMLDivElement>(null);
 
   // 断连/结束时收起软键盘：xterm 隐藏 textarea 仍持焦点会让 iOS 键盘赖着不走,
   // 且键盘弹着时点「重新连接」的首个 tap 会被 blur→键盘收起→布局重排吃掉
@@ -185,10 +187,13 @@ export function TerminalView({
     const cols = term.cols;
     const rows = term.rows;
 
-    // [mobile] 字号自适应：window 的完整列数正好铺满容器宽（iTerm 镜像的
-    // window 常比手机视口宽——缩字号而不是裁内容）。measureText 估 cell 宽，
-    // floor 保守取整；rAF 后校验一轮，字体舍入导致溢出就再缩 1px。
-    const adaptFontSize = (cc: number) => {
+    // [mobile] 字号自适应：window 的完整列数铺满容器宽 + **完整行数塞进可用高**
+    // （iTerm 镜像的 window 常比手机视口宽/高——缩字号而不是裁内容）。高约束
+    // 2026-07-15 owner 报「终端底部有截断」：远端 52×44 的画布自然高比手机可用
+    // 高略大,溢出把键条下的尺寸提示行挤出屏——行数固定,字号是唯一自由度。
+    // measureText 估 cell 宽,已渲染的 screen 实测 cell 高（未渲染保守 1.3）;
+    // rAF 后校验一轮,字体舍入导致溢出就再缩 1px。
+    const adaptFontSize = (cc: number, rr?: number) => {
       if (!mobile || !cc) return;
       const avail = container.clientWidth;
       if (!avail) return;
@@ -198,12 +203,37 @@ export function TerminalView({
       ctx.font = `${fs0}px ${term.options.fontFamily}`;
       const ratio = ctx.measureText("W").width / fs0;
       if (!ratio || !isFinite(ratio)) return;
-      const fs = Math.max(8, Math.min(16, Math.floor((avail - 2) / cc / ratio)));
+      const byW = Math.floor((avail - 2) / cc / ratio);
+      // 高度可用空间 = 列容器高 - 画布之外的固定件(键条实测 + 提示行/边距预留)
+      const availH = (() => {
+        const root = rootRef.current;
+        if (!root) return 0;
+        let fixed = 36; // 提示行 + pt-2 预留
+        for (const el of Array.from(root.children)) {
+          const he = el as HTMLElement;
+          if (!he.contains(container)) fixed += he.offsetHeight;
+        }
+        return root.clientHeight - fixed;
+      })();
+      const rows = rr || term.rows;
+      const byH = (() => {
+        if (!rows || availH <= 0) return Infinity;
+        const screen = container.querySelector(".xterm-screen") as HTMLElement | null;
+        const cellRatio =
+          screen && screen.offsetHeight > 0 && term.rows
+            ? screen.offsetHeight / term.rows / fs0
+            : 1.3;
+        return Math.floor(availH / rows / cellRatio);
+      })();
+      const fs = Math.max(8, Math.min(16, Math.min(byW, byH)));
       if (fs !== fs0) term.options.fontSize = fs;
       requestAnimationFrame(() => {
         if (disposed) return;
         const screen = container.querySelector(".xterm-screen") as HTMLElement | null;
-        if (screen && screen.offsetWidth > avail && (term.options.fontSize ?? 8) > 8) {
+        if (!screen) return;
+        const over =
+          screen.offsetWidth > avail || (availH > 0 && screen.offsetHeight > availH);
+        if (over && (term.options.fontSize ?? 8) > 8) {
           term.options.fontSize = (term.options.fontSize ?? 9) - 1;
         }
       });
@@ -286,7 +316,7 @@ export function TerminalView({
                   if (term.cols !== c || term.rows !== r) term.resize(c, r);
                   lastCols = c;
                   lastRows = r;
-                  adaptFontSize(c);
+                  adaptFontSize(c, r);
                   setMirror({ cols: c, rows: r });
                 };
                 if (wc !== evt.cols || wr !== evt.rows) {
@@ -313,7 +343,7 @@ export function TerminalView({
                 lastCols = evt.cols;
                 lastRows = evt.rows;
                 if (mobile) {
-                  adaptFontSize(evt.cols);
+                  adaptFontSize(evt.cols, evt.rows);
                   setMirror({ cols: evt.cols, rows: evt.rows });
                 }
               }
@@ -344,7 +374,7 @@ export function TerminalView({
         // [mobile] PTY 尺寸 = window 尺寸（不跟手机容器走）；容器宽变
         // （旋转/字号自适应回流）只需重算字号，幂等收敛不 POST。
         if (mobile) {
-          adaptFontSize(term.cols);
+          adaptFontSize(term.cols, term.rows);
           return;
         }
         try {
@@ -490,7 +520,7 @@ export function TerminalView({
   }, [agent, connectSeq]);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-[#1e1e2e]">
+    <div ref={rootRef} className="flex min-h-0 flex-1 flex-col bg-[#1e1e2e]">
       {/* [mobile] 容器高 = 画布自然高（window 行数 × 行高），ControlBar 紧贴
           其下，剩余空白由底部 spacer 沉底——修「画布 23 行 + 控制条钉屏底，
           中间半屏留白」；且总高变小后 iOS 键盘弹出多数不再需要平移页面。 */}

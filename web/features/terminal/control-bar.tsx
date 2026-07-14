@@ -55,7 +55,12 @@ export function ControlBar({
           "max(var(--term-safe-bottom, env(safe-area-inset-bottom)), 6px)",
       }}
     >
-      <div className="flex items-center gap-1.5 overflow-x-auto">
+      {/* touch-action: pan-x —— 键条只许横滑;不锁的话 iOS 会把纵向拖动
+          当滚动/橡皮筋处理,键条跟着上下晃(owner 2026-07-15 实测) */}
+      <div
+        className="flex items-center gap-1.5 overflow-x-auto overflow-y-hidden"
+        style={{ touchAction: "pan-x" }}
+      >
         {/* 唤起软键盘：聚焦 xterm 隐藏 textarea（iOS 必须在手势内 focus） */}
         <button
           className="btn btn-sm shrink-0 border-white/10 bg-white/5 font-normal text-[#cdd6f4] hover:bg-white/10"
