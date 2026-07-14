@@ -19,7 +19,11 @@ const ENV_EXAMPLE_PATH = `${REPO_ROOT}/.env.example`;
 const TEMPLATE_PATH = `${REPO_ROOT}/master/CLAUDE.md.template`;
 const RENDERED_PATH = `${REPO_ROOT}/master/CLAUDE.md`;
 
-const TOTAL_STEPS = 8;
+// v2.10+: 步骤总数随前端选择变化（Discord 5 步可跳过、Web 1 步可加），
+// 编号用自增计数器,不再硬编码。
+let TOTAL_STEPS = 8;
+let stepNo = 0;
+const nextStep = () => ++stepNo;
 
 // ============================================================
 // 终端着色
@@ -280,15 +284,8 @@ const DEPS: DepSpec[] = [
     },
     manual: "curl -fsSL https://bun.sh/install | bash",
   },
-  {
-    cmd: "pm2",
-    label: "pm2",
-    installers: {
-      darwin: { kind: "npm", pkg: "pm2" },
-      linux: { kind: "npm", pkg: "pm2" },
-    },
-    manual: "npm install -g pm2",
-  },
+  // v2.4.0+ 起 daemon 由 launchd 直管（install-cli 写 plist）,pm2 已不是依赖——
+  // 之前留在这里会逼新用户装一个用不上的全局包,缺它还会中断整个安装流程。
   {
     cmd: "claude",
     label: "claude (Claude Code CLI)",
@@ -328,7 +325,7 @@ async function runInstaller(installer: { kind: InstallerKind; pkg?: string; scri
 }
 
 async function stepCheckDeps(): Promise<void> {
-  header(1, t("检查系统依赖 + 自动安装", "Check system dependencies + auto-install"));
+  header(nextStep(), t("检查系统依赖 + 自动安装", "Check system dependencies + auto-install"));
 
   const platform = process.platform === "darwin" ? "darwin" : process.platform === "linux" ? "linux" : null;
   if (!platform) {
@@ -455,7 +452,7 @@ async function stepCheckDeps(): Promise<void> {
 // ============================================================
 
 async function stepCreateApp(): Promise<string> {
-  header(2, t("创建 Discord 应用", "Create Discord application"));
+  header(nextStep(), t("创建 Discord 应用", "Create Discord application"));
 
   print(t("要让 bot 进你的服务器，先在 Discord 开发者门户创建一个应用。", "To add a bot to your server, first create an application in the Discord Developer Portal."));
   br();
@@ -502,7 +499,7 @@ async function stepCreateApp(): Promise<string> {
 // ============================================================
 
 async function stepGetToken(appId: string): Promise<string> {
-  header(3, t("获取 Bot Token", "Get the Bot Token"));
+  header(nextStep(), t("获取 Bot Token", "Get the Bot Token"));
 
   print(t("Bot token 是 bot 的身份凭证。别告诉任何人，更别传到 GitHub。", "The bot token is your bot's credential. Don't share it, don't commit it to GitHub."));
   br();
@@ -541,7 +538,7 @@ async function stepGetToken(appId: string): Promise<string> {
 // ============================================================
 
 async function stepIntents(appId: string): Promise<void> {
-  header(4, t("开启 Privileged Intents", "Enable Privileged Intents"));
+  header(nextStep(), t("开启 Privileged Intents", "Enable Privileged Intents"));
 
   print(t(
     "Discord 对敏感 API 有三个 intent 开关，bot 必须全部打开才能正常工作。",
@@ -579,7 +576,7 @@ async function stepIntents(appId: string): Promise<void> {
 // ============================================================
 
 async function stepInviteBot(appId: string): Promise<void> {
-  header(5, t("邀请 Bot 到你的服务器", "Invite the bot to your server"));
+  header(nextStep(), t("邀请 Bot 到你的服务器", "Invite the bot to your server"));
 
   hint(t(
     `还没有 Discord 服务器？先在 Discord 主界面左边 ${c.bold}+${c.reset} 号点一下 → ${c.bold}亲自创建${c.reset} / ${c.bold}Create My Own${c.reset} → 给自己和朋友 → 起个名字。下面再回来继续。`,
@@ -637,7 +634,7 @@ async function stepCollectIds(): Promise<{
   userId: string;
   controlChannelId: string;
 }> {
-  header(6, t("开启开发者模式 + 收集 ID", "Enable Developer Mode + collect IDs"));
+  header(nextStep(), t("开启开发者模式 + 收集 ID", "Enable Developer Mode + collect IDs"));
 
   print(t(
     "下面要从 Discord 里复制 3 个 ID。先打开开发者模式，不然右键看不到\"复制 ID\"。",
@@ -700,13 +697,13 @@ async function stepPreferences(existing: Partial<Config>): Promise<{
   mcpName: string;
   bridgePort: string;
 }> {
-  header(7, t("个人偏好", "Personal preferences"));
+  header(nextStep(), t("个人偏好", "Personal preferences"));
 
   print(t("最后几个小问题，都有默认值，直接按 ENTER 就行。", "A few small questions. All have defaults — press ENTER to accept."));
   br();
 
   const userName = await promptRequired(
-    `${kbd(t("你的称呼", "Your name"))} ${c.dim}${t("(大总管在 Discord 里怎么叫你)", "(how the master will address you in Discord)")}${c.reset}`,
+    `${kbd(t("你的称呼", "Your name"))} ${c.dim}${t("(大总管在回复里怎么叫你)", "(how the master will address you in replies)")}${c.reset}`,
   );
   const mcpName = await prompt(
     `${kbd(t("MCP 服务名", "MCP server name"))} ${c.dim}${t("(只能用英文字母/数字/-/_；不能用中文，claude mcp add 会拒绝)", "(letters/digits/-/_ only; no CJK — claude mcp add will reject it)")}${c.reset}`,
@@ -789,7 +786,7 @@ async function registerHooks(hookCmd: string): Promise<void> {
 }
 
 async function stepFinalize(cfg: Config): Promise<void> {
-  header(8, t("写入配置 + 自动化收尾", "Write config + auto-finalize"));
+  header(nextStep(), t("写入配置 + 自动化收尾", "Write config + auto-finalize"));
 
   // 写 .env
   if (await fileExists(ENV_PATH)) {
@@ -938,26 +935,159 @@ async function stepFinalize(cfg: Config): Promise<void> {
 }
 
 // ============================================================
+// 前端选择（v2.10+：Discord 成为选项而非必然,可只配 Web）
+// ============================================================
+
+interface Frontends { discord: boolean; web: boolean }
+
+async function stepPickFrontends(existing: Partial<Config>): Promise<Frontends> {
+  header(nextStep(), t("选择前端", "Pick your frontends"));
+  print(t("Claudestra 有两种入口,可以同时启用,也可以只要一个:", "Claudestra has two frontends. Enable either or both:"));
+  br();
+  print(`  ${c.bold}${c.yellow}1${c.reset}  ${c.bold}Discord${c.reset} — ${t("手机 App / 推送通知 / 按钮交互(需要 Discord 账号 + 建 bot)", "phone app / push notifications / buttons (needs a Discord account + bot)")}`);
+  print(`  ${c.bold}${c.yellow}2${c.reset}  ${c.bold}Web${c.reset} — ${t("浏览器 / PWA,本机系统账号(SSH)登录,不依赖任何第三方", "browser / PWA, logs in with your OS account (SSH), no third-party dependency")}`);
+  br();
+  // 默认:老用户按现有配置推断;全新安装默认 Discord(经典路径)
+  const hasWebEnv = await fileExists(`${REPO_ROOT}/web/.env.local`);
+  const def = existing.DISCORD_BOT_TOKEN
+    ? hasWebEnv ? "1,2" : "1"
+    : hasWebEnv ? "2" : "1";
+  while (true) {
+    const raw = await prompt(
+      `${kbd(t("启用哪些?", "Which ones?"))} ${c.dim}${t("(多选,逗号分隔,如 1,2)", "(multi-select, comma-separated, e.g. 1,2)")}${c.reset}`,
+      def,
+    );
+    const picks = new Set(raw.split(/[,，\s]+/).filter(Boolean));
+    const fronts = { discord: picks.has("1"), web: picks.has("2") };
+    if (!fronts.discord && !fronts.web) {
+      fail(t("至少选一个(输入 1、2 或 1,2)", "Pick at least one (enter 1, 2, or 1,2)"));
+      continue;
+    }
+    // 步骤总数定下来:基础 4 步(依赖/前端/偏好/收尾) + Discord 5 步 + Web 1 步
+    TOTAL_STEPS = 4 + (fronts.discord ? 5 : 0) + (fronts.web ? 1 : 0);
+    if (!fronts.discord) {
+      hint(t("跳过 Discord 的 5 个配置步骤(以后想加,重跑 bun run setup 即可)", "Skipping the 5 Discord steps (rerun `bun run setup` anytime to add it later)"));
+    }
+    return fronts;
+  }
+}
+
+// ============================================================
+// Web 前端配置（v2.10+）
+// ============================================================
+
+/** 解析 web/.env.local 现有键值（保留已有 token,不重复签发） */
+function parseDotEnv(content: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of content.split("\n")) {
+    const m = line.match(/^([A-Z_]+)=(.*)$/);
+    if (m) out[m[1]] = m[2];
+  }
+  return out;
+}
+
+async function stepWebSetup(bridgePort: string): Promise<void> {
+  header(nextStep(), t("Web 前端配置", "Web frontend setup"));
+
+  const webDir = `${REPO_ROOT}/web`;
+  if (!(await fileExists(`${webDir}/package.json`))) {
+    warn(t(
+      "本仓库不含 web/ 前端(上游版本)。Web 入口需要 fork 版,先跳过。",
+      "This checkout has no web/ frontend (upstream build). Skipping.",
+    ));
+    return;
+  }
+
+  // 1) web/.env.local:保留现有值,缺什么补什么
+  const envPath = `${webDir}/.env.local`;
+  const cur = (await fileExists(envPath)) ? parseDotEnv(await readFile(envPath, "utf-8")) : {};
+
+  if (!cur.INTERNAL_API_KEY) {
+    cur.INTERNAL_API_KEY = [...crypto.getRandomValues(new Uint8Array(24))]
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    ok(t("生成 INTERNAL_API_KEY(BFF 内部调用凭证)", "Generated INTERNAL_API_KEY (BFF internal credential)"));
+  }
+  cur.BRIDGE_HTTP_URL = `http://127.0.0.1:${bridgePort}`;
+
+  if (!cur.CLAUDESTRA_API_TOKEN) {
+    // 签发 web-ui token(scope: 全部 agent + master + 远程终端)——写 principals.json,
+    // 不需要 bridge 在跑
+    write(`${c.dim}▶${c.reset} ${t("签发 web-ui API token", "Issuing web-ui API token")}… `);
+    const r = await run([
+      "bun", `${REPO_ROOT}/src/manager.ts`, "token-add", "web-ui",
+      "--agents", "*,master", "--force", "--terminal",
+    ], { cwd: REPO_ROOT });
+    let secret = "";
+    try { secret = JSON.parse(r.out)?.secret || ""; } catch { /* 输出非 JSON */ }
+    if (r.ok && secret) {
+      cur.CLAUDESTRA_API_TOKEN = secret;
+      print(`${c.green}✓${c.reset}`);
+    } else {
+      print(`${c.red}✗${c.reset}`);
+      warn(t(
+        "token 签发失败。稍后手动跑: bun src/manager.ts token-add web-ui --agents '*,master' --force --terminal,把 secret 填进 web/.env.local 的 CLAUDESTRA_API_TOKEN",
+        "Token issue failed. Run later: bun src/manager.ts token-add web-ui --agents '*,master' --force --terminal, then put the secret into CLAUDESTRA_API_TOKEN in web/.env.local",
+      ));
+    }
+  } else {
+    ok(t("已有 CLAUDESTRA_API_TOKEN,不重复签发", "CLAUDESTRA_API_TOKEN already present — not re-issuing"));
+  }
+
+  const lines = Object.entries(cur).map(([k, v]) => `${k}=${v}`);
+  await writeFile(envPath, "# Claudestra web 前端配置 (由 bun run setup 生成)\n" + lines.join("\n") + "\n");
+  ok(t(`写入 ${c.bold}web/.env.local${c.reset}`, `Wrote ${c.bold}web/.env.local${c.reset}`));
+
+  // 2) npm 依赖(web 是独立的 Node/npm 依赖树,与根的 bun 互不干扰)
+  if (!(await which("npm"))) {
+    warn(t(
+      "找不到 npm(web 前端用 Node 运行)。装好 Node 后跑: cd web && npm install",
+      "npm not found (the web frontend runs on Node). After installing Node: cd web && npm install",
+    ));
+    return;
+  }
+  if (await confirm(t("现在安装 web 依赖吗?(npm install,可能要几分钟)", "Install web dependencies now? (npm install, may take a few minutes)"), true)) {
+    write(`${c.dim}▶${c.reset} npm install… `);
+    const ni = await run(["npm", "install"], { cwd: webDir });
+    if (ni.ok) print(`${c.green}✓${c.reset}`);
+    else {
+      print(`${c.red}✗${c.reset}`);
+      warn(t("npm install 失败,稍后在 web/ 目录手动重试", "npm install failed — retry manually in web/"));
+    }
+  } else {
+    hint(t("稍后自己跑: cd web && npm install", "Run later: cd web && npm install"));
+  }
+}
+
+// ============================================================
 // 完成
 // ============================================================
 
-function stepDone(cfg: Config): void {
+function stepDone(cfg: Config, fronts: Frontends): void {
   br();
   print(`${c.green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}`);
   print(`${c.bold}${c.green}  ✨ ${t("安装完成！", "Installation complete!")}${c.reset}`);
   print(`${c.green}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c.reset}`);
   br();
-  print(`${c.bold}${t("试一下:", "Try it:")}${c.reset}`);
-  print(`  ${c.dim}①${c.reset} ${t("打开 Discord，去你的", "Open Discord and go to your")} ${c.yellow}${t("#控制频道", "#control channel")}${c.reset}`);
-  print(`  ${c.dim}②${c.reset} ${t(`发一句话给 bot（${c.dim}比如 "你好"${c.reset}）`, `Send the bot a message (${c.dim}e.g. "hi"${c.reset})`)}`);
-  print(`  ${c.dim}③${c.reset} ${t(`几秒内 ${c.yellow}${cfg.USER_NAME}${c.reset} 就会回你 + 给你一个按钮菜单`, `Within seconds ${c.yellow}${cfg.USER_NAME}${c.reset} will reply with a button menu`)}`);
-  br();
+  if (fronts.discord) {
+    print(`${c.bold}${t("试一下(Discord):", "Try it (Discord):")}${c.reset}`);
+    print(`  ${c.dim}①${c.reset} ${t("打开 Discord，去你的", "Open Discord and go to your")} ${c.yellow}${t("#控制频道", "#control channel")}${c.reset}`);
+    print(`  ${c.dim}②${c.reset} ${t(`发一句话给 bot（${c.dim}比如 "你好"${c.reset}）`, `Send the bot a message (${c.dim}e.g. "hi"${c.reset})`)}`);
+    print(`  ${c.dim}③${c.reset} ${t(`几秒内 ${c.yellow}${cfg.USER_NAME}${c.reset} 就会回你 + 给你一个按钮菜单`, `Within seconds ${c.yellow}${cfg.USER_NAME}${c.reset} will reply with a button menu`)}`);
+    br();
+  }
+  if (fronts.web) {
+    print(`${c.bold}${t("试一下(Web):", "Try it (Web):")}${c.reset}`);
+    print(`  ${c.dim}①${c.reset} ${t("启动:", "Start it:")} ${c.cyan}cd web && npm run dev${c.reset}  ${c.dim}${t("(生产部署见 web/CLAUDE.md)", "(production deploy: see web/CLAUDE.md)")}${c.reset}`);
+    print(`  ${c.dim}②${c.reset} ${t("浏览器打开", "Open in browser:")} ${url("http://localhost:33333")}`);
+    print(`  ${c.dim}③${c.reset} ${t("用本机系统账号(SSH 用户名密码)登录,手机上可「添加到主屏幕」装成 PWA", "Log in with your OS account (SSH username/password). On phones, Add to Home Screen for the PWA")}`);
+    br();
+  }
   print(`${c.bold}${t("如果没反应:", "If nothing happens:")}${c.reset}`);
-  print(`  ${c.cyan}pm2 logs discord-bridge${c.reset}  ${c.dim}${t("(看 bridge 日志)", "(bridge logs)")}${c.reset}`);
-  print(`  ${c.cyan}pm2 logs master-launcher${c.reset} ${c.dim}${t("(看大总管启动日志)", "(master launcher logs)")}${c.reset}`);
+  print(`  ${c.cyan}tail -f /tmp/claudestra-bridge.out${c.reset}  ${c.dim}${t("(bridge 日志,launchd 直管)", "(bridge logs, managed by launchd)")}${c.reset}`);
+  print(`  ${c.cyan}launchctl list | grep claudestra${c.reset} ${c.dim}${t("(三个 daemon 的存活状态)", "(daemon liveness)")}${c.reset}`);
   br();
   print(`${c.bold}${t("以后随时把整套拉起来 + 进 master TUI:", "Bring everything up + attach to master TUI anytime:")}${c.reset}`);
-  print(`  ${c.cyan}claudestra${c.reset}  ${c.dim}${t("(自动起 pm2 + 在 iTerm 里 tmux attach；机器重启后服务也会自动回来)", "(auto-starts pm2 + tmux-attaches in iTerm; services also auto-restart on boot)")}${c.reset}`);
+  print(`  ${c.cyan}claudestra${c.reset}  ${c.dim}${t("(daemon 由 launchd 拉起 + 在 iTerm 里 tmux attach；机器重启后服务自动回来)", "(launchd brings the daemons up + tmux-attaches in iTerm; services auto-restart on boot)")}${c.reset}`);
   br();
 
   // tmux 教程
@@ -1019,8 +1149,8 @@ async function main() {
   await stepPickLanguage();
 
   print("");
-  print(`   ${c.dim}${t("从手机 Discord 管理本地 Claude Code session", "Manage local Claude Code sessions from Discord on your phone")}${c.reset}`);
-  print(`   ${c.dim}${t("接下来 8 个步骤，大概 10 分钟搞定", "8 steps, about 10 minutes total")}${c.reset}`);
+  print(`   ${c.dim}${t("从手机(Discord / Web)管理本地 Claude Code session", "Manage local Claude Code sessions from your phone (Discord / Web)")}${c.reset}`);
+  print(`   ${c.dim}${t("跟着向导走,大概 10 分钟搞定", "Follow the wizard — about 10 minutes total")}${c.reset}`);
   print("");
 
   // 读现有 .env 作为默认值
@@ -1032,12 +1162,23 @@ async function main() {
   }
 
   await stepCheckDeps();
-  const appId = await stepCreateApp();
-  const token = await stepGetToken(appId);
-  await stepIntents(appId);
-  await stepInviteBot(appId);
-  const { guildId, userId, controlChannelId } = await stepCollectIds();
+  const fronts = await stepPickFrontends(existing);
+
+  // Discord 未选时留空 → bridge 按 WEB_ONLY 模式启动(config.ts:
+  // WEB_ONLY = !DISCORD_BOT_TOKEN);控制频道用 web-only 约定的本地常量。
+  let token = "";
+  let guildId = "";
+  let userId = "";
+  let controlChannelId = "local-master-control";
+  if (fronts.discord) {
+    const appId = await stepCreateApp();
+    token = await stepGetToken(appId);
+    await stepIntents(appId);
+    await stepInviteBot(appId);
+    ({ guildId, userId, controlChannelId } = await stepCollectIds());
+  }
   const { userName, mcpName, bridgePort } = await stepPreferences(existing);
+  if (fronts.web) await stepWebSetup(bridgePort);
 
   const cfg: Config = {
     DISCORD_BOT_TOKEN: token,
@@ -1050,7 +1191,7 @@ async function main() {
   };
 
   await stepFinalize(cfg);
-  stepDone(cfg);
+  stepDone(cfg, fronts);
 
   process.exit(0);
 }
