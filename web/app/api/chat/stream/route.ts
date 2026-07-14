@@ -63,7 +63,10 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
   const d = evt.data || {};
   switch (evt.type) {
     case "agent_status":
-      return d.status === "done" ? { t: "done" } : { t: "status", status: "running" };
+      // trigger=interrupt 的 done → 前端给该回合标「⊘ 已打断」而非「✓ 完成」
+      return d.status === "done"
+        ? { t: "done", ...(d.trigger === "interrupt" ? { interrupted: true } : {}) }
+        : { t: "status", status: "running" };
     case "tool_start":
       return { t: "tool", name: String(d.name ?? "?"), summary: String(d.summary ?? ""), state: "running" };
     case "assistant_text":

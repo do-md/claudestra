@@ -82,6 +82,8 @@ export interface ChatMessage {
   streamed?: boolean;
   /** 直播回合已完成——气泡底部渲染绿色「✓ 完成」行(历史消息不带,不刷屏)。 */
   turnDone?: boolean;
+  /** 直播回合被打断(手动停止/连发抢占)——气泡底部琥珀「⊘ 已打断」行。 */
+  turnInterrupted?: boolean;
   /** 回合耗时 ms(jsonl turn_duration)——完成行显示「· 12.3s」。 */
   turnMs?: number;
   /** ISO 时间戳（历史来自 session jsonl，实时由前端 stamp）。 */

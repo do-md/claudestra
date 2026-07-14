@@ -616,6 +616,8 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
         lastPreemptAt.set(to.channelId, Date.now());
         await tmuxRaw(["send-keys", "-t", win, "C-c"]);
         recordMetric("agent_interrupt", { channelId: to.channelId, agent: evAgent, meta: { trigger: "preempt" } });
+        // 让前端给被掐的回合标「已打断」(与手动停止同一事件形状)
+        emitEvent({ agent: evAgent, chatId: to.channelId, type: "agent_status", data: { status: "done", trigger: "interrupt" } });
         console.log(`⚡ 抢占打断 ${evAgent}（人类补充消息优先处理）`);
         // CC 中断收尾需要一拍;立刻投递会混进垂死回合的尾流
         await new Promise((r) => setTimeout(r, 1200));

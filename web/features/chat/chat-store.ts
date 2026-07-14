@@ -772,14 +772,17 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     if (status === "running") this.nextBubbleBoundary = true;
   }
 
-  public endTurn() {
+  public endTurn(interrupted?: boolean) {
     this.flushPendingText(); // 定稿前落掉缓冲文本
     this.produce((s) => {
       const last = s.messages[s.messages.length - 1];
       if (last?.role === "assistant") {
-        // 定稿 + 完成标记(owner 2026-07-14:「工作完成给个更明确的提示」)——
-        // 气泡底部渲染绿色「✓ 完成」行;仅直播回合,历史消息不带(本来就都完成了)
-        if (last.streamed) last.turnDone = true;
+        // 定稿 + 完成/打断标记(owner 2026-07-14):气泡底部绿色「✓ 完成」或
+        // 琥珀「⊘ 已打断」行;仅直播回合,历史消息不带(历史有中断系统线)
+        if (last.streamed) {
+          if (interrupted) last.turnInterrupted = true;
+          else last.turnDone = true;
+        }
         last.streamed = false;
       }
       s.streaming = false;

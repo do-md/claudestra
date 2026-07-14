@@ -61,8 +61,8 @@ export type WebStreamEvent =
       components?: WebComponentRow[];
       attachments?: { name: string; kind: "image" | "file"; url: string }[];
     }
-  /** 本轮结束 */
-  | { t: "done" }
+  /** 本轮结束。interrupted=被打断(手动停止/连发抢占)——标「⊘ 已打断」而非「✓ 完成」 */
+  | { t: "done"; interrupted?: boolean }
   /** 回合耗时(jsonl turn_duration)——完成标记行附带「· 12.3s」 */
   | { t: "turn"; ms: number }
   | { t: "error"; error: string }
