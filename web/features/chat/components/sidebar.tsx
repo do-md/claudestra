@@ -34,12 +34,17 @@ function AgentRow({
   a,
   active,
   busyLive,
+  pinned,
+  onTogglePin,
   onSelect,
 }: {
   a: AgentSession;
   active: boolean;
   /** 本端正在流式对话（active agent 的实时忙碌,比 15s 轮询的 busy 快） */
   busyLive: boolean;
+  /** 用户置顶(localStorage 偏好,master 恒顶不算) */
+  pinned: boolean;
+  onTogglePin: () => void;
   onSelect: () => void;
 }) {
   const store = useChatStoreApi();
@@ -73,28 +78,39 @@ function AgentRow({
   return (
     <li>
       <div className="relative overflow-hidden rounded-lg">
-        {/* 左滑露出的删除钮(在滑动层下面) */}
+        {/* 左滑露出的操作钮(在滑动层下面):置顶 + 删除 */}
         {swipeX < 0 && (
-          <button
-            className="absolute inset-y-0 right-0 z-0 flex w-[88px] items-center justify-center bg-error text-[13px] font-medium text-error-content"
-            onClick={async () => {
-              if (removing) return;
-              if (!confirmDel) {
-                setConfirmDel(true);
-                return;
-              }
-              setRemoving(true);
-              const r = await store.removeAgent(a.name);
-              if (!r.ok) {
-                setRemoving(false);
+          <div className="absolute inset-y-0 right-0 z-0 flex w-[160px]">
+            <button
+              className="flex flex-1 items-center justify-center bg-base-content/70 text-[13px] font-medium text-base-100"
+              onClick={() => {
+                onTogglePin();
                 closeSwipe();
-                alert(`删除失败:${r.error}`);
-              }
-              // 成功时本行随列表数据一起消失,无需复位
-            }}
-          >
-            {removing ? "删除中…" : confirmDel ? "确认删除?" : "删除"}
-          </button>
+              }}
+            >
+              {pinned ? "取消置顶" : "置顶"}
+            </button>
+            <button
+              className="flex flex-1 items-center justify-center bg-error text-[13px] font-medium text-error-content"
+              onClick={async () => {
+                if (removing) return;
+                if (!confirmDel) {
+                  setConfirmDel(true);
+                  return;
+                }
+                setRemoving(true);
+                const r = await store.removeAgent(a.name);
+                if (!r.ok) {
+                  setRemoving(false);
+                  closeSwipe();
+                  alert(`删除失败:${r.error}`);
+                }
+                // 成功时本行随列表数据一起消失,无需复位
+              }}
+            >
+              {removing ? "…" : confirmDel ? "确认?" : "删除"}
+            </button>
+          </div>
         )}
         <div
           className={`relative z-[1] flex items-center gap-2.5 overflow-hidden rounded-lg px-2 py-2.5 sm:gap-2 sm:py-1.5 ${
@@ -132,7 +148,7 @@ function AgentRow({
                     if (Math.abs(dx) < 8) return;
                     t.swiping = true;
                   }
-                  setSwipeX(Math.max(-88, Math.min(0, t.startX + dx)));
+                  setSwipeX(Math.max(-160, Math.min(0, t.startX + dx)));
                 }
               : undefined
           }
@@ -143,7 +159,7 @@ function AgentRow({
                   touchRef.current = null;
                   if (!t?.swiping) return;
                   setSwipeX((x) => {
-                    const snap = x < -44 ? -88 : 0;
+                    const snap = x < -60 ? -160 : 0;
                     if (snap === 0) setConfirmDel(false);
                     return snap;
                   });
@@ -178,6 +194,7 @@ function AgentRow({
             <StatusDot status={a.status} busy={a.busy || busyLive} />
           )}
           <span className="min-w-0 flex-1 truncate text-[15px] sm:text-sm">
+            {pinned && <span className="mr-0.5 text-[10px]">📌</span>}
             {a.displayName}
             {a.pinnedMaster && (
               <span className="badge badge-primary badge-xs ml-1 align-middle">
@@ -218,14 +235,44 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
     const t = setInterval(() => setTick((v) => v + 1), 30_000);
     return () => clearInterval(t);
   }, []);
+  // 用户置顶(owner 2026-07-14:左滑加置顶):localStorage 偏好,纯前端排序——
+  // master 恒第一,置顶组其次(保持组内原相对顺序),其余在后
+  const [pinnedList, setPinnedList] = useState<string[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const v = JSON.parse(localStorage.getItem("cstra_pinned") || "[]");
+      return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+  const togglePin = (name: string) => {
+    setPinnedList((prev) => {
+      const next = prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name];
+      try {
+        localStorage.setItem("cstra_pinned", JSON.stringify(next));
+      } catch {
+        /* 隐私模式 */
+      }
+      return next;
+    });
+  };
   // agent 搜索（2026-07-13 owner）：名称/用途 大小写不敏感即时过滤，纯前端
   const [query, setQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showStats, setShowStats] = useState(false);
   const q = query.trim().toLowerCase();
-  const filtered = q
-    ? agents.filter((a) => `${a.displayName} ${a.name} ${a.purpose}`.toLowerCase().includes(q))
-    : agents;
+  const pinSet = new Set(pinnedList);
+  const filtered = (
+    q
+      ? agents.filter((a) => `${a.displayName} ${a.name} ${a.purpose}`.toLowerCase().includes(q))
+      : agents
+  )
+    .slice()
+    .sort((a, b) => {
+      const rank = (x: AgentSession) => (x.pinnedMaster ? 2 : pinSet.has(x.name) ? 1 : 0);
+      return rank(b) - rank(a); // 稳定排序:同组保持原相对顺序
+    });
 
   return (
     <aside className="flex w-full shrink-0 flex-col border-r border-base-300 bg-base-200 sm:w-64">
@@ -321,6 +368,8 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
               a={a}
               active={active === a.name}
               busyLive={active === a.name && streaming}
+              pinned={pinSet.has(a.name)}
+              onTogglePin={() => togglePin(a.name)}
               onSelect={onSelect}
             />
           ))}
