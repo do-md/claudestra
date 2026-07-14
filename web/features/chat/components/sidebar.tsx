@@ -224,6 +224,7 @@ function AgentRow({
  * onSelect：选中会话后回调（移动端 = 横滑到内容页 toContent；桌面端空转）。
  */
 export function Sidebar({ onSelect }: { onSelect: () => void }) {
+  const store = useChatStoreApi();
   const agents = useChatStore((s) => s.state.agents);
   const loading = useChatStore((s) => s.state.loadingAgents);
   const ready = useChatStore((s) => s.state.agentsReady);
@@ -263,15 +264,19 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const [showStats, setShowStats] = useState(false);
   const q = query.trim().toLowerCase();
   const pinSet = new Set(pinnedList);
+  // 大总管独立入口(owner 2026-07-14:「跟普通 agent 区分开」)——不进列表、
+  // 不参与搜索过滤,常驻列表区顶部的边框卡片
+  const master = agents.find((a) => a.pinnedMaster);
+  const workers = agents.filter((a) => !a.pinnedMaster);
   const filtered = (
     q
-      ? agents.filter((a) => `${a.displayName} ${a.name} ${a.purpose}`.toLowerCase().includes(q))
-      : agents
+      ? workers.filter((a) => `${a.displayName} ${a.name} ${a.purpose}`.toLowerCase().includes(q))
+      : workers
   )
     .slice()
     .sort((a, b) => {
-      const rank = (x: AgentSession) => (x.pinnedMaster ? 2 : pinSet.has(x.name) ? 1 : 0);
-      return rank(b) - rank(a); // 稳定排序:同组保持原相对顺序
+      const rank = (x: AgentSession) => (pinSet.has(x.name) ? 1 : 0);
+      return rank(b) - rank(a); // 稳定排序:置顶组保持原相对顺序
     });
 
   return (
@@ -354,6 +359,29 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
         )}
         {ready && !loading && agents.length === 0 && (
           <div className="px-2 py-4 text-sm opacity-50">暂无会话</div>
+        )}
+        {/* 大总管独立入口卡:边框实卡与普通行区分,常驻不受搜索影响 */}
+        {master && (
+          <button
+            className={`mb-2 flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors ${
+              active === master.name
+                ? "border-primary/40 bg-primary/10"
+                : "border-base-300 bg-base-100 hover:bg-base-300/40"
+            }`}
+            onClick={() => {
+              store.openAgent(master.name);
+              onSelect();
+            }}
+          >
+            <span className="text-lg">👑</span>
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="truncate text-[15px] font-medium sm:text-sm">{master.displayName}</span>
+              <span className="truncate text-[11px] text-base-content/45">总控调度 · 新建会话找它</span>
+            </span>
+            {(master.busy || (active === master.name && streaming)) && (
+              <span className="size-2 shrink-0 rounded-full bg-warning" />
+            )}
+          </button>
         )}
         {agents.length > 0 && filtered.length === 0 && (
           <div className="px-2 py-4 text-sm opacity-50">没有匹配「{query.trim()}」的会话</div>
