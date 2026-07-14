@@ -605,18 +605,22 @@ const Message = memo(function Message({
 }) {
   // 点击消息（user 气泡 / ✦ 头）切换秒级时间显示
   const [showTs, setShowTs] = useState(false);
+  // 个人资料：自己的消息(无 from——from 是入站来源标签,别人的消息才带)
+  // 旁显示自定义头像+昵称(owner 2026-07-14)。低频变更,全气泡重渲染可接受。
+  const profile = useChatStore((s) => s.state.profile);
   if (m.role === "system") return <SystemDivider m={m} />;
   if (m.role === "user") {
     const atts = m.attachments ?? [];
-    return (
-      <div className="chat-msg-in mb-[22px] flex flex-col items-end gap-2">
-        {m.from && (
-          <div className="pr-1 text-[10px] opacity-50">{m.from}</div>
-        )}
+    const isSelf = !m.from;
+    const showAvatar = isSelf && !!profile.avatar;
+    const label = m.from || (isSelf ? profile.nickname : "");
+    const body = (
+      <div className="flex min-w-0 flex-col items-end gap-2">
+        {label && <div className="pr-1 text-[10px] opacity-50">{label}</div>}
         {atts.length > 0 && <AttachmentStrip items={atts} />}
         {m.content && (
           <div
-            className="max-w-[85%] cursor-pointer whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90"
+            className="max-w-full cursor-pointer whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90"
             onClick={() => setShowTs((v) => !v)}
           >
             {m.content}
@@ -624,6 +628,19 @@ const Message = memo(function Message({
         )}
         {showTs && m.ts && (
           <div className="pr-1 font-mono text-[10px] tabular-nums opacity-40">{fmtTs(m.ts)}</div>
+        )}
+      </div>
+    );
+    return (
+      <div className="chat-msg-in mb-[22px] flex justify-end gap-2">
+        <div className="flex max-w-[85%] justify-end">{body}</div>
+        {showAvatar && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={profile.avatar}
+            alt=""
+            className={`size-7 shrink-0 rounded-full object-cover ${label ? "mt-4" : "mt-0.5"}`}
+          />
         )}
       </div>
     );

@@ -15,4 +15,15 @@ export function runSettingsMigrations(db: Database.Database) {
       updated_at TEXT NOT NULL
     )
   `);
+  // 用户个人资料（owner 2026-07-14:设置里自定义头像+昵称,显示在对话里）。
+  // 单账号单行表;avatar 是前端压缩后的 data URL(128px jpeg,~15KB),
+  // 存库省去文件管理,GET 直出。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_profile (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      nickname TEXT NOT NULL DEFAULT '',
+      avatar TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL
+    )
+  `);
 }

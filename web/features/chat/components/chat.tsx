@@ -257,6 +257,7 @@ function ChatInner() {
 
   useEffect(() => {
     store.loadAgents();
+    void store.loadProfile();
     // 回前台时若流断了则重连，并立即刷一次列表（后台期间可能有新 agent）。
     // iOS PWA 从 App 切换器/锁屏回来有时只发 focus/pageshow 不发 visibilitychange
     // (2026-07-14 真机:断流旧帧一直挂着,历史/回复全缺)——三个事件都挂同一

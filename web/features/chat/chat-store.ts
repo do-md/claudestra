@@ -44,6 +44,8 @@ interface ChatState {
   pendingAsk: PendingAsk | null;
   /** 当前会话的后台任务（subagent / bg shell）跟踪面板，按到达顺序。 */
   bgTasks: BgTaskView[];
+  /** 用户个人资料（头像 data URL + 昵称）——显示在自己的消息气泡旁。 */
+  profile: { nickname: string; avatar: string };
 }
 
 /**
@@ -95,7 +97,40 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       pendingPermission: null,
       pendingAsk: null,
       bgTasks: [],
+      profile: { nickname: "", avatar: "" },
     });
+  }
+
+  /** 拉取个人资料（应用启动时调一次;失败保持空,不打扰）。 */
+  public async loadProfile() {
+    try {
+      const res = await fetch("/api/profile");
+      if (!res.ok) return;
+      const json = (await res.json()) as { data?: { nickname?: string; avatar?: string } };
+      this.produce((s) => {
+        s.profile = { nickname: json.data?.nickname ?? "", avatar: json.data?.avatar ?? "" };
+      });
+    } catch {
+      /* 非关键 */
+    }
+  }
+
+  /** 保存个人资料并更新本地状态。返回是否成功（设置面板据此提示）。 */
+  public async saveProfile(nickname: string, avatar: string): Promise<boolean> {
+    try {
+      const res = await fetch("/api/profile", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nickname, avatar }),
+      });
+      if (!res.ok) return false;
+      this.produce((s) => {
+        s.profile = { nickname: nickname.trim().slice(0, 32), avatar };
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private nextId() {
