@@ -258,6 +258,11 @@ function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
       zoom: false, // 隐藏缩放按钮(手势缩放为主,按钮占位)
       pinchToClose: true,
       closeOnVerticalDrag: true,
+      // 单击即关(owner 2026-07-14:「单击一下也关闭」)——默认 tap 是切换控制栏、
+      // 点图是缩放,手机上关图片只能下拉,不顺手。双击缩放/捏合仍在。
+      tapAction: "close",
+      imageClickAction: "close",
+      bgClickAction: "close",
     });
     // 自定义「保存」按钮:iOS PWA 里 lightbox 的图长按不出系统菜单,
     // Web Share API 的分享面板才有「存储图像」到相册
