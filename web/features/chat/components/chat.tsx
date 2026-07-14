@@ -137,8 +137,18 @@ function ChatInner() {
   // 首帧按当前 hash 初始化定位，随后开启过渡
   useLayoutEffect(() => {
     // 带 #terminal / #manage 刷新进入：页面态不可恢复（termId 已随连接销毁 /
-    // showManage 初始 false），降级回会话内容页（#chat），避免 hash 悬空
-    if (["#terminal", "#manage"].includes(window.location.hash.split("?")[0])) {
+    // showManage 初始 false），降级回会话内容页（#chat），避免 hash 悬空。
+    // #terminal 额外留恢复标记——TerminalButton 挂载后自动重开终端页
+    // (iOS PWA 冷恢复=整页重载,用户本来就在终端里,别把人丢回聊天框)
+    const hash0 = window.location.hash.split("?")[0];
+    if (["#terminal", "#manage"].includes(hash0)) {
+      if (hash0 === "#terminal") {
+        try {
+          sessionStorage.setItem("cstra_term_restore", String(Date.now()));
+        } catch {
+          /* 隐私模式 */
+        }
+      }
       window.history.replaceState(null, "", "#chat");
     }
     setShowContent(isContentHash());

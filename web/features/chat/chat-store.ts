@@ -116,8 +116,12 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       const res = await fetch("/api/agents");
       if (res.status === 401) return this.gotoLogin();
       const json = (await res.json()) as { data?: AgentSession[] };
+      // 非 2xx（bridge 重启窗口的 502）别把列表清空——agents 一空,TopBar 的
+      // info 变 undefined,已打开的终端页/操作区整体卸载(2026-07-14 实证:
+      // 用户在终端页被「丢回聊天框」的元凶之一)。保留旧列表等下一轮。
+      if (!res.ok || !Array.isArray(json.data)) throw new Error(`HTTP ${res.status}`);
       this.produce((s) => {
-        s.agents = json.data ?? [];
+        s.agents = json.data!;
         s.loadingAgents = false;
         s.agentsReady = true;
       });
@@ -141,7 +145,10 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       const res = await fetch("/api/agents");
       if (res.status === 401) return;
       const json = (await res.json()) as { data?: AgentSession[] };
-      const next = json.data ?? [];
+      // 同 loadAgents:502/坏响应不清列表(否则 15s 轮询撞上 bridge 重启窗口,
+      // 终端页随 TopBar 卸载而蒸发)
+      if (!res.ok || !Array.isArray(json.data)) return;
+      const next = json.data;
       // 会话态校准(2026-07-14 owner:agent 忙不忙是服务端事实,别只依赖流):
       // 活跃会话在服务端是 busy(hook 真值)而本地没在 streaming → 补锁。
       // 反向(busy=false 解锁)不做——15s 轮询粒度粗,会误杀刚起步的回合;

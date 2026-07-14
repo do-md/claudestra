@@ -64,6 +64,36 @@ export function TerminalView({
     }
   }, [status]);
 
+  const statusRef = useRef<TermStatus>("connecting");
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+  // 自愈重连的一次性闸：连上(open 帧)即归零;防 bridge 长宕时 error→重连→error 空转
+  const autoRetriedRef = useRef(false);
+
+  // 断流自愈(2026-07-14 owner:「终端的重连从来没有成功过」)：
+  // - 页面可见时断到 error/exited → 2s 后自动重连一次(bridge 重启 ~15s 才检测到
+  //   断流,那时服务多半已回来,不需要用户手点「重新连接」)
+  // - 回前台(iOS 后台必断) → 直接自动重连,用户无感接上
+  useEffect(() => {
+    if (status !== "error" && status !== "exited") return;
+    if (document.visibilityState !== "visible" || autoRetriedRef.current) return;
+    autoRetriedRef.current = true;
+    const t = window.setTimeout(() => setConnectSeq((n) => n + 1), 2000);
+    return () => window.clearTimeout(t);
+  }, [status]);
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState !== "visible") return;
+      if (statusRef.current === "error" || statusRef.current === "exited") {
+        autoRetriedRef.current = true;
+        setConnectSeq((n) => n + 1);
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
   /** 上行：微批 + 串行链（字节序！）。ControlBar 也走这里。 */
   const queueInput = (data: string) => {
     if (!data) return;
@@ -188,6 +218,13 @@ export function TerminalView({
     // 窗口时取消传导会丢（实测漏过一条 → Bridge 僵尸 PTY，靠 TTL 才能回收）。
     // 延迟让第一个 effect 的连接根本不发生；50ms 对真人无感。
     const connectTimer = window.setTimeout(connect, 50);
+    // 僵尸连接看门狗：iOS 回前台的挂起 socket 常常既不报错也不关闭——终端永远
+    // 冻结且无重连入口。bridge 每 5s 发 ping,>15s 无任何字节 = 连接已死,主动
+    // abort 走 error 分支,配合上面的自愈逻辑自动重连。
+    let lastByteAt = Date.now();
+    const stallTimer = window.setInterval(() => {
+      if (!disposed && Date.now() - lastByteAt > 15_000) abort.abort();
+    }, 5_000);
     async function connect() {
       let res: Response;
       try {
@@ -217,6 +254,7 @@ export function TerminalView({
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          lastByteAt = Date.now(); // ping 注释帧也算——有字节就是活的
           buffer += decoder.decode(value, { stream: true });
           const frames = buffer.split("\n\n");
           buffer = frames.pop() || "";
@@ -267,6 +305,7 @@ export function TerminalView({
                 term.resize(evt.cols, evt.rows);
               }
               if (!disposed) setStatus("connected");
+              autoRetriedRef.current = false; // 连上了,自愈闸复位
             } else if (evt.t === "resize" && evt.cols && evt.rows) {
               // 后端 settle 校正推送（iTerm 钳制解除失败的降级/恢复）——同步 xterm
               if (!disposed) {
@@ -429,6 +468,7 @@ export function TerminalView({
     return () => {
       disposed = true;
       clearTimeout(connectTimer); // dev 双 effect：首个 effect 的连接在 fire 前取消
+      clearInterval(stallTimer);
       ro.disconnect();
       container.removeEventListener("touchstart", onTouchStart);
       container.removeEventListener("touchmove", onTouchMove);

@@ -55,7 +55,25 @@ export function TerminalButton({ agent }: { agent: AgentSession }) {
     return () => window.removeEventListener("popstate", onPop);
   }, [openPage]);
 
-  if (agent.mock || agent.status !== "active") return null;
+  // [iOS PWA] 冷恢复(整页重载)时 #terminal 悬空被 chat.tsx 降级,同时留下恢复
+  // 标记——挂载后自动重开终端页,回到用户离开时的位置(2026-07-14 owner:
+  // 「终端的重连从来没成功过,每次点过去都是点到聊天框里」)。
+  useEffect(() => {
+    if (agent.status !== "active" || !isNarrow()) return;
+    try {
+      const raw = sessionStorage.getItem("cstra_term_restore");
+      if (!raw) return;
+      sessionStorage.removeItem("cstra_term_restore");
+      if (Date.now() - Number(raw) > 60_000) return; // 陈旧标记(非本次恢复)不消费
+      if (!isTerminalHash()) window.history.pushState(null, "", TERMINAL_HASH);
+      setOpenPage(true);
+    } catch {
+      /* 隐私模式等 sessionStorage 不可用 */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent.status]);
+
+  if (agent.mock) return null;
 
   const open = () => {
     if (isNarrow()) {
@@ -74,14 +92,19 @@ export function TerminalButton({ agent }: { agent: AgentSession }) {
 
   return (
     <>
-      <button
-        className="btn btn-ghost btn-sm px-2 text-base-content/60 hover:text-base-content"
-        title="打开远程终端（实时镜像 + 可输入）"
-        aria-label="打开远程终端"
-        onClick={open}
-      >
-        <TerminalIcon />
-      </button>
+      {/* 入口按钮只在 active 时显示;已打开的终端页不随 status 抖动卸载——
+          agents 轮询数据瞬时异常(bridge 重启窗口)不该让用户被丢回聊天页,
+          agent 真停了终端流自己会 exit 并给出「已结束」遮罩 */}
+      {agent.status === "active" && (
+        <button
+          className="btn btn-ghost btn-sm px-2 text-base-content/60 hover:text-base-content"
+          title="打开远程终端（实时镜像 + 可输入）"
+          aria-label="打开远程终端"
+          onClick={open}
+        >
+          <TerminalIcon />
+        </button>
+      )}
       {openModal && (
         <TerminalModal
           agent={agent.name}
