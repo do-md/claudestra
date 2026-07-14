@@ -593,10 +593,15 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
   // 上下文都在,agent 带着前一条的进度优先响应补充,而不是把补充压到回复之后。
   // 只对人类的 request 生效(Discord user / API user);agent↔agent、peer、bridge
   // 系统消息、response 回执不抢占目标的工作。
-  // 防线:①tmux 实测 pane 出现 "esc to interrupt" 才算工作中(唯一真值——hook 状态
-  // 表 bridge 重启即空,paneLooksIdle 对工作中的空 `❯` 输入行会假阳性;空闲 prompt
-  // 下绝不发 C-c,连两下会直接退出 CC;权限弹窗时该文案也不在,不误伤弹窗);
-  // ②同频道 4s 冷却,三连发不叠加打断。
+  // 「工作中」三信号 OR(2026-07-14 深夜实锤:CC 2.1.209 的 spinner 行轮换显示
+  // tips,"esc to interrupt" 大部分时间不在——只认它会静默漏掉抢占):
+  //   ① pane 有 "esc to interrupt"(老版文案,轮换恰好在时最准);
+  //   ② pane 有 spinner 时间模式「✶ Xxx… (2m 7s · ↓ 4.6k tokens)」;
+  //   ③ event-bus 最近状态 = thinking(投递时自 emit,同进程可靠;bridge 重启后
+  //      第一回合内为空,由①②补)。
+  // 误伤面:空闲被误判时单发一次 C-c 只清输入行不退出 CC(退出需短窗内连按两次,
+  // 4s 冷却隔开了);paneLooksIdle 不用——工作中的空 ❯ 输入行会假阳性。
+  // 同频道 4s 冷却,三连发不叠加打断。
   if (
     (env.from.kind === "user" || env.from.kind === "api") &&
     env.intent === "request" &&
@@ -612,7 +617,11 @@ async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Pro
       const tail10 = win
         ? (await tmuxRaw(["capture-pane", "-t", win, "-p"])).split("\n").slice(-10).join("\n")
         : "";
-      if (win && /esc to interrupt/i.test(tail10)) {
+      const working =
+        /esc to interrupt/i.test(tail10) ||
+        /…\s*\(\d+m?\s*\d*s\b/.test(tail10) ||
+        getAgentStatus(evAgent) === "thinking";
+      if (win && working) {
         lastPreemptAt.set(to.channelId, Date.now());
         await tmuxRaw(["send-keys", "-t", win, "C-c"]);
         recordMetric("agent_interrupt", { channelId: to.channelId, agent: evAgent, meta: { trigger: "preempt" } });
