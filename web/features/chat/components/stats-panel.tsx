@@ -78,16 +78,39 @@ export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => vo
         <div className="flex items-center px-5 pb-2 pt-4">
           <span className="text-base font-semibold">用量看板</span>
           <button
-            className="btn btn-ghost btn-sm ml-auto"
+            className="ml-auto flex size-7 items-center justify-center rounded-lg text-base-content/50 transition-colors hover:bg-base-200 hover:text-base-content disabled:opacity-40"
             aria-label="强制刷新账号用量"
             title="强制重抓账号用量（最长约 20 秒）"
             disabled={refreshing}
             onClick={() => load(true)}
           >
-            {refreshing ? <span className="loading loading-spinner loading-xs" /> : "🔄"}
+            {/* 与侧栏图标同一套 SVG 线条语言（emoji 🔄 被 owner 嫌丑）;刷新中自转 */}
+            <svg
+              width="15"
+              height="15"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={refreshing ? "animate-spin" : ""}
+            >
+              <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+              <path d="M21 3v5h-5" />
+              <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+              <path d="M8 16H3v5" />
+            </svg>
           </button>
-          <button className="btn btn-ghost btn-sm" aria-label="关闭" onClick={onClose}>
-            ✕
+          <button
+            className="flex size-7 items-center justify-center rounded-lg text-base-content/50 transition-colors hover:bg-base-200 hover:text-base-content"
+            aria-label="关闭"
+            onClick={onClose}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
           </button>
         </div>
 
