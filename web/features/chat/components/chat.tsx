@@ -255,21 +255,29 @@ function ChatInner() {
 
   useEffect(() => {
     store.loadAgents();
-    // 回前台时若流断了则重连，并立即刷一次列表（后台期间可能有新 agent）
+    // 回前台时若流断了则重连，并立即刷一次列表（后台期间可能有新 agent）。
+    // iOS PWA 从 App 切换器/锁屏回来有时只发 focus/pageshow 不发 visibilitychange
+    // (2026-07-14 真机:断流旧帧一直挂着,历史/回复全缺)——三个事件都挂同一
+    // handler,5s 节流防连发触发多次对齐。
+    let lastAlign = 0;
     const onVisible = () => {
-      if (document.visibilityState === "visible") {
-        store.maybeReconnect();
-        store.refreshAgents();
-        // iOS PWA 从后台回来偶发合成层黑屏（GPU 层被回收后未重绘,2026-07-13
-        // 真机）——同步 display 切换强制整树重排重绘,单帧内完成无闪烁
-        requestAnimationFrame(() => {
-          document.body.style.display = "none";
-          void document.body.offsetHeight;
-          document.body.style.display = "";
-        });
-      }
+      if (document.visibilityState !== "visible") return;
+      const now = Date.now();
+      if (now - lastAlign < 5_000) return;
+      lastAlign = now;
+      store.maybeReconnect();
+      store.refreshAgents();
+      // iOS PWA 从后台回来偶发合成层黑屏（GPU 层被回收后未重绘,2026-07-13
+      // 真机）——同步 display 切换强制整树重排重绘,单帧内完成无闪烁
+      requestAnimationFrame(() => {
+        document.body.style.display = "none";
+        void document.body.offsetHeight;
+        document.body.style.display = "";
+      });
     };
     document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    window.addEventListener("pageshow", onVisible);
     // 轮询感知本端之外的 roster 变化（master/CLI/其他端 创建/kill/restart agent）——
     // 无实时事件可挂，只能轮询；仅前台，diff-guard 只在列表真变时才 re-render。
     // ⚠ 间隔受 Bridge 限流约束：web-ui token 限 30 req/min（bridge.ts SlidingWindowLimiter，
@@ -281,6 +289,8 @@ function ChatInner() {
     }, 15_000);
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+      window.removeEventListener("pageshow", onVisible);
       clearInterval(poll);
     };
   }, [store]);

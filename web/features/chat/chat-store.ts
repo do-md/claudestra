@@ -358,11 +358,13 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       });
     } catch {
       if (gen !== this.openGen) return;
-      if (attempt < 1) {
-        // 瞬时失败（限流窗口/竞态）自动重试一次；保持 loading 态不闪空
+      if (attempt < 2) {
+        // 瞬时失败自动重试:限流窗口/竞态之外,iOS 回前台头几秒网络栈未醒
+        // fetch 必败(2026-07-14 真机:对齐失败历史缺口一直留到杀 App)——
+        // 1.5s/3s 两次重试把网络唤醒窗口盖住;保持 loading 态不闪空
         setTimeout(() => {
           if (gen === this.openGen) void this.loadMessages(name, gen, attempt + 1);
-        }, 1500);
+        }, 1500 * (attempt + 1));
         return;
       }
       this.produce((s) => {
