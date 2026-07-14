@@ -19,7 +19,7 @@ interface NeutralMessage {
   ts?: string;
   role: "user" | "assistant" | "system";
   text?: string;
-  tools?: { name: string; summary: string }[];
+  tools?: { name: string; summary: string; detail?: string; error?: boolean }[];
   /** [fork] reply() 的最终回复正文（后端从 jsonl 的 reply tool_use 提取） */
   replyText?: string;
   /** [fork] reply() 附带的按钮/选单（后端从 reply tool_use 的 input.components 提取） */
@@ -130,7 +130,7 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
     }
 
     const toolCalls: ToolCallView[] | undefined = m.tools?.length
-      ? m.tools.map((t) => ({ name: t.name, summary: t.summary, state: "done" as const, ts: m.ts }))
+      ? m.tools.map((t) => ({ name: t.name, summary: t.summary, state: t.error ? ("error" as const) : ("done" as const), ts: m.ts, ...(t.detail ? { detail: t.detail } : {}) }))
       : undefined;
     if (!m.text && !toolCalls && !m.replyText) continue;
 

@@ -25,7 +25,7 @@ import { collectSessions } from "./sessions-inventory.js";
 import { cleanupBgJob } from "../lib/bg-jobs.js";
 import { emitEvent, getAgentStatus, type EventFilter } from "./event-bus.js";
 import { listAgentSessions, readSessionHistory, isValidSessionId, isValidSubagentId } from "../lib/session-history.js";
-import { formatTool, agentNameForChannel } from "./jsonl-watcher.js";
+import { formatTool, formatToolDetail, agentNameForChannel } from "./jsonl-watcher.js";
 import { newThreadId, type Envelope, type ApiUserEndpoint } from "./router.js";
 // [fork] additive 端点（interrupt/clear/answer/pending/create/lifecycle）复用的共享 helper。
 // 绝大多数是平台无关模块，直接 import；仅 scheduleClearRotation 依赖 bridge 本地
@@ -573,6 +573,7 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
         limit: Number.isFinite(limitRaw) ? limitRaw : 100,
         before: before != null && Number.isFinite(before) ? before : undefined,
         formatToolFn: formatTool,
+        toolDetailFn: formatToolDetail,
       });
       return apiJson(200, {
         ok: true,

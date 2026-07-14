@@ -1,11 +1,15 @@
 import type { WebPermAction, WebAuqQuestion, WebComponentRow } from "@/lib/chat/events";
 
 export interface ToolCallView {
+  /** tool_use id——直播里 tool-state（失败标红）按它找回这张卡。 */
+  id?: string;
   name: string;
   summary: string;
   state: "running" | "done" | "error";
   /** 调用时间（ISO）：历史来自 jsonl 条目 ts，直播由前端 stamp。点击工具卡显示。 */
   ts?: string;
+  /** 完整入参详情（后端 formatToolDetail，截断 4k）——工具卡点开展示。 */
+  detail?: string;
 }
 
 /** assistant 气泡内的交错段——叙述与工具按真实时间顺序排列（修「工具全堆气泡顶部」）。

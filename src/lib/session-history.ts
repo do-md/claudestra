@@ -20,6 +20,11 @@ import { ARCHIVE_ROOT } from "./session-archive.js";
 export interface HistoryToolCall {
   name: string;
   summary: string;
+  /** [fork] 完整入参详情（jsonl-watcher formatToolDetail 渲染，截断 4k）——
+   *  web 工具卡点开展示。可选：老快照 / 未传 toolDetailFn 时缺省。 */
+  detail?: string;
+  /** [fork] 该次调用的 tool_result 带 is_error——web 把失败的工具卡标红。 */
+  error?: boolean;
 }
 
 /** [fork] reply() 附带的交互组件（按钮/选单），点击回投 [button:id]/[select:id:v]。
@@ -266,13 +271,18 @@ export async function readSessionHistory(
     before?: number;
     /** tool_use 摘要渲染器（bridge 传 jsonl-watcher 的 formatTool），默认只回工具名 */
     formatToolFn?: (name: string, input: any) => string;
+    /** [fork] tool_use 完整详情渲染器（formatToolDetail）——省略则历史不带 detail */
+    toolDetailFn?: (name: string, input: any) => string;
   } = {},
 ): Promise<HistoryPage> {
   const limit = Math.max(1, Math.min(500, Math.floor(opts.limit ?? 100)));
   const fmt = opts.formatToolFn ?? ((name: string) => name);
+  const detailFn = opts.toolDetailFn;
   const raw = await Bun.file(filePath).text();
   const lines = raw.split("\n");
   const all: HistoryMessage[] = [];
+  // [fork] tool_use id → 工具卡：后续 user 记录里的 tool_result(is_error) 回填失败态
+  const toolById = new Map<string, HistoryToolCall>();
 
   for (let i = 0; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
@@ -306,6 +316,16 @@ export async function readSessionHistory(
 
     if (rec.type === "user") {
       const c = rec.message?.content;
+      // [fork] tool_result 的 is_error 回填到对应工具卡（web 标红失败的调用）。
+      // 回填不影响本条 user 记录自身的过滤逻辑，继续走原流程。
+      if (Array.isArray(c)) {
+        for (const b of c) {
+          if (b?.type === "tool_result" && b.tool_use_id && b.is_error === true) {
+            const tc = toolById.get(b.tool_use_id);
+            if (tc) tc.error = true;
+          }
+        }
+      }
       const text =
         typeof c === "string"
           ? c
@@ -389,7 +409,13 @@ export async function readSessionHistory(
               }
             }
           } else {
-            tools.push({ name: b.name, summary: fmt(b.name, b.input) });
+            const tc: HistoryToolCall = { name: b.name, summary: fmt(b.name, b.input) };
+            if (detailFn) {
+              const dt = detailFn(b.name, b.input);
+              if (dt) tc.detail = dt;
+            }
+            tools.push(tc);
+            if (typeof b.id === "string" && b.id) toolById.set(b.id, tc);
           }
         }
       }

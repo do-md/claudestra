@@ -619,14 +619,16 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   public addToolCall(
     name: string,
     summary: string,
-    state: "running" | "done" | "error"
+    state: "running" | "done" | "error",
+    detail?: string,
+    id?: string
   ) {
     this.flushPendingText(); // 保持叙述/工具的真实交错序
     this.ensureLiveAssistant();
     this.produce((s) => {
       const last = s.messages[s.messages.length - 1];
       if (last?.role === "assistant") {
-        const tc = { name, summary, state, ts: new Date().toISOString() };
+        const tc = { name, summary, state, ts: new Date().toISOString(), ...(detail ? { detail } : {}), ...(id ? { id } : {}) };
         last.toolCalls = last.toolCalls ?? [];
         last.toolCalls.push(tc);
         // segments 保持叙述/工具的真实交错序（渲染层优先用它）
@@ -636,6 +638,29 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         else last.segments.push({ kind: "tools", tools: [tc] });
       }
       s.awaitingChunk = false;
+    });
+  }
+
+  /** 工具状态更新（失败标红）。toolCalls 与 segments 是两份引用,immer 下
+   *  各自 copy-on-write 可能分叉——两处都按 id 找到并更新。 */
+  public updateToolState(id: string, state: "done" | "error") {
+    this.produce((s) => {
+      for (let i = s.messages.length - 1; i >= 0; i--) {
+        const m = s.messages[i];
+        if (m.role !== "assistant") continue;
+        let hit = false;
+        for (const tc of m.toolCalls ?? []) {
+          if (tc.id === id) { tc.state = state; hit = true; }
+        }
+        for (const seg of m.segments ?? []) {
+          if (seg.kind === "tools") {
+            for (const tc of seg.tools) {
+              if (tc.id === id) { tc.state = state; hit = true; }
+            }
+          }
+        }
+        if (hit) return;
+      }
     });
   }
 
@@ -775,15 +800,36 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   public endTurn(interrupted?: boolean) {
     this.flushPendingText(); // 定稿前落掉缓冲文本
     this.produce((s) => {
-      const last = s.messages[s.messages.length - 1];
-      if (last?.role === "assistant") {
+      // 逆扫最近一条 assistant,不只看 messages[last]——连发抢占时用户的新消息
+      // 已乐观 push 到末尾,done(interrupted) 到达时末尾是 user 气泡,只看末尾
+      // 会整个跳过打断标记(2026-07-14 用户实测:工作中补发消息没标「已打断」;
+      // 手动「■ 停止」没有新消息插队所以一直正常)。streamed 标志保证只标直播回合。
+      let marked = false;
+      for (let i = s.messages.length - 1; i >= 0; i--) {
+        const m = s.messages[i];
+        if (m.role !== "assistant") continue;
         // 定稿 + 完成/打断标记(owner 2026-07-14):气泡底部绿色「✓ 完成」或
         // 琥珀「⊘ 已打断」行;仅直播回合,历史消息不带(历史有中断系统线)
-        if (last.streamed) {
-          if (interrupted) last.turnInterrupted = true;
-          else last.turnDone = true;
+        if (m.streamed) {
+          if (interrupted) m.turnInterrupted = true;
+          else m.turnDone = true;
+          m.streamed = false;
+          marked = true;
         }
-        last.streamed = false;
+        break;
+      }
+      // thinking 期被抢占:回合还没吐出任何流式气泡,无处标黄 → 插一条与历史
+      // 同款的中断系统线(SystemDivider 渲染成黄⊘)。插在末尾连续的 user 消息
+      // 之前——打断发生在旧回合,触发打断的新消息在时间序上晚于它。
+      if (interrupted && !marked) {
+        let idx = s.messages.length;
+        while (idx > 0 && s.messages[idx - 1].role === "user") idx--;
+        s.messages.splice(idx, 0, {
+          id: this.nextId(),
+          role: "system",
+          content: "已被用户中断",
+          ts: new Date().toISOString(),
+        });
       }
       s.streaming = false;
       s.awaitingChunk = false;

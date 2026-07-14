@@ -85,6 +85,46 @@ export function formatTool(name: string, input: any): string {
   }
 }
 
+/**
+ * [fork] 工具调用完整详情——web 工具卡点开后展示（摘要只够一眼扫过，
+ * 「mem0 write 到底写了啥」这类问题要看完整入参）。随 tool_start 事件
+ * 和历史 tools[] 一起下发。截断上限防单条事件撑爆 SSE / 环形缓冲。
+ */
+const TOOL_DETAIL_MAX = 4000;
+
+export function formatToolDetail(name: string, input: any): string {
+  let out: string;
+  switch (name) {
+    case "Read":
+      out = [
+        input?.file_path || "",
+        input?.offset != null ? `offset=${input.offset}` : "",
+        input?.limit != null ? `limit=${input.limit}` : "",
+      ].filter(Boolean).join("\n");
+      break;
+    case "Edit":
+      out = `${input?.file_path || ""}\n─── old ───\n${input?.old_string ?? ""}\n─── new ───\n${input?.new_string ?? ""}`;
+      break;
+    case "Write":
+      out = `${input?.file_path || ""}\n───\n${input?.content ?? ""}`;
+      break;
+    case "Bash":
+      out = [input?.description, input?.command].filter(Boolean).join("\n───\n");
+      break;
+    default:
+      try {
+        out = JSON.stringify(input ?? {}, null, 2);
+      } catch {
+        out = String(input);
+      }
+  }
+  out = (out || "").trim();
+  if (out.length > TOOL_DETAIL_MAX) {
+    out = out.slice(0, TOOL_DETAIL_MAX) + `\n… (已截断，完整 ${out.length} 字符)`;
+  }
+  return out;
+}
+
 /** 渲染 tool 列表为 Discord 消息 */
 function renderToolMsg(tools: ToolEntry[]): string {
   return tools.map((t) => {
@@ -393,7 +433,7 @@ async function processNewData(state: WatcherState, discord: Client): Promise<voi
                 error: false,
               });
               toolsChanged = true;
-              emitEvent({ agent: state.agentName, chatId: state.channelId, type: "tool_start", data: { toolId: block.id, name: block.name, summary } });
+              emitEvent({ agent: state.agentName, chatId: state.channelId, type: "tool_start", data: { toolId: block.id, name: block.name, summary, detail: formatToolDetail(block.name, block.input) } });
             }
             if (block.type === "text" && block.text?.trim() && WATCHER_CONFIG.showClaudeText && !hasReply) {
               // 以前有 `t.length > 3` 的 filter 防碎片短 text 刷屏，但那会把 "OK"

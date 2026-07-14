@@ -20,7 +20,7 @@ const SSE_HEADERS = {
  *
  * 事件映射：
  *   agent_status thinking → {t:"status",status:"running"}；done → {t:"done"}
- *   tool_start            → {t:"tool", state:"running"}（tool_done 不重复推卡）
+ *   tool_start            → {t:"tool", state:"running"}（tool_done 仅失败时推 tool-state 标红）
  *   assistant_text        → {t:"text"}
  *   chat_message(out)     → {t:"reply"}（reply() 的最终回复，挂 replyText 与叙述分区渲染）
  *   question              → {t:"ask"}；question_cleared → {t:"ask-cleared"}（fork 事件）
@@ -68,7 +68,22 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
         ? { t: "done", ...(d.trigger === "interrupt" ? { interrupted: true } : {}) }
         : { t: "status", status: "running" };
     case "tool_start":
-      return { t: "tool", name: String(d.name ?? "?"), summary: String(d.summary ?? ""), state: "running" };
+      return {
+        t: "tool",
+        name: String(d.name ?? "?"),
+        summary: String(d.summary ?? ""),
+        state: "running",
+        // id：tool_done 的失败态按它找回这张卡
+        ...(typeof d.toolId === "string" && d.toolId ? { id: d.toolId } : {}),
+        // 完整入参详情（后端 formatToolDetail，截断 4k）——工具卡点开展示
+        ...(typeof d.detail === "string" && d.detail ? { detail: d.detail } : {}),
+      };
+    case "tool_done":
+      // 成功完成不推（转圈只在最新一张卡,定稿由下一事件自然接管）;
+      // 失败推 tool-state 让前端把那张卡标红
+      return d.error && typeof d.toolId === "string" && d.toolId
+        ? { t: "tool-state", id: d.toolId, state: "error" }
+        : null;
     case "assistant_text":
       return { t: "text", text: String(d.text ?? "") };
     case "chat_message": {

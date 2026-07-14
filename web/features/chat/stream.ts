@@ -9,8 +9,12 @@ export interface StreamSink {
   addToolCall(
     name: string,
     summary: string,
-    state: "running" | "done" | "error"
+    state: "running" | "done" | "error",
+    detail?: string,
+    id?: string
   ): void;
+  /** 工具状态更新（目前只有失败标红）——按 tool_use id 找回那张卡。 */
+  updateToolState(id: string, state: "done" | "error"): void;
   appendAssistantText(text: string): void;
   /** [fork] reply() 的最终回复：挂到当前 assistant 气泡的 replyText（回合外到达也定稿）。
    *  components：reply 附带的按钮/选单，挂到同一气泡供渲染。
@@ -43,7 +47,10 @@ export interface StreamSink {
 export function processStreamEvent(sink: StreamSink, evt: WebStreamEvent) {
   switch (evt.t) {
     case "tool":
-      sink.addToolCall(evt.name, evt.summary, evt.state);
+      sink.addToolCall(evt.name, evt.summary, evt.state, evt.detail, evt.id);
+      break;
+    case "tool-state":
+      sink.updateToolState(evt.id, evt.state);
       break;
     case "text":
       sink.appendAssistantText(evt.text);

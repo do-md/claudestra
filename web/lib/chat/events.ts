@@ -48,8 +48,12 @@ export type WebComponentRow =
 
 export type WebStreamEvent =
   | { t: "status"; status: "running" | "done" }
-  /** 一次工具调用的段级摘要（📖 Read xxx / ✏️ Edit xxx / ⚙️ Bash ...） */
-  | { t: "tool"; name: string; summary: string; state: "running" | "done" | "error" }
+  /** 一次工具调用的段级摘要（📖 Read xxx / ✏️ Edit xxx / ⚙️ Bash ...）。
+   *  id：tool_use id（tool-state 按它更新这张卡）。
+   *  detail：完整入参详情（截断 4k），工具卡点开展示。 */
+  | { t: "tool"; id?: string; name: string; summary: string; state: "running" | "done" | "error"; detail?: string }
+  /** 工具调用状态更新（目前只有失败标红——成功不推,省事件量）。 */
+  | { t: "tool-state"; id: string; state: "done" | "error" }
   /** 助手文本段（过程叙述，追加到当前流式助手消息的 content） */
   | { t: "text"; text: string }
   /** [fork] reply() 的最终回复（挂到当前 assistant 气泡的 replyText，与叙述分区渲染）。
