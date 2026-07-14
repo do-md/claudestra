@@ -84,7 +84,7 @@ export function ManagePanel({ open, onClose }: { open: boolean; onClose: () => v
                       <div className="truncate text-[11px] text-base-content/40">{a.purpose}</div>
                     )}
                   </div>
-                  {typeof a.contextTokens === "number" && a.contextTokens >= 100_000 && (
+                  {typeof a.contextTokens === "number" && a.contextTokens >= 200_000 && (
                     <span className="shrink-0 font-mono text-[10px] tabular-nums text-base-content/40">
                       {Math.round(a.contextTokens / 1000)}k
                     </span>

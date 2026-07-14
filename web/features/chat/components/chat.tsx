@@ -78,8 +78,9 @@ function TopBar() {
         {info?.displayName || active || "Claudestra"}
       </span>
       {/* 上下文占用徽章(2026-07-14 owner:context 超标 web 端毫无提示)。
-          色阶按 200k 窗口(owner 定阈值):≥40k 黄,≥100k 红,≥150k 深红(实色)。 */}
-      {typeof info?.contextTokens === "number" && info.contextTokens >= 40_000 && (
+          色阶按 1M 窗口(owner 定档):≥200k 黄,≥500k 红,≥750k 深红(实色);
+          <200k 不打扰(不显示)。 */}
+      {typeof info?.contextTokens === "number" && info.contextTokens >= 200_000 && (
         <span
           title="当前会话上下文占用(建议在对话里让 agent /compact)"
           className={`shrink-0 rounded-full px-2 py-0.5 font-mono text-[10.5px] tabular-nums ${

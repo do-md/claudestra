@@ -156,8 +156,10 @@ export function Composer() {
   const agentInfo = agents.find((a) => a.name === active);
   const ctxTokens = typeof agentInfo?.contextTokens === "number" ? agentInfo.contextTokens : 0;
   const reqAt = compactReqAt[active] || 0;
+  // 阈值对齐 ctx-level 深红档(1M 窗的 75%)——此前按 200k 窗的 170k,1M 模型
+  // 才用 17% 就催压缩,太吵(owner 2026-07-14 更正窗口口径)
   const showCtxWarn =
-    ctxTokens >= 170_000 &&
+    ctxTokens >= 750_000 &&
     ctxDismissedFor !== active &&
     (!reqAt || Date.now() - reqAt > 10 * 60_000);
 

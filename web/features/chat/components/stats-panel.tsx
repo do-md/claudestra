@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useChatStore } from "../chat-store";
-import { ctxLevel } from "../ctx-level";
+import { ctxLevel, CTX_WINDOW } from "../ctx-level";
 
 /**
  * 用量/上下文看板（2026-07-14 owner：context 要成体系,web 看板可以更详细）。
@@ -193,15 +193,15 @@ export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => vo
             </div>
           )}
 
-          {/* 各 agent 上下文占用(200k 参考刻度) */}
+          {/* 各 agent 上下文占用(1M 参考刻度) */}
           <div className="mb-2 text-xs font-medium uppercase tracking-wide text-base-content/40">
             各会话上下文占用
           </div>
           <div className="space-y-3">
             {rows.map((a) => {
               const t = a.contextTokens!;
-              const pct = (t / 200_000) * 100;
-              // 色阶(owner 定阈值):≥150k 深红(实色) / ≥100k 红 / ≥40k 黄 / 其余绿
+              const pct = (t / CTX_WINDOW) * 100;
+              // 色阶(owner 定阈值,1M 窗):≥750k 深红(实色) / ≥500k 红 / ≥200k 黄 / 其余绿
               const tone = {
                 deep: "bg-error",
                 high: "bg-error/60",
