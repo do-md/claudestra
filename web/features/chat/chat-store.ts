@@ -790,6 +790,19 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     });
   }
 
+  /** 回合出错(流 error 事件)——最后一条 assistant 标红「✕ 出错」。 */
+  public turnError() {
+    this.produce((s) => {
+      for (let i = s.messages.length - 1; i >= 0; i--) {
+        const m = s.messages[i];
+        if (m.role === "assistant") {
+          m.turnError = true;
+          break;
+        }
+      }
+    });
+  }
+
   /** 回合耗时(jsonl turn_duration)——补到完成标记上:「✓ 完成 · 12.3s」 */
   public turnDuration(ms: number) {
     this.produce((s) => {

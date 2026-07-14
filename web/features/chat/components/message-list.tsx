@@ -231,6 +231,29 @@ async function shareImage(url: string, name: string): Promise<void> {
   }
 }
 
+/** 回合结束标记:三态同构(圆圈图标 + 文字),绿=完成 / 黄=已打断 / 红=出错。 */
+function TurnMark({ kind, ms }: { kind: "done" | "interrupted" | "error"; ms?: number }) {
+  const conf = {
+    done: { cls: "text-success", label: "完成", icon: <path d="M8.5 12.5l2.5 2.5 5-5.5" /> },
+    interrupted: { cls: "text-warning", label: "已打断", icon: <path d="M5.6 5.6l12.8 12.8" /> },
+    error: { cls: "text-error", label: "出错", icon: <path d="M8.5 8.5l7 7M15.5 8.5l-7 7" /> },
+  }[kind];
+  return (
+    <div className={`chat-msg-in mt-2 flex items-center gap-1.5 text-[11.5px] font-medium ${conf.cls}`}>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="9" />
+        {conf.icon}
+      </svg>
+      {conf.label}
+      {kind === "done" && typeof ms === "number" && (
+        <span className="font-mono text-[10.5px] font-normal tabular-nums opacity-70">
+          · {(ms / 1000).toFixed(ms >= 60_000 ? 0 : 1)}s
+        </span>
+      )}
+    </div>
+  );
+}
+
 function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
   const images = items.filter((a) => a.kind === "image" && a.url);
   const imgEls = useRef(new Map<string, HTMLImageElement>());
@@ -533,29 +556,13 @@ const Message = memo(function Message({
         </div>
       )}
       {!!m.replyComponents?.length && <ReplyComponents m={m} />}
-      {/* 直播回合完成/打断标记(owner 2026-07-14)——小字行跟着本回合气泡走,
-          不刷屏不打扰;历史消息不渲染完成(本来就都完成了),中断历史有系统线。 */}
-      {m.turnDone && !m.turnInterrupted && !streamingLast && (
-        <div className="chat-msg-in mt-2 flex items-center gap-1.5 text-[11.5px] font-medium text-success">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M20 6L9 17l-5-5" />
-          </svg>
-          完成
-          {typeof m.turnMs === "number" && (
-            <span className="font-mono text-[10.5px] font-normal tabular-nums text-success/70">
-              · {(m.turnMs / 1000).toFixed(m.turnMs >= 60_000 ? 0 : 1)}s
-            </span>
-          )}
-        </div>
-      )}
-      {m.turnInterrupted && !streamingLast && (
-        <div className="chat-msg-in mt-2 flex items-center gap-1.5 text-[11.5px] font-medium text-warning">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-            <circle cx="12" cy="12" r="9" />
-            <path d="M5.6 5.6l12.8 12.8" />
-          </svg>
-          已打断
-        </div>
+      {/* 直播回合三态标记(owner 2026-07-14:同构格式,绿完成/黄打断/红出错)
+          ——小字行跟着本回合气泡走;历史消息不渲染完成(本来就都完成了)。 */}
+      {!streamingLast && (m.turnError || m.turnInterrupted || m.turnDone) && (
+        <TurnMark
+          kind={m.turnError ? "error" : m.turnInterrupted ? "interrupted" : "done"}
+          ms={m.turnMs}
+        />
       )}
     </div>
   );
