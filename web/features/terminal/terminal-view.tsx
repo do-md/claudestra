@@ -551,15 +551,20 @@ export function TerminalView({
             if (term) {
               const buf = term.buffer.active;
               const line = (y: number) => buf.getLine(y)?.translateToString() || "";
-              // copy-mode 指示器:屏幕区(非 scrollback)顶部两行、右对齐的 [n/m]
+              // 主界面否决条件:底部有 ❯ 输入框行(转录视图没有输入框)。
+              // 光看 "transcript" 字样会踩正文地雷——聊「⤓ 底」功能本身的会话,
+              // 叙述文本全是这些词,真机误判发 G 打进了输入框(❯ GG,2026-07-14)。
               const top = Math.max(0, buf.length - term.rows);
-              for (let y = top; y < Math.min(top + 2, buf.length); y++) {
-                if (/\[\d+\/\d+\]\s*$/.test(line(y).trimEnd())) {
-                  out = "q";
+              let hasPromptLine = false;
+              for (let y = Math.max(top, buf.length - 8); y < buf.length; y++) {
+                if (/^\s*❯/.test(line(y))) {
+                  hasPromptLine = true;
                   break;
                 }
               }
-              if (out === null) {
+              // copy-mode 指示器:屏幕区最顶行、右对齐的 [n/m](tmux overlay)
+              if (/\[\d+\/\d+\]\s*$/.test(line(top).trimEnd())) out = "q";
+              if (out === null && !hasPromptLine) {
                 for (let y = Math.max(0, buf.length - 8); y < buf.length; y++) {
                   if (/transcript/i.test(line(y))) {
                     out = "G";
