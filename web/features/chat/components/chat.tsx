@@ -16,6 +16,7 @@ import { Splash } from "./splash";
 import { AgentActions } from "./agent-actions";
 import { TerminalButton } from "../../terminal/terminal-button";
 import { ManagePanel } from "./manage-panel";
+import { ctxLevel } from "../ctx-level";
 
 /** 「会话内容」页的 hash 锚点：存在即处于内容视图，移动端横滑到内容栏 */
 const CONTENT_HASH = "#chat";
@@ -77,16 +78,17 @@ function TopBar() {
         {info?.displayName || active || "Claudestra"}
       </span>
       {/* 上下文占用徽章(2026-07-14 owner:context 超标 web 端毫无提示)。
-          色阶按 200k 窗口:≥140k 琥珀,≥170k 红,<100k 不打扰。 */}
-      {typeof info?.contextTokens === "number" && info.contextTokens >= 100_000 && (
+          色阶按 200k 窗口(owner 定阈值):≥40k 黄,≥100k 红,≥150k 深红(实色)。 */}
+      {typeof info?.contextTokens === "number" && info.contextTokens >= 40_000 && (
         <span
           title="当前会话上下文占用(建议在对话里让 agent /compact)"
           className={`shrink-0 rounded-full px-2 py-0.5 font-mono text-[10.5px] tabular-nums ${
-            info.contextTokens >= 170_000
-              ? "bg-error/15 text-error"
-              : info.contextTokens >= 140_000
-                ? "bg-warning/15 text-warning"
-                : "bg-base-300 text-base-content/50"
+            {
+              deep: "bg-error text-error-content",
+              high: "bg-error/15 text-error",
+              mid: "bg-warning/15 text-warning",
+              none: "bg-base-300 text-base-content/50",
+            }[ctxLevel(info.contextTokens)]
           }`}
         >
           ctx {Math.round(info.contextTokens / 1000)}k

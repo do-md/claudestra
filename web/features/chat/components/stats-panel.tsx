@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useChatStore } from "../chat-store";
+import { ctxLevel } from "../ctx-level";
 
 /**
  * 用量/上下文看板（2026-07-14 owner：context 要成体系,web 看板可以更详细）。
@@ -200,7 +201,13 @@ export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => vo
             {rows.map((a) => {
               const t = a.contextTokens!;
               const pct = (t / 200_000) * 100;
-              const tone = t >= 170_000 ? "bg-error" : t >= 140_000 ? "bg-warning" : "bg-success";
+              // 色阶(owner 定阈值):≥150k 深红(实色) / ≥100k 红 / ≥40k 黄 / 其余绿
+              const tone = {
+                deep: "bg-error",
+                high: "bg-error/60",
+                mid: "bg-warning",
+                none: "bg-success",
+              }[ctxLevel(t)];
               return (
                 <div key={a.name}>
                   <div className="mb-1 flex items-center gap-1.5 text-xs">

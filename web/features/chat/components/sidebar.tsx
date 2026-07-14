@@ -5,6 +5,7 @@ import type { AgentSession } from "../type";
 import { SettingsModal } from "./settings-modal";
 import { InstallBanner } from "./install-banner";
 import { StatsPanel } from "./stats-panel";
+import { ctxLevel } from "../ctx-level";
 
 function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: boolean }) {
   if (status === "active") {
@@ -57,11 +58,15 @@ function AgentRow({
   const lastAt = fmtLastActive(a.lastActivityTs);
   // ctx 用量背景条（owner 2026-07-14:用量看板藏太深,列表行内直接可视化）:
   // 行背景自左向右填充,宽=占 200k 窗口比例;色阶同顶栏 ctx 徽章
-  // (≥170k 红 / ≥140k 琥珀 / 其余中性淡灰),平时几乎隐形,超标一眼看见。
+  // (≥150k 深红 / ≥100k 红 / ≥40k 黄 / 其余中性淡灰),平时几乎隐形,超标一眼看见。
   const ctx = a.status === "active" && typeof a.contextTokens === "number" ? a.contextTokens : 0;
   const ctxPct = Math.min(100, Math.round((ctx / 200_000) * 100));
-  const ctxTone =
-    ctx >= 170_000 ? "bg-error/15" : ctx >= 140_000 ? "bg-warning/15" : "bg-base-content/[0.05]";
+  const ctxTone = {
+    deep: "bg-error/35",
+    high: "bg-error/15",
+    mid: "bg-warning/15",
+    none: "bg-base-content/[0.05]",
+  }[ctxLevel(ctx)];
 
   return (
     <li>
