@@ -411,7 +411,7 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
               setQuery(e.target.value);
               setChatHits(null); // 换词后旧结果失效
             }}
-            placeholder="搜索会话…"
+            placeholder="搜索会话 / 聊天记录…"
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
