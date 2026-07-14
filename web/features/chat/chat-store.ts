@@ -310,8 +310,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           if (!m.local || m.role !== "user") return false;
           if (m.ts && Date.now() - Date.parse(m.ts) > 30 * 60_000) return false;
           const t = m.content.trim();
+          // wire 口径:按钮点击的乐观气泡显示 label,jsonl 里落的是 [button:<id>]
+          // ——不看 wire 就永远对不上,气泡挂满 30 分钟(2026-07-14 真机截图)
+          const w = m.wire?.trim();
           const idx = tail.findIndex(
-            (h, i) => !used.has(i) && h.role === "user" && h.content.trim() === t
+            (h, i) =>
+              !used.has(i) &&
+              h.role === "user" &&
+              (h.content.trim() === t || (!!w && h.content.includes(w)))
           );
           if (idx >= 0) {
             used.add(idx);
@@ -482,6 +488,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         ts: new Date().toISOString(),
         attachments,
         local: true, // 历史确认前保留(见 loadMessages 的乐观消息保全)
+        // 按钮点击:展示 label、实发 wire——对账按 wire 匹配,否则气泡永挂 30min
+        ...(wire !== display ? { wire } : {}),
       });
       s.streaming = true;
       s.awaitingChunk = true;

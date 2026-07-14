@@ -75,6 +75,9 @@ export interface ChatMessage {
   /** 已点击的按钮/选项 id —— 点后禁用整组，高亮所选（一条 reply 只作答一次）。 */
   replyClickedId?: string;
   toolCalls?: ToolCallView[];
+  /** 本地乐观消息的实发 payload（按钮点击:展示 label、实发 [button:<id>]）。
+   *  历史对账要用它——jsonl 里落的是 wire,按展示文本永远匹配不上。 */
+  wire?: string;
   /** 由本轮流式生成（区别于历史加载） */
   streamed?: boolean;
   /** ISO 时间戳（历史来自 session jsonl，实时由前端 stamp）。 */
