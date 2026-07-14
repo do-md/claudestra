@@ -8,6 +8,73 @@ import { StatsPanel } from "./stats-panel";
 import { ctxLevel, CTX_WINDOW } from "../ctx-level";
 import { fmtAgo } from "../fmt-time";
 
+/** 聊天记录全局搜索命中（/api/chat/search 返回项）。 */
+interface ChatSearchHit {
+  agent: string;
+  sessionId: string;
+  seq: number;
+  ts: string | null;
+  role: string;
+  snippet: string;
+  from?: string;
+  compact?: boolean;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** snippet 里的命中词高亮。 */
+function Highlighted({ text, q }: { text: string; q: string }) {
+  const parts = text.split(new RegExp(`(${escapeRegExp(q)})`, "gi"));
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.toLowerCase() === q.toLowerCase() ? (
+          <mark key={i} className="rounded-sm bg-warning/40 px-0.5 text-inherit">
+            {p}
+          </mark>
+        ) : (
+          p
+        )
+      )}
+    </>
+  );
+}
+
+/** 一条聊天记录搜索命中：agent + 时间 + 正文节选（命中高亮），点击打开该会话。 */
+function ChatHitRow({
+  hit,
+  q,
+  canOpen,
+  onOpen,
+}: {
+  hit: ChatSearchHit;
+  q: string;
+  canOpen: boolean;
+  onOpen: () => void;
+}) {
+  const agentLabel = hit.agent === "__master__" ? "👑 大总管" : hit.agent;
+  return (
+    <button
+      className={`flex w-full flex-col gap-1 rounded-lg px-2.5 py-2 text-left transition-colors ${
+        canOpen ? "hover:bg-base-300/50" : "cursor-default opacity-70"
+      }`}
+      onClick={canOpen ? onOpen : undefined}
+    >
+      <span className="flex items-center gap-1.5 text-[11px] text-base-content/45">
+        <span className="shrink-0">{hit.role === "user" ? "👤" : "✦"}</span>
+        <span className="truncate font-medium text-base-content/60">{agentLabel}</span>
+        {hit.compact && <span className="shrink-0 rounded bg-base-300 px-1">📦 压缩摘要</span>}
+        {hit.ts && <span className="ml-auto shrink-0 tabular-nums">{fmtAgo(Date.parse(hit.ts))}</span>}
+      </span>
+      <span className="line-clamp-3 text-xs leading-relaxed text-base-content/75">
+        <Highlighted text={hit.snippet} q={q} />
+      </span>
+    </button>
+  );
+}
+
 function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: boolean }) {
   if (status === "active") {
     // 运行中：实心核心点 + 柔和呼吸外晕（cstra-breathe，替换生硬的 animate-ping）。
@@ -263,6 +330,23 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const [showSettings, setShowSettings] = useState(false);
   const [showStats, setShowStats] = useState(false);
   const q = query.trim().toLowerCase();
+  // 聊天记录全局搜索（2026-07-14 owner:「compact 后忘事,模糊记得有件事——
+  // 搜聊天记录找回」）。跨会话正文检索,按钮触发不自动搜(全盘扫描,省请求)。
+  const [chatHits, setChatHits] = useState<ChatSearchHit[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const searchChat = async () => {
+    const term = query.trim();
+    if (term.length < 2 || searching) return;
+    setSearching(true);
+    try {
+      const res = await fetch(`/api/chat/search?q=${encodeURIComponent(term)}`);
+      const json = (await res.json()) as { data?: ChatSearchHit[] };
+      setChatHits(Array.isArray(json.data) ? json.data : []);
+    } catch {
+      setChatHits([]);
+    }
+    setSearching(false);
+  };
   const pinSet = new Set(pinnedList);
   // 大总管独立入口(owner 2026-07-14:「跟普通 agent 区分开」)——不进列表、
   // 不参与搜索过滤,常驻列表区顶部的边框卡片
@@ -323,24 +407,52 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
           <input
             type="search"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setChatHits(null); // 换词后旧结果失效
+            }}
             placeholder="搜索会话…"
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
             spellCheck={false}
+            enterKeyHint="search"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void searchChat();
+              }
+            }}
             className="w-full min-w-0 bg-transparent text-sm outline-none placeholder:text-base-content/35 [&::-webkit-search-cancel-button]:hidden"
           />
           {query && (
             <button
               className="shrink-0 text-xs text-base-content/40"
               aria-label="清除搜索"
-              onClick={() => setQuery("")}
+              onClick={() => {
+                setQuery("");
+                setChatHits(null);
+              }}
             >
               ✕
             </button>
           )}
         </label>
+        {/* 聊天记录全局搜索入口:输入 ≥2 字符出现,点击(或回车)才扫全部会话 */}
+        {query.trim().length >= 2 && chatHits === null && (
+          <button
+            className="mt-1.5 flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs text-base-content/60 transition-colors hover:bg-base-300/60"
+            onClick={() => void searchChat()}
+            disabled={searching}
+          >
+            {searching ? (
+              <span className="loading loading-spinner loading-xs" />
+            ) : (
+              <span className="opacity-60">💬</span>
+            )}
+            {searching ? "正在搜聊天记录…" : `搜聊天记录「${query.trim()}」`}
+          </button>
+        )}
       </div>
 
       {/* 添加到主屏幕引导（浏览器标签页访问且未 dismiss 时显示） */}
@@ -359,6 +471,43 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
         )}
         {ready && !loading && agents.length === 0 && (
           <div className="px-2 py-4 text-sm opacity-50">暂无会话</div>
+        )}
+        {/* 聊天记录搜索结果:跨会话正文命中,点击进对应会话(已删 agent 只读展示) */}
+        {chatHits !== null && (
+          <div className="mb-2 rounded-xl border border-base-300 bg-base-100 p-1.5">
+            <div className="flex items-center px-1.5 pb-1 pt-0.5 text-[11px] text-base-content/45">
+              <span>💬 聊天记录 · {chatHits.length ? `${chatHits.length} 条命中` : "无命中"}</span>
+              <button
+                className="ml-auto rounded px-1 text-base-content/40 hover:text-base-content/70"
+                aria-label="关闭搜索结果"
+                onClick={() => setChatHits(null)}
+              >
+                ✕
+              </button>
+            </div>
+            {chatHits.length === 0 && (
+              <div className="px-1.5 pb-1.5 text-xs text-base-content/40">
+                对话正文里没有「{query.trim()}」
+              </div>
+            )}
+            <div className="flex flex-col">
+              {chatHits.map((h, i) => {
+                const canOpen = agents.some((a) => a.name === h.agent);
+                return (
+                  <ChatHitRow
+                    key={`${h.agent}-${h.sessionId}-${h.seq}-${i}`}
+                    hit={h}
+                    q={query.trim()}
+                    canOpen={canOpen}
+                    onOpen={() => {
+                      store.openAgent(h.agent);
+                      onSelect();
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </div>
         )}
         {/* 大总管独立入口卡:边框实卡与普通行区分,常驻不受搜索影响 */}
         {master && (

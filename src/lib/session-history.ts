@@ -434,3 +434,110 @@ export async function readSessionHistory(
   const messages = eligible.slice(-limit);
   return { messages, total: all.length, hasMore: eligible.length > messages.length };
 }
+
+// ── [fork] 聊天记录全文搜索 ─────────────────────────────────────────────
+
+export interface HistorySearchHit {
+  /** jsonl 行号，与 readSessionHistory 的 seq 同一坐标系 */
+  seq: number;
+  ts: string | null;
+  role: "user" | "assistant";
+  /** 命中消息的正文节选（命中词居中，前 80 后 240 字符，越界加 …） */
+  snippet: string;
+  /** 入站消息发送者（<channel> user 属性） */
+  from?: string;
+  /** 命中在 compact 压缩摘要里——被 compact 抛弃的上下文正是搜索的高价值目标 */
+  compact?: boolean;
+}
+
+/** 命中词居中截取节选。 */
+function makeSnippet(text: string, lowerText: string, q: string): string {
+  const at = lowerText.indexOf(q);
+  const start = Math.max(0, at - 80);
+  const end = Math.min(text.length, at + q.length + 240);
+  return (start > 0 ? "…" : "") + text.slice(start, end).trim() + (end < text.length ? "…" : "");
+}
+
+/**
+ * 在一个会话 jsonl 里全文搜索对话正文（user 文本 / assistant 叙述 / reply 正文 /
+ * compact 摘要）。工具参数与 tool_result 不搜——用户「模糊记得一件事」的场景
+ * 命中点在对话正文，参数级噪音只会淹没结果。
+ *
+ * 性能：先对原始行做大小写不敏感子串预筛（indexOf），命中才 JSON.parse +
+ * 正文提取 + 二次确认（预筛可能命中在工具参数/JSON key 上）。53MB 的 jsonl
+ * 预筛一遍远快于全量 parse。
+ */
+export async function searchSessionHistory(
+  filePath: string,
+  query: string,
+  opts: { maxHits?: number } = {},
+): Promise<HistorySearchHit[]> {
+  const maxHits = Math.max(1, Math.min(100, Math.floor(opts.maxHits ?? 20)));
+  const q = query.toLowerCase();
+  if (!q) return [];
+  const raw = await Bun.file(filePath).text();
+  const lines = raw.split("\n");
+  const hits: HistorySearchHit[] = [];
+
+  for (let i = 0; i < lines.length && hits.length < maxHits; i++) {
+    const line = lines[i];
+    if (!line.trim() || !line.toLowerCase().includes(q)) continue;
+    let rec: any;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const ts = typeof rec.timestamp === "string" ? rec.timestamp : null;
+
+    if (rec.type === "user") {
+      const c = rec.message?.content;
+      const text =
+        typeof c === "string"
+          ? c
+          : Array.isArray(c)
+            ? c.filter((b: any) => b?.type === "text").map((b: any) => b.text || "").join("\n")
+            : "";
+      let body = text;
+      let from: string | undefined;
+      if (rec.isMeta === true) {
+        // channel 送达的入站消息解包；其余 isMeta（caveat / 命令输出）不搜
+        const un = unwrapChannelMessage(text);
+        if (!un) continue;
+        body = un.text;
+        from = un.from;
+      } else {
+        const trimmed = text.trim();
+        // 与 readSessionHistory 同规则：机器产物不当用户消息搜
+        if (!trimmed) continue;
+        if (/^<(task-notification|command-name|command-message|local-command-stdout)>/.test(trimmed)) continue;
+        if (/^\/[\w:-]+$/.test(trimmed)) continue;
+      }
+      const lower = body.toLowerCase();
+      if (!lower.includes(q)) continue;
+      const hit: HistorySearchHit = { seq: i, ts, role: "user", snippet: makeSnippet(body, lower, q) };
+      if (from) hit.from = from;
+      if (rec.isCompactSummary === true) hit.compact = true;
+      hits.push(hit);
+      continue;
+    }
+
+    if (rec.type === "assistant") {
+      const content = rec.message?.content;
+      if (!Array.isArray(content)) continue;
+      const parts: string[] = [];
+      for (const b of content) {
+        if (b?.type === "text" && b.text?.trim()) parts.push(b.text);
+        else if (b?.type === "tool_use" && b.name && isReplyTool(b.name) && typeof b.input?.text === "string") {
+          parts.push(b.input.text);
+        }
+      }
+      if (!parts.length) continue;
+      const body = parts.join("\n");
+      const lower = body.toLowerCase();
+      if (!lower.includes(q)) continue;
+      hits.push({ seq: i, ts, role: "assistant", snippet: makeSnippet(body, lower, q) });
+    }
+  }
+  return hits;
+}

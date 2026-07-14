@@ -514,6 +514,65 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     return apiJson(200, { ok: true, tasks });
   }
 
+  // [fork] GET /api/v1/history/search —— 跨 agent 跨 session 聊天记录全文搜索。
+  //   ?q=<词，≥2 字符>&limit=<1..100，默认 30>&agent=<可选，只搜这个 agent>
+  // 场景：compact 后 agent 忘事 / 用户只剩模糊记忆——对话正文全局检索捞回来。
+  // 覆盖 live + 归档（含已 remove 的 agent，归档在即可搜）。按 session mtime
+  // 降序扫，凑满 3×limit 早停（新会话优先，防全盘扫描拖时长）。
+  if (path === "/history/search" && req.method === "GET") {
+    const q = (url.searchParams.get("q") || "").trim();
+    if (q.length < 2) return apiJson(400, { ok: false, error: "q 至少 2 个字符" });
+    const limitRaw = Number(url.searchParams.get("limit") || 30);
+    const limit = Math.max(1, Math.min(100, Number.isFinite(limitRaw) ? Math.floor(limitRaw) : 30));
+    const agentFilter = url.searchParams.get("agent");
+
+    const { readRegistryAgents } = await import("../lib/registry.js");
+    const { readdirSync } = await import("fs");
+    const { ARCHIVE_ROOT } = await import("../lib/session-archive.js");
+    // scope 内的候选 agent：registry 全量 + 归档目录（已删 agent）+ master（须显式 scope）
+    const candidates = new Set<string>();
+    for (const a of await readRegistryAgents()) {
+      if (agentInScope(principal, a.name)) candidates.add(a.name);
+    }
+    try {
+      for (const d of readdirSync(ARCHIVE_ROOT, { withFileTypes: true })) {
+        if (d.isDirectory() && d.name !== "master" && agentInScope(principal, d.name)) candidates.add(d.name);
+      }
+    } catch { /* 归档目录不存在 = 无归档 */ }
+    if (agentInScope(principal, "master")) candidates.add("master");
+    let names = [...candidates];
+    if (agentFilter) {
+      const want = agentFilter.startsWith("agent-") || agentFilter === "master" ? agentFilter : `agent-${agentFilter}`;
+      if (!agentInScope(principal, agentFilter) && !agentInScope(principal, want)) {
+        return apiJson(403, { ok: false, error: `agent "${agentFilter}" not in token scope` });
+      }
+      names = names.filter((n) => n === want || n === agentFilter);
+    }
+
+    type Hit = { agent: string; sessionId: string; source: string; seq: number; ts: string | null; role: string; snippet: string; from?: string; compact?: boolean };
+    const { searchSessionHistory } = await import("../lib/session-history.js");
+    const all: Hit[] = [];
+    const collectBudget = limit * 3;
+    // 全部候选 session 拉平后按 mtime 降序——最近的对话最可能是要找的
+    const files: { agent: string; sessionId: string; source: string; path: string; mtime: string }[] = [];
+    for (const n of names) {
+      const agent = await findApiAgent(n.replace(/^agent-/, ""));
+      const canonical = agent?.name ?? n;
+      const sessions = await listAgentSessions(canonical, { cwd: agent?.cwd, currentSessionId: agent?.sessionId });
+      for (const s of sessions) files.push({ agent: canonical, sessionId: s.sessionId, source: s.source, path: s.path, mtime: s.mtime });
+    }
+    files.sort((a, b) => b.mtime.localeCompare(a.mtime));
+    for (const f of files) {
+      if (all.length >= collectBudget) break;
+      try {
+        const hits = await searchSessionHistory(f.path, q, { maxHits: Math.min(20, collectBudget - all.length) });
+        for (const h of hits) all.push({ agent: f.agent, sessionId: f.sessionId, source: f.source, ...h });
+      } catch { /* 单文件失败不影响整体 */ }
+    }
+    all.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+    return apiJson(200, { ok: true, query: q, hits: all.slice(0, limit), scanned: files.length });
+  }
+
   // v2.9+ GET /api/v1/agents/:name/history —— session 清单（live + 归档快照）。
   // agent 已被 kill 时归档仍可读（这正是归档存在的意义），所以 registry 查不到
   // 不算 404，降级为只列归档。响应不含服务器路径（path 字段剥掉）。

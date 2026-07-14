@@ -320,3 +320,71 @@ describe("参数校验（拼路径前的白名单）", () => {
     expect(isValidSubagentId("nope")).toBe(false);
   });
 });
+
+// [fork] 聊天记录全文搜索（跨会话搜索端点的解析层）
+describe("searchSessionHistory", () => {
+  const { searchSessionHistory } = require("../src/lib/session-history.js");
+  const dir = mkdtempSync(join(tmpdir(), "cstra-search-"));
+  const file = writeJsonl(dir, "s.jsonl", [
+    { type: "user", timestamp: "2026-07-01T00:01:00Z", message: { content: "我们聊过火山引擎的流式 ASR 方案" } },
+    {
+      type: "assistant",
+      timestamp: "2026-07-01T00:02:00Z",
+      message: {
+        content: [
+          { type: "text", text: "好的，火山引擎的 key 到了我就接" },
+          { type: "tool_use", name: "Bash", input: { command: "echo 火山引擎" } },
+        ],
+      },
+    },
+    // reply 正文可搜
+    {
+      type: "assistant",
+      timestamp: "2026-07-01T00:03:00Z",
+      message: { content: [{ type: "tool_use", name: "mcp__claudestra__reply", input: { text: "ASR 用火山引擎，等 key" } }] },
+    },
+    // channel 包装的入站消息:解包后搜
+    {
+      type: "user",
+      isMeta: true,
+      timestamp: "2026-07-01T00:04:00Z",
+      message: { content: '<channel source="claudestra" chat_id="api:x" user="web-ui">\n记得处理火山引擎的事\n</channel>' },
+    },
+    // compact 摘要:可搜且打标
+    { type: "user", isCompactSummary: true, timestamp: "2026-07-01T00:05:00Z", message: { content: [{ type: "text", text: "早前讨论过火山引擎接入,还没做" }] } },
+    // 机器产物不搜:命令记录 / task-notification
+    { type: "user", timestamp: "2026-07-01T00:06:00Z", message: { content: "<command-name>/compact</command-name><command-message>火山引擎</command-message>" } },
+  ]);
+
+  test("正文命中:user/assistant/reply/channel 解包/compact 摘要", async () => {
+    const hits = await searchSessionHistory(file, "火山引擎");
+    expect(hits.length).toBe(5);
+    expect(hits[0].role).toBe("user");
+    expect(hits.find((h: any) => h.from === "web-ui")).toBeTruthy();
+    expect(hits.find((h: any) => h.compact === true)).toBeTruthy();
+  });
+
+  test("大小写不敏感 + 只搜正文(工具参数命中不算)", async () => {
+    const hits = await searchSessionHistory(file, "asr");
+    expect(hits.length).toBe(2); // user 首条 + reply 正文
+    const cmd = await searchSessionHistory(file, "echo 火山");
+    expect(cmd.length).toBe(0); // 只在 Bash input 里出现 → 不算命中
+  });
+
+  test("snippet 命中词居中 + maxHits 截断", async () => {
+    const long = writeJsonl(dir, "long.jsonl", [
+      { type: "user", timestamp: "2026-07-01T00:01:00Z", message: { content: "x".repeat(500) + "独特关键词" + "y".repeat(500) } },
+    ]);
+    const [hit] = await searchSessionHistory(long, "独特关键词");
+    expect(hit.snippet).toContain("独特关键词");
+    expect(hit.snippet.startsWith("…")).toBe(true);
+    expect(hit.snippet.endsWith("…")).toBe(true);
+    const capped = await searchSessionHistory(file, "火山引擎", { maxHits: 2 });
+    expect(capped.length).toBe(2);
+  });
+
+  test("无命中/短查询返回空", async () => {
+    expect(await searchSessionHistory(file, "不存在的词")).toEqual([]);
+    expect(await searchSessionHistory(file, "")).toEqual([]);
+  });
+});
