@@ -328,6 +328,15 @@ export async function readSessionHistory(
       //   <local-command-stdout>输出</local-command-stdout> → system 轻条目（去 ANSI、截断）
       // 不处理会把原始标签 + ANSI 转义裸渲染成用户气泡（2026-07-12 真机截图）。
       const trimmed = text.trim();
+      // [fork] harness 注入的后台任务完成通知(<task-notification>,裸 user 记录
+      // 不带 isMeta)不是用户打的字——渲染成用户气泡就像「用户发了段 XML」
+      // (2026-07-14 真机截图,master 频道)。取 summary 转 system 轻条目。
+      if (/^<task-notification>/.test(trimmed)) {
+        const sum = /<summary>([\s\S]*?)<\/summary>/.exec(trimmed);
+        const body = sum?.[1]?.trim();
+        all.push({ seq: i, ts, role: "system", text: body ? `⚙️ ${body}` : "⚙️ 后台任务通知" });
+        continue;
+      }
       if (/^<command-(name|message)>/.test(trimmed)) {
         const cmd = /<command-name>(\/[\w:-]+)<\/command-name>/.exec(trimmed);
         if (cmd) all.push({ seq: i, ts, role: "system", text: cmd[1] });
