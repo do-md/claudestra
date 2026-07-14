@@ -289,6 +289,16 @@ async function sessionTailInfo(path: string): Promise<SessionTailInfo | null> {
             const body = typeof c === "string" ? c : "";
             if (/^\s*<(command-name|command-message|local-command-stdout|local-command-caveat)/.test(body)) continue;
           }
+          // restart/resume 回放排队命令时,CC 会产出一条礼节性 assistant
+          // 「No response requested.」——不是真对话,不排除的话每次 restart
+          // 都把该 agent 顶到列表最前(owner 2026-07-14:「重启不算用户真正的会话」)
+          if (rec.type === "assistant") {
+            const c = rec.message?.content;
+            const txt = Array.isArray(c)
+              ? c.filter((b: any) => b?.type === "text").map((b: any) => b.text || "").join("")
+              : typeof c === "string" ? c : "";
+            if (/^\s*No response requested\.?\s*$/.test(txt)) continue;
+          }
           const t = Date.parse(rec.timestamp);
           if (Number.isFinite(t)) convTs = t;
         }
