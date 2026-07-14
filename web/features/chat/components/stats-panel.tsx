@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useChatStore } from "../chat-store";
 import { ctxLevel, CTX_WINDOW } from "../ctx-level";
+import { fmtAgo } from "../fmt-time";
 
 /**
  * 用量/上下文看板（2026-07-14 owner：context 要成体系,web 看板可以更详细）。
@@ -48,14 +49,8 @@ function fmtTok(n: number): string {
   return String(n);
 }
 
-function fmtRel(ts?: number | null): string {
-  if (!ts) return "";
-  const d = new Date(ts);
-  const now = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  if (d.toDateString() === now.toDateString()) return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  return `${d.getMonth() + 1}-${pad(d.getDate())}`;
-}
+// 相对时间与侧栏列表统一口径(x秒前/x分钟前/x小时x分前/x天前)
+const fmtRel = fmtAgo;
 
 export function StatsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const agents = useChatStore((s) => s.state.agents);

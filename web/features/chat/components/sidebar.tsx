@@ -1,11 +1,12 @@
 "use client";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
 import { SettingsModal } from "./settings-modal";
 import { InstallBanner } from "./install-banner";
 import { StatsPanel } from "./stats-panel";
 import { ctxLevel, CTX_WINDOW } from "../ctx-level";
+import { fmtAgo } from "../fmt-time";
 
 function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: boolean }) {
   if (status === "active") {
@@ -24,19 +25,6 @@ function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: bo
   );
 }
 
-/** 最近对话时间：当天 HH:mm，昨天，今年 M-D，跨年 YYYY-M-D。 */
-function fmtLastActive(ts?: number | null): string {
-  if (!ts) return "";
-  const d = new Date(ts);
-  const now = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  if (d.toDateString() === now.toDateString()) return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  const yest = new Date(now);
-  yest.setDate(now.getDate() - 1);
-  if (d.toDateString() === yest.toDateString()) return "昨天";
-  if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}-${pad(d.getDate())}`;
-  return `${d.getFullYear()}-${d.getMonth() + 1}-${pad(d.getDate())}`;
-}
 
 /**
  * 会话列表行——纯选择项。会话操作（清空/重启/停止）已迁到会话详情顶栏
@@ -55,7 +43,9 @@ function AgentRow({
   onSelect: () => void;
 }) {
   const store = useChatStoreApi();
-  const lastAt = fmtLastActive(a.lastActivityTs);
+  // 相对时间(owner 2026-07-14):x秒前/x分钟前/x小时x分前/x天前;
+  // Sidebar 的 30s tick 让它保鲜
+  const lastAt = fmtAgo(a.lastActivityTs);
   // 左滑删除(owner 2026-07-14:「临时起的 agent 污染列表,永久删除」):
   // 横滑露出红色删除钮,二次点击确认后 removeAgent(kill + registry 条目删,
   // 归档保留)。纵向意图让路给列表滚动;master/mock 不可删。
@@ -222,6 +212,12 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const ready = useChatStore((s) => s.state.agentsReady);
   const active = useChatStore((s) => s.state.activeAgent);
   const streaming = useChatStore((s) => s.state.streaming);
+  // 相对时间标签保鲜:30s 心跳整列表重渲染(行数少,代价可忽略)
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((v) => v + 1), 30_000);
+    return () => clearInterval(t);
+  }, []);
   // agent 搜索（2026-07-13 owner）：名称/用途 大小写不敏感即时过滤，纯前端
   const [query, setQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
