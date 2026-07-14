@@ -9,6 +9,28 @@ import { ctxLevel, CTX_WINDOW } from "../ctx-level";
 import { fmtAgo } from "../fmt-time";
 import { ChatHitRow, type ChatSearchHit } from "./search-hits";
 
+/** 大总管图标（lucide network,调度/编排语义）——替代 👑(owner 2026-07-15:
+ *  「皇冠不要了,显得更专业一点」)。 */
+function MasterIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="16" y="16" width="6" height="6" rx="1" />
+      <rect x="2" y="16" width="6" height="6" rx="1" />
+      <rect x="9" y="2" width="6" height="6" rx="1" />
+      <path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3" />
+      <path d="M12 12V8" />
+    </svg>
+  );
+}
+
 function StatusDot({ status, busy }: { status: AgentSession["status"]; busy?: boolean }) {
   if (status === "active") {
     // 运行中：实心核心点 + 柔和呼吸外晕（cstra-breathe，替换生硬的 animate-ping）。
@@ -188,9 +210,7 @@ function AgentRow({
           }}
         >
           {a.pinnedMaster ? (
-            <span className="text-base sm:text-sm" title="大总管（总控）">
-              👑
-            </span>
+            <MasterIcon className="size-4 shrink-0 text-base-content/60" />
           ) : (
             <StatusDot status={a.status} busy={a.busy || busyLive} />
           )}
@@ -456,7 +476,13 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
               onSelect();
             }}
           >
-            <span className="text-lg">👑</span>
+            <span
+              className={`grid size-9 shrink-0 place-items-center rounded-lg ${
+                active === master.name ? "bg-primary/15 text-primary" : "bg-base-300/60 text-base-content/65"
+              }`}
+            >
+              <MasterIcon className="size-[18px]" />
+            </span>
             <span className="flex min-w-0 flex-1 flex-col">
               <span className="truncate text-[15px] font-medium sm:text-sm">{master.displayName}</span>
               <span className="truncate text-[11px] text-base-content/45">总控调度 · 新建会话找它</span>

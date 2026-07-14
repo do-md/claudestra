@@ -50,7 +50,7 @@ export function ChatHitRow({
   onOpen?: () => void;
   showAgent?: boolean;
 }) {
-  const agentLabel = hit.agent === "__master__" ? "👑 大总管" : hit.agent;
+  const agentLabel = hit.agent === "__master__" ? "大总管" : hit.agent;
   return (
     <button
       className={`flex w-full flex-col gap-1 rounded-lg px-2.5 py-2 text-left transition-colors ${
