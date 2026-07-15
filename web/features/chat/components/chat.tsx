@@ -264,6 +264,11 @@ function ChatInner() {
     // handler,5s 节流防连发触发多次对齐。
     let lastAlign = 0;
     const onVisible = () => {
+      // 进后台时刻是回前台快路径的判据(<5min → SSE 断点重放,不全量重拉)
+      if (document.visibilityState === "hidden") {
+        store.noteHidden();
+        return;
+      }
       if (document.visibilityState !== "visible") return;
       const now = Date.now();
       if (now - lastAlign < 5_000) return;

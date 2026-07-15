@@ -1,6 +1,6 @@
 export const runtime = "nodejs";
 
-import { SSE_DONE, type WebStreamEvent, type WebAuqQuestion, type WebComponentRow } from "@/lib/chat/events";
+import { SSE_DONE, type WebStreamEvent, type AnchoredStreamEvent, type WebAuqQuestion, type WebComponentRow } from "@/lib/chat/events";
 import { apiAgentName, bridgeGet, bridgeAuthHeaders, BRIDGE } from "@/lib/chat/bridge-api";
 import { isAuthed } from "@/lib/api-auth";
 
@@ -151,16 +151,22 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const agent = url.searchParams.get("agent");
   if (!agent) return new Response("missing agent", { status: 400 });
+  // 断点续传:前端带上最后收到的 eid → bridge 环形缓冲重放 seq>since 的事件,
+  // 回前台/断流重连不用全量重拉历史(owner 2026-07-16「catch up 更快更丝滑」)
+  const since = url.searchParams.get("since");
   const apiName = apiAgentName(agent);
   // 事件里的 agent 字段是 registry 名（agent-xxx）或 "master"
   const nameVariants = new Set([apiName, `agent-${apiName}`]);
 
   let upstream: Response;
   try {
-    upstream = await fetch(`${BRIDGE}/api/v1/events`, {
-      headers: { ...bridgeAuthHeaders(), Accept: "text/event-stream" },
-      signal: request.signal,
-    });
+    upstream = await fetch(
+      `${BRIDGE}/api/v1/events${since && /^\d+$/.test(since) ? `?since=${since}` : ""}`,
+      {
+        headers: { ...bridgeAuthHeaders(), Accept: "text/event-stream" },
+        signal: request.signal,
+      }
+    );
   } catch (e) {
     const cause = (e as { cause?: unknown }).cause;
     console.error(`[stream] Bridge events fetch 失败 agent=${agent}:`, (e as Error).message, "| cause:", cause);
@@ -179,7 +185,7 @@ export async function GET(request: Request) {
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const send = (evt: WebStreamEvent | typeof SSE_DONE) => {
+      const send = (evt: AnchoredStreamEvent | typeof SSE_DONE) => {
         try {
           const payload = evt === SSE_DONE ? SSE_DONE : JSON.stringify(evt);
           controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
@@ -253,7 +259,8 @@ export async function GET(request: Request) {
             }
             if (!nameVariants.has(evt.agent)) continue;
             const mapped = translate(evt);
-            if (mapped) send(mapped);
+            // eid = bridge seq:前端的断点续传锚(下次重连 ?since=<eid>)
+            if (mapped) send({ ...mapped, eid: evt.seq });
           }
         }
       } catch {

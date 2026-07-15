@@ -439,13 +439,25 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   /** 断流自动重连的退避（ms）：流存活 ≥10s 视为曾健康、重置 3s；快速反复断则翻倍封顶 30s。 */
   private reconnectDelay = 3_000;
 
-  /** 打开某 agent 的持久 SSE 输出流。会话切换 / 重连共用。 */
-  private async openStream(name: string) {
+  /** 断点续传锚:最后收到的 bridge 事件 seq(BFF 附在每条事件的 eid 上)。
+   *  重连带 ?since=<seq> → bridge 环形缓冲重放错过的事件,不用全量重拉历史。 */
+  private lastEventSeq = 0;
+  private lastEventAgent = "";
+  /** 页面最近一次进后台的时刻(chat.tsx visibilitychange hidden 时记)。 */
+  private hiddenAt = 0;
+
+  public noteHidden() {
+    this.hiddenAt = Date.now();
+  }
+
+  /** 打开某 agent 的持久 SSE 输出流。会话切换 / 重连共用。
+   *  since:断点续传锚——bridge 重放 seq>since 的缓冲事件(错过的直播直接补)。 */
+  private async openStream(name: string, since?: number) {
     const gen = ++this.streamGen;
     const startedAt = Date.now();
     try {
       const res = await fetch(
-        `/api/chat/stream?agent=${encodeURIComponent(name)}`
+        `/api/chat/stream?agent=${encodeURIComponent(name)}${since ? `&since=${since}` : ""}`
       );
       if (res.status === 401) return this.gotoLogin();
       if (gen !== this.streamGen) return; // 已切走
@@ -454,6 +466,17 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       this.streamReader = reader;
       await consumeSSEStream(reader, (evt) => {
         if (gen !== this.streamGen) return;
+        const eid = (evt as { eid?: number }).eid;
+        if (typeof eid === "number" && eid > 0) {
+          // seq 倒退 = bridge 重启过(seq 清零 + 环形缓冲清空,重启窗口内的
+          // 事件永久丢失)→ 全量重拉历史补缺口,一次即可(之后 seq 恢复单调)
+          if (this.lastEventAgent === name && eid < this.lastEventSeq) {
+            const g = ++this.openGen;
+            void this.loadMessages(name, g);
+          }
+          this.lastEventSeq = eid;
+          this.lastEventAgent = name;
+        }
         processStreamEvent(this, evt);
       });
     } catch {
@@ -491,7 +514,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         setTimeout(() => {
           if (gen !== this.streamGen || this.state.activeAgent !== name) return;
           if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
-          this.maybeReconnect();
+          // 断流重连:断档只有退避的 3-30s,带断点锚快路径重连(重放补事件)
+          this.maybeReconnect({ fast: true });
         }, this.reconnectDelay);
       }
     }
@@ -525,10 +549,20 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
    * 重连流（openStream 连上后 BFF /pending 补 thinking 态，把 composer 锁态也校准：
    * 仍在回合则重锁「停止」，已结束则保持解锁）。
    */
-  public maybeReconnect() {
+  public maybeReconnect(opts?: { fast?: boolean }) {
     const name = this.state.activeAgent;
     if (!name) return;
     this.detachActiveStream();
+    // 快路径(owner 2026-07-16「catch up 更快更丝滑」):短暂离开(<5min)且有
+    // 断点锚 → 只重连流带 ?since=<seq>,bridge 环形缓冲把错过的事件直接重放,
+    // 跳过全量历史往返(限流窗口下动辄数秒)。长时间后台/无锚 → 事件可能被挤出
+    // 缓冲(每 agent 500 条),仍走全量重拉保正确。断流自动重连(fast:true)断档
+    // 只有退避的 3-30s,恒走快路径。bridge 重启的缺口由 seq 倒退检测兜底。
+    const shortAway = this.hiddenAt > 0 && Date.now() - this.hiddenAt < 5 * 60_000;
+    if ((opts?.fast || shortAway) && this.lastEventAgent === name && this.lastEventSeq > 0) {
+      void this.openStream(name, this.lastEventSeq);
+      return;
+    }
     const gen = ++this.openGen;
     void this.loadMessages(name, gen).then(() => {
       if (gen !== this.openGen) return;

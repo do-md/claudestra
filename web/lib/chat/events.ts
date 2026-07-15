@@ -93,4 +93,9 @@ export type WebStreamEvent =
   /** compact 完成（jsonl compact_boundary）：插系统分隔线 + ctx 徽章即时回落。 */
   | { t: "compact"; pre: number; post: number };
 
+/** 带 bridge 事件锚点的流事件:eid = BridgeEvent.seq(event-bus 单调递增),
+ *  前端记录最后收到的 eid,断线/回前台重连时 ?since=<eid> 走环形缓冲重放
+ *  (Last-Event-ID 语义)——错过的事件直接补,不用全量重拉历史。 */
+export type AnchoredStreamEvent = WebStreamEvent & { eid?: number };
+
 export const SSE_DONE = "[DONE]";
