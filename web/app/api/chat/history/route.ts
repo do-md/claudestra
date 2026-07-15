@@ -93,17 +93,21 @@ function extractAttachments(text: string): { content: string; attachments?: Chat
  * 同一个气泡。这里让历史对齐实时：连续的 assistant 记录累积进一个气泡（text 用
  * 空行拼接、工具按序收集），遇到 user / system 分隔线 / compact 边界就断开分组。
  */
-/** 在带组件的气泡里找该点击对应的 choiceId（不在组里返回 null）。 */
+/** 在带组件的气泡里找该点击对应的 choiceId + 人类可读 label（不在组里返回 null）。 */
 function matchClickedChoice(
   bubble: ChatMessage,
   btnId: string | null,
   selId: string | null,
   selValue: string | null
-): string | null {
+): { choiceId: string; label: string } | null {
   for (const row of bubble.replyComponents ?? []) {
-    if (row.type === "buttons" && btnId && row.buttons.some((b) => b.id === btnId)) return btnId;
-    if (row.type === "select" && selId && row.id === selId && selValue && row.options.some((o) => o.value === selValue)) {
-      return `${selId}:${selValue}`;
+    if (row.type === "buttons" && btnId) {
+      const btn = row.buttons.find((b) => b.id === btnId);
+      if (btn) return { choiceId: btnId, label: btn.label };
+    }
+    if (row.type === "select" && selId && row.id === selId && selValue) {
+      const opt = row.options.find((o) => o.value === selValue);
+      if (opt) return { choiceId: `${selId}:${selValue}`, label: opt.label };
     }
   }
   return null;
@@ -153,20 +157,28 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
         continue;
       }
       const from = m.from && !SELF_FROM.has(m.from) ? m.from : undefined;
-      // 按钮/选单点击的机器 payload → 友好化（live 时显示的是 label，历史里只有 id），
-      // 并回填最近那条带组件气泡的 replyClickedId（已答态跨刷新持久）
+      // 按钮/选单点击的机器 payload → 渲染成组件里的 label，与 live 乐观气泡**同形**
+      // （形态不一致会让乐观/历史对账失败,乐观 label 气泡被当「未送达」挂到列表
+      // 末尾——出现在后续回复之后,2026-07-16 真机截图）;组件气泡不在本页时才
+      // 兜底 🔘 id。并回填该气泡的 replyClickedId（已答态跨刷新持久）。
       const btnMatch = (m.text || "").match(/^\[button:([\w-]+)\]$/);
       const selMatch = (m.text || "").match(/^\[select:([\w-]+):(.+)\]$/);
-      if ((btnMatch || selMatch) && lastWithComponents && !lastWithComponents.replyClickedId) {
+      let clickLabel: string | null = null;
+      if ((btnMatch || selMatch) && lastWithComponents) {
         const clicked = matchClickedChoice(
           lastWithComponents,
           btnMatch?.[1] ?? null,
           selMatch?.[1] ?? null,
           selMatch?.[2] ?? null
         );
-        if (clicked) lastWithComponents.replyClickedId = clicked;
+        if (clicked) {
+          clickLabel = clicked.label;
+          if (!lastWithComponents.replyClickedId) lastWithComponents.replyClickedId = clicked.choiceId;
+        }
       }
-      const raw = btnMatch ? `🔘 ${btnMatch[1]}` : selMatch ? `🔘 ${selMatch[2]}` : m.text || "";
+      const raw = btnMatch || selMatch
+        ? clickLabel ?? `🔘 ${btnMatch ? btnMatch[1] : selMatch![2]}`
+        : m.text || "";
       const { content, attachments } = extractAttachments(raw);
       out.push({ id: `h${m.seq}`, role: "user", content, ts: m.ts, from, ...(attachments ? { attachments } : {}) });
       continue;

@@ -389,13 +389,22 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           if (m.ts && Date.now() - Date.parse(m.ts) > 30 * 60_000) return false;
           const t = norm(m.content);
           // wire 口径:按钮点击的乐观气泡显示 label,jsonl 里落的是 [button:<id>]
-          // ——不看 wire 就永远对不上,气泡挂满 30 分钟(2026-07-14 真机截图)
+          // ——不看 wire 就永远对不上,气泡挂满 30 分钟(2026-07-14 真机截图)。
+          // history route 会把点击渲染成 label(与乐观气泡同形,t 相等即中)或
+          // 兜底「🔘 id」——第三种形态也要认,否则对账再度失败(2026-07-16)
           const w = m.wire?.trim();
+          const friendly = w
+            ? (w.match(/^\[button:([\w-]+)\]$/)?.[1] ??
+                w.match(/^\[select:[\w-]+:(.+)\]$/)?.[1] ??
+                null)
+            : null;
           const idx = tail.findIndex(
             (h, i) =>
               !used.has(i) &&
               h.role === "user" &&
-              (norm(h.content) === t || (!!w && h.content.includes(w)))
+              (norm(h.content) === t ||
+                (!!w && h.content.includes(w)) ||
+                (!!friendly && norm(h.content) === `🔘 ${friendly}`))
           );
           if (idx >= 0) {
             used.add(idx);
@@ -554,6 +563,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         })
       : undefined;
     this.flushPendingText(); // 用户气泡排在已缓冲的叙述之后
+    const optimisticId = this.nextId();
     this.produce((s) => {
       // 流式中插话：给当前流式助手气泡定稿，用户插入独立成段（后续输出另起气泡），
       // 避免把「插入前的回复」和「插入后的回复」挤进同一个气泡显得错乱。
@@ -562,7 +572,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         if (last?.role === "assistant" && last.streamed) last.streamed = false;
       }
       s.messages.push({
-        id: this.nextId(),
+        id: optimisticId,
         role: "user",
         content: display,
         ts: new Date().toISOString(),
@@ -616,6 +626,11 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           this.produce((s) => {
             s.streaming = false;
             s.awaitingChunk = false;
+            // 撤掉乐观 user 气泡:slash 在 jsonl 里落 <command-name> → 历史渲染
+            // 成 system 分隔线,不是 user 消息——对账(只扫 user)永远配不上,
+            // 气泡会在每次 realign 后挂到列表末尾(与按钮点击同款错乱)。
+            // 信息由下面的注入提示线承载,刷新后与历史形态一致。
+            s.messages = s.messages.filter((m) => m.id !== optimisticId);
             s.messages.push({
               id: this.nextId(),
               role: "system",
