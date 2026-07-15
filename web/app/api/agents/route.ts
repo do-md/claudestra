@@ -26,7 +26,7 @@ export async function POST(request: Request) {
   if (!(await isAuthed(request))) {
     return NextResponse.json({ error: "未登录" }, { status: 401 });
   }
-  const { name, dir, purpose } = await request.json().catch(() => ({}));
+  const { name, dir, purpose, model, effort } = await request.json().catch(() => ({}));
   if (!name || !dir || typeof name !== "string" || typeof dir !== "string") {
     return NextResponse.json({ error: "name 和 dir 不能为空" }, { status: 400 });
   }
@@ -34,7 +34,14 @@ export async function POST(request: Request) {
     // create 会 spawn Claude Code，可能要 10-30s
     const result = await bridgePost(
       "/agents",
-      { name: name.trim(), dir: dir.trim(), purpose },
+      {
+        name: name.trim(),
+        dir: dir.trim(),
+        purpose,
+        // 可选钉模型/effort(session 级 CLI flag,不碰全局 settings.json)
+        ...(typeof model === "string" && model.trim() ? { model: model.trim() } : {}),
+        ...(typeof effort === "string" && effort.trim() ? { effort: effort.trim() } : {}),
+      },
       { timeoutMs: 90_000 }
     );
     return NextResponse.json(result);

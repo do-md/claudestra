@@ -2,8 +2,29 @@
 import { useState } from "react";
 import { useChatStoreApi } from "../chat-store";
 
+/** 模型选项(值 = manager 侧别名,空 = 跟随全局 settings.json 默认)。 */
+const MODEL_OPTIONS = [
+  { value: "", label: "默认（跟随全局）" },
+  { value: "fable", label: "Fable 5" },
+  { value: "opus", label: "Opus 4.8" },
+  { value: "sonnet", label: "Sonnet 4.6" },
+  { value: "haiku", label: "Haiku 4.5" },
+] as const;
+
+/** Effort 选项(经 --effort 传 CC,session 级,不写全局默认)。 */
+const EFFORT_OPTIONS = [
+  { value: "", label: "默认（跟随全局）" },
+  { value: "low", label: "low" },
+  { value: "medium", label: "medium" },
+  { value: "high", label: "high" },
+  { value: "xhigh", label: "xhigh" },
+  { value: "max", label: "max" },
+] as const;
+
 /**
- * 新建 agent 弹窗：填 name / dir / purpose → store.createAgent → Bridge runManager create。
+ * 新建 agent 弹窗：填 name / dir / purpose (+可选钉模型/effort) → store.createAgent
+ * → Bridge runManager create。选了模型/effort 会写进 registry,restart 也保持——
+ * 与 TUI /model、/effort 不同,不会改写全局 settings.json(owner 2026-07-16)。
  * daisyUI modal（遵 prin b8ce13：只用 DaisyUI + Tailwind）。
  */
 export function NewAgentModal({
@@ -17,6 +38,8 @@ export function NewAgentModal({
   const [name, setName] = useState("");
   const [dir, setDir] = useState("");
   const [purpose, setPurpose] = useState("");
+  const [model, setModel] = useState("");
+  const [effort, setEffort] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -26,6 +49,8 @@ export function NewAgentModal({
     setName("");
     setDir("");
     setPurpose("");
+    setModel("");
+    setEffort("");
     setError("");
     setBusy(false);
   };
@@ -45,7 +70,10 @@ export function NewAgentModal({
     }
     setBusy(true);
     setError("");
-    const res = await store.createAgent(n, d, purpose.trim() || undefined);
+    const res = await store.createAgent(n, d, purpose.trim() || undefined, {
+      model: model || undefined,
+      effort: effort || undefined,
+    });
     setBusy(false);
     if (res.ok) {
       reset();
@@ -98,6 +126,41 @@ export function NewAgentModal({
               }}
             />
           </label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="form-control">
+              <span className="label-text mb-1 text-sm">模型</span>
+              <select
+                className="select select-bordered select-sm w-full"
+                value={model}
+                disabled={busy}
+                onChange={(e) => setModel(e.target.value)}
+              >
+                {MODEL_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="form-control">
+              <span className="label-text mb-1 text-sm">Effort</span>
+              <select
+                className="select select-bordered select-sm w-full"
+                value={effort}
+                disabled={busy}
+                onChange={(e) => setEffort(e.target.value)}
+              >
+                {EFFORT_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <p className="-mt-1 text-[11px] leading-snug opacity-45">
+            只钉这个 agent（重启保持），不改全局默认——和终端里 /model、/effort 会写全局不同。
+          </p>
         </div>
 
         {error && (

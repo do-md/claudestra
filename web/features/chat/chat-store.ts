@@ -221,13 +221,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   public async createAgent(
     name: string,
     dir: string,
-    purpose?: string
+    purpose?: string,
+    opts?: { model?: string; effort?: string }
   ): Promise<{ ok: boolean; error?: string; agent?: string }> {
     try {
       const res = await fetch("/api/agents", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, dir, purpose }),
+        body: JSON.stringify({ name, dir, purpose, model: opts?.model, effort: opts?.effort }),
       });
       if (res.status === 401) {
         this.gotoLogin();

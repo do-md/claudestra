@@ -1040,8 +1040,16 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     const name = String(body?.name || "").trim();
     const dir = String(body?.dir || "").trim();
     const purpose = String(body?.purpose || "").trim();
-    if (!name || !dir) return apiJson(400, { ok: false, error: 'body must be {"name", "dir", "purpose"?}' });
-    const r = await runManager(...(purpose ? ["create", name, dir, purpose] : ["create", name, dir]));
+    // v2.10+ 可选钉模型/effort(owner 2026-07-16:「新建 agent 加选模型和 Effort」)。
+    // 透传给 manager create --model/--effort,校验(别名/合法档位)由 manager 做。
+    const model = String(body?.model || "").trim();
+    const effort = String(body?.effort || "").trim();
+    if (!name || !dir) return apiJson(400, { ok: false, error: 'body must be {"name", "dir", "purpose"?, "model"?, "effort"?}' });
+    const createArgs = ["create", name, dir];
+    if (purpose) createArgs.push(purpose);
+    if (model) createArgs.push("--model", model);
+    if (effort) createArgs.push("--effort", effort);
+    const r = await runManager(...createArgs);
     return apiJson(r?.ok ? 200 : 500, r ?? { ok: false, error: "manager create failed" });
   }
 
