@@ -44,6 +44,7 @@ import { clearSafetyTimer } from "./discord-adapter.js";
 import { recordMetric } from "../lib/metrics.js";
 import { commandsForAgent, resolveWebInvocation, isProjectSkillForOtherAgent } from "./slash-registry.js";
 import { projectsSlug } from "../lib/jsonl-cost.js";
+import { resolveModelAlias, isKnownEffort, KNOWN_EFFORT_LEVELS } from "../lib/claude-launch.js";
 
 // [fork] master 不在 registry，从 env 读其控制频道 id（各端点的 master 特判用）
 const CONTROL_CHANNEL_ID = process.env.CONTROL_CHANNEL_ID || "";
@@ -1051,6 +1052,63 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     if (effort) createArgs.push("--effort", effort);
     const r = await runManager(...createArgs);
     return apiJson(r?.ok ? 200 : 500, r ?? { ok: false, error: "manager create failed" });
+  }
+
+  // [fork] GET/PUT /api/v1/config/claude-defaults —— 全局默认模型/effort 管理
+  // (owner 2026-07-16:「设置里可以管理全局 model 和 effort」)。读写
+  // ~/.claude/settings.json 的 model / effortLevel 两个字段,其余字段原样保留。
+  // 影响所有不带 --model/--effort 的新 session(含终端里直接开的 claude)。
+  if (path === "/config/claude-defaults") {
+    if (!principal.agents.includes("*")) {
+      return apiJson(403, { ok: false, error: "claude-defaults requires a full-scope token" });
+    }
+    const settingsPath = `${process.env.HOME}/.claude/settings.json`;
+    if (req.method === "GET") {
+      try {
+        const s = JSON.parse(await Bun.file(settingsPath).text());
+        return apiJson(200, {
+          ok: true,
+          model: typeof s.model === "string" ? s.model : null,
+          effort: typeof s.effortLevel === "string" ? s.effortLevel : null,
+        });
+      } catch (e) {
+        return apiJson(500, { ok: false, error: `读取 settings.json 失败: ${(e as Error).message}` });
+      }
+    }
+    if (req.method === "PUT") {
+      let body: any;
+      try {
+        body = await req.json();
+      } catch {
+        return apiJson(400, { ok: false, error: "invalid JSON body" });
+      }
+      const model = typeof body?.model === "string" ? body.model.trim() : undefined;
+      const effort = typeof body?.effort === "string" ? body.effort.trim() : undefined;
+      if (model === undefined && effort === undefined) {
+        return apiJson(400, { ok: false, error: 'body must contain "model" and/or "effort"' });
+      }
+      if (effort !== undefined && effort !== "" && !isKnownEffort(effort)) {
+        return apiJson(400, { ok: false, error: `未知 effort: "${effort}"。可用: ${KNOWN_EFFORT_LEVELS.join(", ")}` });
+      }
+      try {
+        // 重读-改字段-写回:只动 model/effortLevel,别的字段(hooks 等)原样保留
+        const s = JSON.parse(await Bun.file(settingsPath).text());
+        if (model !== undefined) {
+          if (model === "") delete s.model;
+          else s.model = resolveModelAlias(model);
+        }
+        if (effort !== undefined) {
+          if (effort === "") delete s.effortLevel;
+          else s.effortLevel = effort;
+        }
+        await Bun.write(settingsPath, JSON.stringify(s, null, 2) + "\n");
+        recordMetric("claude_defaults_updated", { meta: { model: s.model, effort: s.effortLevel } });
+        return apiJson(200, { ok: true, model: s.model ?? null, effort: s.effortLevel ?? null });
+      } catch (e) {
+        return apiJson(500, { ok: false, error: `写入 settings.json 失败: ${(e as Error).message}` });
+      }
+    }
+    return apiJson(405, { ok: false, error: "GET / PUT only" });
   }
 
   // [fork] POST /api/v1/agents/:name/kill | /restart | /remove —— 生命周期（仅全权 token）

@@ -28,7 +28,9 @@ export type MetricEvent =
   | "auq_cancel"        // AskUserQuestion 回传（取消）
   | "agent_wedged"      // wedge watcher 报警
   | "error"
-  | "cron_run";
+  | "cron_run"
+  | "api_slash"                 // [fork] Web slash 直通注入
+  | "claude_defaults_updated";  // [fork] 全局默认模型/effort 变更
 
 export interface MetricRecord {
   ts: string;                   // ISO 8601

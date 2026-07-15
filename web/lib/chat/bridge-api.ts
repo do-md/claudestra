@@ -49,10 +49,10 @@ export async function bridgeGet<T = Record<string, unknown>>(
 export async function bridgePost<T = Record<string, unknown>>(
   path: string,
   body: unknown,
-  opts?: { timeoutMs?: number }
+  opts?: { timeoutMs?: number; method?: "POST" | "PUT" }
 ): Promise<T> {
   const res = await fetch(`${BRIDGE}/api/v1${path}`, {
-    method: "POST",
+    method: opts?.method ?? "POST",
     headers: { "Content-Type": "application/json", ...bridgeAuthHeaders() },
     body: JSON.stringify(body ?? {}),
     signal: AbortSignal.timeout(opts?.timeoutMs ?? 60_000),

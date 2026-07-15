@@ -50,6 +50,8 @@ import {
   isKnownPermissionMode,
   resolveModelAlias,
   listModelAliases,
+  KNOWN_EFFORT_LEVELS,
+  isKnownEffort,
 } from "./lib/claude-launch.js";
 import { printTmuxGuide } from "./lib/tmux-guide.js";
 import { projectsSlug } from "./lib/jsonl-cost.js";
@@ -397,10 +399,6 @@ function extractPermFlags(args: string[]): {
   return { rest, preset, disallowedRaw };
 }
 
-const KNOWN_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "auto"] as const;
-function isKnownEffort(e: string): boolean {
-  return (KNOWN_EFFORT_LEVELS as readonly string[]).includes(e);
-}
 
 /** 从 argv 提取 --effort <level>，支持 --effort=foo */
 function extractEffortFlag(args: string[]): { rest: string[]; effort?: string } {

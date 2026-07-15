@@ -147,6 +147,13 @@ export function resolveModelAlias(m: string): string {
   return MODEL_ALIASES[key] || m.trim();
 }
 
+/** Claude Code --effort / settings.json effortLevel 的合法档位。 */
+export const KNOWN_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max", "auto"] as const;
+
+export function isKnownEffort(e: string): boolean {
+  return (KNOWN_EFFORT_LEVELS as readonly string[]).includes(e);
+}
+
 /** 展示用：列出所有已知别名 + 对应 id。 */
 export function listModelAliases(): Array<{ alias: string; model: string }> {
   return Object.entries(MODEL_ALIASES).map(([alias, model]) => ({ alias, model }));
