@@ -871,13 +871,24 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         }
         break;
       }
-      // thinking 期被抢占:回合还没吐出任何流式气泡,无处标黄 → 插一条与历史
-      // 同款的中断系统线(SystemDivider 渲染成黄⊘)。只跳过触发打断的最后一条
-      // user——连发场景第 N 条打断的是第 N-1 条开启的回合,线要落在两条之间;
-      // 跳过整个 user 块会把线错插到第一条之前(2026-07-14 temp 实测)。
+      // thinking 期被打断:回合还没吐出任何流式气泡,无处标黄 → 插一条与历史
+      // 同款的中断系统线(SystemDivider 渲染成黄⊘)。插线位置按场景分:
+      // - 连发抢占:末尾 user 是触发打断的新消息(刚乐观 push,<3s),线落它
+      //   **前面**(两句之间,2026-07-14 temp 实测);
+      // - 手动「■ 停止」:末尾 user 是被打断回合的发起者(更早发出),线落它
+      //   **后面**——一刀切跳过会把线错插到发起消息之前(2026-07-15 真机:
+      //   发一句→按停止→补一句,线跑到第一句上面,timeline 错乱)。
+      // 两种 done(interrupt) 事件形状相同,用「末尾 user 的新鲜度」区分。
       if (interrupted && !marked) {
         let idx = s.messages.length;
-        if (idx > 0 && s.messages[idx - 1].role === "user") idx--;
+        const tail = s.messages[idx - 1];
+        if (
+          tail?.role === "user" &&
+          tail.ts &&
+          Date.now() - Date.parse(tail.ts) < 3000
+        ) {
+          idx--;
+        }
         s.messages.splice(idx, 0, {
           id: this.nextId(),
           role: "system",
