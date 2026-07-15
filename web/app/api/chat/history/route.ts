@@ -119,6 +119,10 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
   for (const m of items) {
     // compact 生成的长摘要不是真实用户输入（guide §6 建议默认折叠），v1 先不展示
     if (m.compactSummary) continue;
+    // CRLF 归一：channel 注入链路会把 \n 变 \r\n,而前端乐观消息是 textarea 的
+    // \n——不归一,乐观/历史对账精确匹配必失败 → 同一条消息双份渲染
+    // (2026-07-15 真机截图,qingniao-backend)
+    if (m.text) m.text = m.text.replace(/\r\n?/g, "\n");
 
     if (m.role === "system") {
       // system 级事件（compact 边界 / 斜杠命令记录 / 命令输出）→ 居中分隔条，

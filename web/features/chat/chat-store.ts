@@ -380,10 +380,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         // 逐条消费匹配(同文本连发两条也各自对账),30 分钟后不再保全。
         const tail = history.slice(-80);
         const used = new Set<number>();
+        // CRLF/空白归一后再比——channel 注入链路把 \n 变 \r\n,精确匹配失败
+        // 会让乐观条+历史条双份并存(2026-07-15 真机;history route 已归一,
+        // 这里再归一防其它来源差异)
+        const norm = (x: string) => x.replace(/\r\n?/g, "\n").trim();
         const pending = s.messages.filter((m) => {
           if (!m.local || m.role !== "user") return false;
           if (m.ts && Date.now() - Date.parse(m.ts) > 30 * 60_000) return false;
-          const t = m.content.trim();
+          const t = norm(m.content);
           // wire 口径:按钮点击的乐观气泡显示 label,jsonl 里落的是 [button:<id>]
           // ——不看 wire 就永远对不上,气泡挂满 30 分钟(2026-07-14 真机截图)
           const w = m.wire?.trim();
@@ -391,7 +395,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
             (h, i) =>
               !used.has(i) &&
               h.role === "user" &&
-              (h.content.trim() === t || (!!w && h.content.includes(w)))
+              (norm(h.content) === t || (!!w && h.content.includes(w)))
           );
           if (idx >= 0) {
             used.add(idx);

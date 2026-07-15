@@ -106,13 +106,20 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
 
 /** 历史 / 定稿后的工具行：可展开看完整入参详情（detail，老数据回退摘要）。
  *  带边框卡片样式,与流式态/bg 任务卡统一（2026-07-13 owner 拍板:无边框
- *  和正文混在一起;此前「去边框统一」方向反了）。 */
+ *  和正文混在一起;此前「去边框统一」方向反了）。
+ *  详情子树**展开才渲染**（2026-07-15 滑动卡顿刀）:非受控 details 收起时
+ *  DOM 依然全量存在——几百张卡 × 高亮后数百 span = 数万节点压垮 iOS 滚动
+ *  合成;高亮计算也在首渲全量执行。 */
 const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallView }) {
   const summary = cleanSummary(tool.summary);
   const err = tool.state === "error";
+  const [open, setOpen] = useState(false);
   return (
-    <details className={`group rounded-lg border [&>summary]:list-none ${err ? "border-error/30 bg-error/[0.06]" : "border-info/25 bg-info/[0.06]"}`}>
-      <summary className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs">
+    <div className={`rounded-lg border ${err ? "border-error/30 bg-error/[0.06]" : "border-info/25 bg-info/[0.06]"}`}>
+      <div
+        className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs"
+        onClick={() => setOpen((v) => !v)}
+      >
         <span className="shrink-0 opacity-70">
           {err ? "❌" : toolIcon(tool.name)}
         </span>
@@ -122,25 +129,27 @@ const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallVi
             {summary.slice(0, 80)}
           </span>
         )}
-        <span className="ml-auto shrink-0 opacity-30 transition-transform group-open:rotate-90">
+        <span className={`ml-auto shrink-0 opacity-30 transition-transform ${open ? "rotate-90" : ""}`}>
           ›
         </span>
-      </summary>
-      <div className="px-2.5 pb-2 pt-0.5">
-        {tool.ts && (
-          <div className="pb-1 font-mono text-[10px] tabular-nums opacity-40">
-            🕐 {fmtTs(tool.ts)}
-          </div>
-        )}
-        {tool.detail ? (
-          <ToolDetailView name={tool.name} detail={tool.detail} />
-        ) : (
-          <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-base-content/50">
-            {summary || tool.name}
-          </pre>
-        )}
       </div>
-    </details>
+      {open && (
+        <div className="px-2.5 pb-2 pt-0.5">
+          {tool.ts && (
+            <div className="pb-1 font-mono text-[10px] tabular-nums opacity-40">
+              🕐 {fmtTs(tool.ts)}
+            </div>
+          )}
+          {tool.detail ? (
+            <ToolDetailView name={tool.name} detail={tool.detail} />
+          ) : (
+            <pre className="max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-base-content/50">
+              {summary || tool.name}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
   );
 });
 
