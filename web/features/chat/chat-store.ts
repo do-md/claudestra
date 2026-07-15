@@ -914,7 +914,9 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     });
   }
 
-  /** 回合耗时(jsonl turn_duration)——补到完成标记上:「✓ 完成 · 12.3s」 */
+  /** 回合耗时(jsonl turn_duration)——补到完成标记上:「✓ 完成 · 12.3s」。
+   *  隔了 user 消息就不回填(与 session-history 的 jsonl 侧回填同一保护):
+   *  事件迟到时用户已开新回合,耗时错挂到新气泡上。 */
   public turnDuration(ms: number) {
     this.produce((s) => {
       for (let i = s.messages.length - 1; i >= 0; i--) {
@@ -923,6 +925,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           m.turnMs = ms;
           break;
         }
+        if (m.role === "user") break;
       }
     });
   }
