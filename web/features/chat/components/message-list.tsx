@@ -77,7 +77,7 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
   const err = tool.state === "error";
   const tone = TOOL_TONE[tool.state] ?? TOOL_TONE.running;
   return (
-    <div className={`rounded-lg border ${tone.box}`}>
+    <div className={`tool-in rounded-lg border ${tone.box}`}>
       <div
         className="flex cursor-pointer items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs"
         onClick={() => setOpen((v) => !v)}
@@ -270,16 +270,18 @@ function ThinkingDots() {
 }
 
 /** ✦ Claude 头（assistant 消息 / 独立思考态共用）。头像/名称可在设置里
- *  自定义(owner 2026-07-14),未设置回落 ✦ + Claude。 */
-function ClaudeHeader() {
+ *  自定义(owner 2026-07-14),未设置回落 ✦ + Claude。pulsing = 思考中缓慢
+ *  呼吸(owner 2026-07-16 动效)。 */
+function ClaudeHeader({ pulsing = false }: { pulsing?: boolean }) {
   const profile = useChatStore((s) => s.state.profile);
+  const pulse = pulsing ? "claude-pulse" : "";
   return (
     <div className="mb-[9px] flex items-center gap-2">
       {profile.claudeAvatar ? (
         // eslint-disable-next-line @next/next/no-img-element
-        <img src={profile.claudeAvatar} alt="" className="size-[21px] rounded-md object-cover" />
+        <img src={profile.claudeAvatar} alt="" className={`size-[21px] rounded-md object-cover ${pulse}`} />
       ) : (
-        <span className="flex size-[21px] items-center justify-center rounded-md bg-accent text-[11px] text-white">
+        <span className={`flex size-[21px] items-center justify-center rounded-md bg-accent text-[11px] text-white ${pulse}`}>
           ✦
         </span>
       )}
@@ -353,14 +355,14 @@ async function shareImage(url: string, name: string): Promise<void> {
 /** 回合结束标记:居中分隔线样式(owner 2026-07-14:「像中段一样居中、横线
  *  隔开、带颜色和 tick 图标」),三态同构:绿=完成 / 黄=已打断 / 红=出错。
  *  横线用 currentColor 低透明度,自动跟随态色。 */
-function TurnMark({ kind, ms }: { kind: "done" | "interrupted" | "error"; ms?: number }) {
+function TurnMark({ kind, ms, animate = true }: { kind: "done" | "interrupted" | "error"; ms?: number; animate?: boolean }) {
   const conf = {
     done: { cls: "text-success", label: "完成", icon: <path d="M8.5 12.5l2.5 2.5 5-5.5" /> },
     interrupted: { cls: "text-warning", label: "已打断", icon: <path d="M5.6 5.6l12.8 12.8" /> },
     error: { cls: "text-error", label: "出错", icon: <path d="M8.5 8.5l7 7M15.5 8.5l-7 7" /> },
   }[kind];
   return (
-    <div className={`chat-msg-in my-3.5 flex select-none items-center gap-3 ${conf.cls}`}>
+    <div className={`${animate ? "chat-msg-in" : ""} my-3.5 flex select-none items-center gap-3 ${conf.cls}`}>
       <span className="h-px flex-1 bg-current opacity-20" />
       <span className="flex shrink-0 items-center gap-1.5 text-[11.5px] font-medium">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
@@ -454,11 +456,14 @@ function AttachmentStrip({ items }: { items: ChatAttachmentView[] }) {
  *  与消息气泡视觉解耦：无头像无名字，两侧细线 + 小灰字；点击附带秒级时间。 */
 const SystemDivider = memo(function SystemDivider({ m }: { m: ChatMessage }) {
   const [showTs, setShowTs] = useState(false);
+  // 进场动画只给实时新增(本地 id)——历史加载/对账替换的 h{seq} 节点不播,
+  // 否则打开会话/切回对齐时整页一起闪一遍(owner 2026-07-16「更丝滑」)
+  const anim = m.id.startsWith("h") ? "" : "chat-msg-in";
   // 历史里的中断记录统一成 TurnMark 同款黄色分隔线(直播/历史视觉一致)
-  if (/^已被用户中断/.test(m.content)) return <TurnMark kind="interrupted" />;
+  if (/^已被用户中断/.test(m.content)) return <TurnMark kind="interrupted" animate={!m.id.startsWith("h")} />;
   return (
     <div
-      className="chat-msg-in mb-[22px] flex cursor-pointer select-none items-center gap-3"
+      className={`${anim} mb-[22px] flex cursor-pointer select-none items-center gap-3`}
       onClick={() => setShowTs((v) => !v)}
     >
       <span className="h-px flex-1 bg-base-content/10" />
@@ -642,7 +647,7 @@ const Message = memo(function Message({
     const showAvatar = isSelf && !!profile.avatar;
     const label = m.from || (isSelf ? profile.nickname : "");
     return (
-      <div className="chat-msg-in mb-[22px] flex flex-col items-end gap-2">
+      <div className={`${m.id.startsWith("h") ? "" : "chat-msg-in"} mb-[22px] flex flex-col items-end gap-2`}>
         {/* 头行:昵称 + 头像落在气泡上方,不占气泡宽度(owner 2026-07-14) */}
         {(label || showAvatar) && (
           <div className="flex items-center gap-1.5">
@@ -674,10 +679,10 @@ const Message = memo(function Message({
   const liveEmpty = streamingLast && awaiting && !m.content && !m.segments?.length;
   const hasSegs = !!m.segments?.length;
   return (
-    <div className="chat-msg-in mb-[22px] w-full">
+    <div className={`${m.id.startsWith("h") ? "" : "chat-msg-in"} mb-[22px] w-full`}>
       {/* 点 ✦ Claude 头显示/隐藏本条消息时间（秒级） */}
       <div className="cursor-pointer" onClick={() => setShowTs((v) => !v)}>
-        <ClaudeHeader />
+        <ClaudeHeader pulsing={liveEmpty} />
       </div>
       {showTs && m.ts && (
         <div className="-mt-1.5 mb-1.5 font-mono text-[10px] tabular-nums opacity-40">
@@ -702,6 +707,7 @@ const Message = memo(function Message({
         <TurnMark
           kind={m.turnError ? "error" : m.turnInterrupted ? "interrupted" : "done"}
           ms={m.turnMs}
+          animate={!m.id.startsWith("h")}
         />
       )}
     </div>
@@ -870,7 +876,7 @@ export function MessageList() {
         {pendingAsk && <AskQuestionCard a={pendingAsk} />}
         {standaloneThinking && (
           <div className="chat-msg-in mb-[22px] w-full">
-            <ClaudeHeader />
+            <ClaudeHeader pulsing />
             <ThinkingDots />
           </div>
         )}

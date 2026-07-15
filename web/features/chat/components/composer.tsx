@@ -726,7 +726,7 @@ export function Composer() {
                   streaming ? "插入当前会话（当前步骤后生效）" : "发送"
                 }
                 aria-label="发送"
-                className={`flex size-[34px] items-center justify-center rounded-[10px] transition-colors ${
+                className={`flex size-[34px] items-center justify-center rounded-[10px] transition-[background-color,transform] duration-150 active:scale-90 ${
                   canSend
                     ? "bg-accent text-white"
                     : "bg-base-300 text-base-content/40"
