@@ -1267,11 +1267,26 @@ async function gracefulExit(name: string): Promise<boolean> {
  * 实际还在 opus。会话内 `/model` 是 TUI 层面的切换，可靠且幂等（已在目标模型时
  * 直接确认不弹框；换模型时弹 "Switch model?" 确认框，❯ 默认在 Yes，Enter 即可）。
  * 失败不阻塞启动 —— 看板显示的是 jsonl 真相，漂了能看见。
+ *
+ * ⚠ CC 2.1.x 起 TUI `/model` 会「saved as your default for new sessions」——直接
+ * 改写 ~/.claude/settings.json 的 model,把这个 agent 的钉值传染给之后所有不带
+ * --model 的新 session(2026-07-16 实测,test-eff 补发 haiku 把全局从 fable 改成了
+ * haiku)。per-agent pin 不该有全局副作用:补发前快照全局值,补发后原样写回。
  */
+const GLOBAL_CLAUDE_SETTINGS = `${process.env.HOME}/.claude/settings.json`;
+
 async function enforceSessionModel(name: string, model?: string): Promise<boolean> {
   if (!model?.trim()) return true;
   const target = windowTarget(name);
   const resolved = resolveModelAlias(model.trim());
+  // 快照全局默认。null = 读失败(文件不存在/坏 JSON),跳过恢复,别越修越坏。
+  let globalModel: string | undefined | null = null;
+  try {
+    const s = JSON.parse(await Bun.file(GLOBAL_CLAUDE_SETTINGS).text());
+    globalModel = typeof s.model === "string" ? s.model : undefined;
+  } catch {
+    /* 无快照就不恢复 */
+  }
   try {
     await tmuxRaw(["send-keys", "-t", target, "-l", `/model ${resolved}`]);
     await Bun.sleep(400);
@@ -1287,6 +1302,25 @@ async function enforceSessionModel(name: string, model?: string): Promise<boolea
     }
   } catch {
     /* 失败不阻塞启动 */
+  } finally {
+    if (globalModel !== null) {
+      // CC 落盘晚于 TUI 反馈渲染(实测:检测到「Set model to」立即恢复仍被后到的
+      // 写盘覆盖)——多轮延迟复查,漂了就写回。重读再只改 model 字段,期间 CC
+      // 可能写过其它字段,拿旧快照全量覆盖会丢。
+      for (let i = 0; i < 3; i++) {
+        await Bun.sleep(1200);
+        try {
+          const s = JSON.parse(await Bun.file(GLOBAL_CLAUDE_SETTINGS).text());
+          if (s.model !== globalModel) {
+            if (globalModel === undefined) delete s.model;
+            else s.model = globalModel;
+            await Bun.write(GLOBAL_CLAUDE_SETTINGS, JSON.stringify(s, null, 2) + "\n");
+          }
+        } catch {
+          /* 恢复失败不阻塞 */
+        }
+      }
+    }
   }
   return false;
 }
