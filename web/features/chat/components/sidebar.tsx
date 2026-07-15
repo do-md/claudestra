@@ -60,6 +60,9 @@ function AgentRow({
   pinned,
   onTogglePin,
   onSelect,
+  manage = false,
+  checked = false,
+  onToggleCheck,
 }: {
   a: AgentSession;
   active: boolean;
@@ -69,6 +72,10 @@ function AgentRow({
   pinned: boolean;
   onTogglePin: () => void;
   onSelect: () => void;
+  /** 多选管理模式(owner 2026-07-16):行首 checkbox,点行=选中,禁左滑 */
+  manage?: boolean;
+  checked?: boolean;
+  onToggleCheck?: () => void;
 }) {
   const store = useChatStoreApi();
   // 相对时间(owner 2026-07-14):x秒前/x分钟前/x小时x分前/x天前;
@@ -78,6 +85,7 @@ function AgentRow({
   // 横滑露出红色删除钮,二次点击确认后 removeAgent(kill + registry 条目删,
   // 归档保留)。纵向意图让路给列表滚动;master/mock 不可删。
   const canRemove = !a.pinnedMaster && !a.mock;
+  const swipeEnabled = canRemove && !manage; // 多选模式下手势让位
   const [swipeX, setSwipeX] = useState(0);
   const [confirmDel, setConfirmDel] = useState(false);
   const [removing, setRemoving] = useState(false);
@@ -144,7 +152,7 @@ function AgentRow({
             transition: touchRef.current?.swiping ? "none" : "transform 0.18s ease",
           }}
           onTouchStart={
-            canRemove
+            swipeEnabled
               ? (e) => {
                   touchRef.current = {
                     x: e.touches[0].clientX,
@@ -156,7 +164,7 @@ function AgentRow({
               : undefined
           }
           onTouchMove={
-            canRemove
+            swipeEnabled
               ? (e) => {
                   const t = touchRef.current;
                   if (!t) return;
@@ -176,7 +184,7 @@ function AgentRow({
               : undefined
           }
           onTouchEnd={
-            canRemove
+            swipeEnabled
               ? () => {
                   const t = touchRef.current;
                   touchRef.current = null;
@@ -200,6 +208,11 @@ function AgentRow({
         <button
           className="relative flex min-w-0 flex-1 items-center gap-2.5 text-left sm:gap-2"
           onClick={() => {
+            // 多选模式:点行 = 切换选中(不可删的行忽略)
+            if (manage) {
+              if (canRemove) onToggleCheck?.();
+              return;
+            }
             // 滑开状态下点行 = 收起,不进会话
             if (swipeX !== 0) {
               closeSwipe();
@@ -209,6 +222,23 @@ function AgentRow({
             onSelect();
           }}
         >
+          {manage && (
+            <span
+              className={`grid size-5 shrink-0 place-items-center rounded-full border-2 transition-colors ${
+                !canRemove
+                  ? "border-base-content/15 opacity-30"
+                  : checked
+                    ? "border-error bg-error text-error-content"
+                    : "border-base-content/30"
+              }`}
+            >
+              {checked && (
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M20 6 9 17l-5-5" />
+                </svg>
+              )}
+            </span>
+          )}
           {a.pinnedMaster ? (
             <MasterIcon className="size-4 shrink-0 text-base-content/60" />
           ) : (
@@ -284,6 +314,39 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
   const [showSettings, setShowSettings] = useState(false);
   const [showStats, setShowStats] = useState(false);
   const q = query.trim().toLowerCase();
+  // 多选管理(owner 2026-07-16:「agent 页面做管理功能,多选删除」)
+  const [manage, setManage] = useState(false);
+  const [sel, setSel] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [confirmBatch, setConfirmBatch] = useState(false);
+  const exitManage = () => {
+    setManage(false);
+    setSel(new Set());
+    setConfirmBatch(false);
+  };
+  const toggleSel = (name: string) =>
+    setSel((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  const batchRemove = async () => {
+    if (batchBusy || sel.size === 0) return;
+    if (!confirmBatch) {
+      setConfirmBatch(true);
+      return;
+    }
+    setBatchBusy(true);
+    const failed: string[] = [];
+    for (const name of sel) {
+      const r = await store.removeAgent(name);
+      if (!r.ok) failed.push(name);
+    }
+    setBatchBusy(false);
+    exitManage();
+    if (failed.length) alert(`部分删除失败:${failed.join(", ")}`);
+  };
   // 聊天记录全局搜索（2026-07-14 owner:「compact 后忘事,模糊记得有件事——
   // 搜聊天记录找回」）。跨会话正文检索,按钮触发不自动搜(全盘扫描,省请求)。
   const [chatHits, setChatHits] = useState<ChatSearchHit[] | null>(null);
@@ -329,7 +392,29 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
         <div className="flex items-center pb-2.5">
           <span className="font-semibold">会话</span>
           <button
-            className="ml-auto flex size-7 items-center justify-center rounded-lg text-base-content/50 transition-colors hover:bg-base-300 hover:text-base-content"
+            className={`ml-auto flex h-7 items-center justify-center rounded-lg px-1.5 transition-colors ${
+              manage
+                ? "text-primary"
+                : "text-base-content/50 hover:bg-base-300 hover:text-base-content"
+            }`}
+            title={manage ? "退出多选" : "多选管理（批量删除）"}
+            aria-label={manage ? "退出多选" : "多选管理"}
+            onClick={() => (manage ? exitManage() : setManage(true))}
+          >
+            {manage ? (
+              <span className="text-xs font-medium">完成</span>
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m3 17 2 2 4-4" />
+                <path d="m3 7 2 2 4-4" />
+                <path d="M13 6h8" />
+                <path d="M13 12h8" />
+                <path d="M13 18h8" />
+              </svg>
+            )}
+          </button>
+          <button
+            className="flex size-7 items-center justify-center rounded-lg text-base-content/50 transition-colors hover:bg-base-300 hover:text-base-content"
             title="用量看板"
             aria-label="用量看板"
             onClick={() => setShowStats(true)}
@@ -508,18 +593,46 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
               pinned={pinSet.has(a.name)}
               onTogglePin={() => togglePin(a.name)}
               onSelect={onSelect}
+              manage={manage}
+              checked={sel.has(a.name)}
+              onToggleCheck={() => toggleSel(a.name)}
             />
           ))}
         </ul>
       </div>
 
-      {/* 底部安全区：max() 取大不叠加——home 条区高度只算一次，不再「env+间距」双层 */}
-      <div
-        className="border-t border-base-300 px-4 pt-2 text-xs opacity-50"
-        style={{ paddingBottom: "max(env(safe-area-inset-bottom), 0.5rem)" }}
-      >
-        Claudestra Web
-      </div>
+      {/* 多选管理操作条:替换底部品牌行,删除按钮二次确认 */}
+      {manage ? (
+        <div
+          className="flex items-center gap-2 border-t border-base-300 px-3 pt-2"
+          style={{ paddingBottom: "max(env(safe-area-inset-bottom), 0.5rem)" }}
+        >
+          <span className="text-xs text-base-content/50">
+            已选 {sel.size} 个{sel.size > 0 && " · 归档保留"}
+          </span>
+          <button
+            className={`btn btn-sm ml-auto ${sel.size ? "btn-error" : "btn-disabled"}`}
+            disabled={!sel.size || batchBusy}
+            onClick={() => void batchRemove()}
+          >
+            {batchBusy ? (
+              <span className="loading loading-spinner loading-xs" />
+            ) : confirmBatch ? (
+              `确认删除 ${sel.size} 个?`
+            ) : (
+              `删除${sel.size ? ` ${sel.size} 个` : ""}`
+            )}
+          </button>
+        </div>
+      ) : (
+        /* 底部安全区：max() 取大不叠加——home 条区高度只算一次，不再「env+间距」双层 */
+        <div
+          className="border-t border-base-300 px-4 pt-2 text-xs opacity-50"
+          style={{ paddingBottom: "max(env(safe-area-inset-bottom), 0.5rem)" }}
+        >
+          Claudestra Web
+        </div>
+      )}
       <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
       <StatsPanel open={showStats} onClose={() => setShowStats(false)} />
     </aside>

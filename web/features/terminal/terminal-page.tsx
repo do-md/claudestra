@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
 
@@ -58,8 +58,35 @@ export function TerminalPage({
     };
   }, []);
 
+  // 左缘滑返回(owner 2026-07-16:「左滑返回识别率有点低」)——PWA standalone
+  // 下 iOS 系统边缘返回手势不可靠,自己识别:起始点 x<28px、水平位移 >56px 且
+  // 明显横向主导 → 关页。capture 阶段监听,xterm 自己的触摸处理(合成滚轮)
+  // 拦不到左缘起始的这一段。
+  const edgeRef = useRef<{ x: number; y: number; active: boolean } | null>(null);
   return createPortal(
-    <div className="fixed inset-0 z-50 bg-[#1e1e2e]">
+    <div
+      className="fixed inset-0 z-50 bg-[#1e1e2e]"
+      onTouchStartCapture={(e) => {
+        const t = e.touches[0];
+        edgeRef.current =
+          t && t.clientX < 28 ? { x: t.clientX, y: t.clientY, active: true } : null;
+      }}
+      onTouchMoveCapture={(e) => {
+        const s = edgeRef.current;
+        if (!s?.active) return;
+        const t = e.touches[0];
+        if (!t) return;
+        const dx = t.clientX - s.x;
+        const dy = Math.abs(t.clientY - s.y);
+        if (dx > 56 && dx > dy * 1.5) {
+          s.active = false;
+          onClose();
+        }
+      }}
+      onTouchEndCapture={() => {
+        if (edgeRef.current) edgeRef.current.active = false;
+      }}
+    >
       <div
         className="absolute inset-x-0 flex flex-col"
         style={
