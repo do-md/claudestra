@@ -26,6 +26,16 @@ export function runSettingsMigrations(db: Database.Database) {
       updated_at TEXT NOT NULL
     )
   `);
+  // Skill 快捷入口偏好(owner 2026-07-15:「斜杠太隐蔽,加按钮+管理页」)。
+  // pinned=置顶(updated_at 定置顶组内顺序),used_count=使用频次(排序依据)。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS skill_prefs (
+      name TEXT PRIMARY KEY,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      used_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    )
+  `);
   // Claude 侧也可自定义头像+名称(owner 同日追加)。ALTER 幂等:查列缺才加。
   const cols = (db.prepare("PRAGMA table_info(user_profile)").all() as { name: string }[]).map((c) => c.name);
   if (!cols.includes("claude_nickname")) {

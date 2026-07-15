@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { useChatStore, useChatStoreApi } from "../chat-store";
+import { SkillsSheet } from "./skills-sheet";
 
 const MAX_FILES = 5;
 
@@ -211,6 +212,8 @@ export function Composer() {
     setText(`/${c.name} `);
     taRef.current?.focus();
   };
+  // Skills 面板(owner 2026-07-15:「斜杠太隐蔽,对话框下加按钮呼出」)
+  const [skillsOpen, setSkillsOpen] = useState(false);
 
   const disabled = !active;
   const hasContent = !!text.trim() || files.length > 0;
@@ -422,6 +425,15 @@ export function Composer() {
 
   const submit = () => {
     if (!canSend) return;
+    // Skill 使用计数埋点(面板排序的频次数据源)——手打 / 和面板选择都覆盖
+    const m = /^\/([\w:-]+)/.exec(text.trim());
+    if (m) {
+      void fetch("/api/skills/prefs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: m[1] }),
+      }).catch(() => {});
+    }
     store.send(text, files.length ? files : undefined);
     setText("");
     setFiles([]);
@@ -659,6 +671,15 @@ export function Composer() {
               <PaperclipIcon />
             </button>
             <button
+              onClick={() => setSkillsOpen(true)}
+              title="Skills（斜杠命令面板）"
+              aria-label="打开 Skills 面板"
+              disabled={disabled}
+              className="flex size-8 items-center justify-center rounded-[9px] font-mono text-[15px] font-semibold text-base-content/60 transition-colors hover:bg-base-content/[0.06] hover:text-base-content disabled:opacity-30 disabled:hover:bg-transparent"
+            >
+              /
+            </button>
+            <button
               onPointerDown={(e) => {
                 e.preventDefault(); // 不抢输入焦点/不触发长按系统菜单
                 if (!disabled && recState === "idle") void holdStart();
@@ -717,6 +738,18 @@ export function Composer() {
           </div>
         </div>
       </div>
+      {skillsOpen && (
+        <SkillsSheet
+          skills={skills}
+          onPick={(s) => {
+            setText(`/${s.name} `);
+            setSkillsOpen(false);
+            // sheet 卸载后再聚焦,免得焦点被回收
+            setTimeout(() => taRef.current?.focus(), 60);
+          }}
+          onClose={() => setSkillsOpen(false)}
+        />
+      )}
     </div>
   );
 }
