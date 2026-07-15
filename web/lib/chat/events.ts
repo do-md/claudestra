@@ -52,7 +52,7 @@ export type WebStreamEvent =
    *  id：tool_use id（tool-state 按它更新这张卡）。
    *  detail：完整入参详情（截断 4k），工具卡点开展示。 */
   | { t: "tool"; id?: string; name: string; summary: string; state: "running" | "done" | "error"; detail?: string }
-  /** 工具调用状态更新（目前只有失败标红——成功不推,省事件量）。 */
+  /** 工具调用状态定稿（done=绿 / error=红,三态背景直播侧的收尾信号）。 */
   | { t: "tool-state"; id: string; state: "done" | "error" }
   /** 助手文本段（过程叙述，追加到当前流式助手消息的 content） */
   | { t: "text"; text: string }

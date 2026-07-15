@@ -20,7 +20,7 @@ const SSE_HEADERS = {
  *
  * 事件映射：
  *   agent_status thinking → {t:"status",status:"running"}；done → {t:"done"}
- *   tool_start            → {t:"tool", state:"running"}（tool_done 仅失败时推 tool-state 标红）
+ *   tool_start            → {t:"tool", state:"running"}（tool_done 推 tool-state 定稿绿/红）
  *   assistant_text        → {t:"text"}
  *   chat_message(out)     → {t:"reply"}（reply() 的最终回复，挂 replyText 与叙述分区渲染）
  *   question              → {t:"ask"}；question_cleared → {t:"ask-cleared"}（fork 事件）
@@ -79,10 +79,10 @@ function translate(evt: BridgeEvent): WebStreamEvent | null {
         ...(typeof d.detail === "string" && d.detail ? { detail: d.detail } : {}),
       };
     case "tool_done":
-      // 成功完成不推（转圈只在最新一张卡,定稿由下一事件自然接管）;
-      // 失败推 tool-state 让前端把那张卡标红
-      return d.error && typeof d.toolId === "string" && d.toolId
-        ? { t: "tool-state", id: d.toolId, state: "error" }
+      // 成功/失败都推 tool-state——工具卡三态背景(运行蓝/完成绿/失败红,
+      // owner 2026-07-15)需要 done 信号,不然直播里的卡永远停在蓝色
+      return typeof d.toolId === "string" && d.toolId
+        ? { t: "tool-state", id: d.toolId, state: d.error ? "error" : "done" }
         : null;
     case "assistant_text":
       return { t: "text", text: String(d.text ?? "") };

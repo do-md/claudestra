@@ -64,12 +64,20 @@ function TsBadge({ ts, shown }: { ts?: string; shown: boolean }) {
  *  （2026-07-13 owner 拍板）。
  *  memo：immer 结构共享下旧 tool 对象引用稳定，流式长回合几百张工具卡
  *  只有最新一张需要重渲染（2026-07-13 性能刀）。 */
+/** 工具卡三态配色(owner 2026-07-15):运行中蓝 / 完成绿 / 失败红。 */
+const TOOL_TONE = {
+  running: { box: "border-info/25 bg-info/[0.06]", name: "text-info" },
+  done: { box: "border-success/30 bg-success/[0.06]", name: "text-success" },
+  error: { box: "border-error/30 bg-error/[0.06]", name: "text-error" },
+} as const;
+
 const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: ToolCallView; active: boolean }) {
   const summary = cleanSummary(tool.summary);
   const [open, setOpen] = useState(false);
   const err = tool.state === "error";
+  const tone = TOOL_TONE[tool.state] ?? TOOL_TONE.running;
   return (
-    <div className={`rounded-lg border ${err ? "border-error/30 bg-error/[0.06]" : "border-info/25 bg-info/[0.06]"}`}>
+    <div className={`rounded-lg border ${tone.box}`}>
       <div
         className="flex cursor-pointer items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs"
         onClick={() => setOpen((v) => !v)}
@@ -81,7 +89,7 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
         ) : (
           <span className="shrink-0 opacity-60">{toolIcon(tool.name)}</span>
         )}
-        <span className={`font-semibold ${err ? "text-error" : "text-info"}`}>{tool.name}</span>
+        <span className={`font-semibold ${tone.name}`}>{tool.name}</span>
         {summary && (
           <span className="truncate text-base-content/50 max-w-[60vw] lg:max-w-[40vw]">
             {summary}
@@ -114,8 +122,9 @@ const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallVi
   const summary = cleanSummary(tool.summary);
   const err = tool.state === "error";
   const [open, setOpen] = useState(false);
+  const tone = TOOL_TONE[tool.state] ?? TOOL_TONE.done;
   return (
-    <div className={`rounded-lg border ${err ? "border-error/30 bg-error/[0.06]" : "border-info/25 bg-info/[0.06]"}`}>
+    <div className={`rounded-lg border ${tone.box}`}>
       <div
         className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs"
         onClick={() => setOpen((v) => !v)}
@@ -123,7 +132,7 @@ const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallVi
         <span className="shrink-0 opacity-70">
           {err ? "❌" : toolIcon(tool.name)}
         </span>
-        <span className={`font-semibold ${err ? "text-error" : "text-info"}`}>{tool.name}</span>
+        <span className={`font-semibold ${tone.name}`}>{tool.name}</span>
         {summary && (
           <span className="truncate text-base-content/50 max-w-[60vw] lg:max-w-[40vw]">
             {summary.slice(0, 80)}
