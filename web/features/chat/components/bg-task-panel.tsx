@@ -9,7 +9,51 @@ import type { BgTaskView } from "../type";
  * subagent 行带 markdown 前缀（-# 🔧 / 💬），shell 行是原始输出。
  */
 
-const KIND_ICON = { subagent: "🧵", shell: "💻" } as const;
+/** 线性图标统一替代 emoji(owner 2026-07-15:⏹ 在 iOS 渲染成蓝色 emoji
+ *  方块,「丑死了」)——subagent 用 git-branch(分支任务),shell 用 terminal。 */
+function KindIcon({ kind }: { kind: BgTaskView["kind"] }) {
+  const common = {
+    className: "size-3.5 shrink-0 opacity-70",
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+  };
+  if (kind === "shell") {
+    return (
+      <svg {...common}>
+        <path d="M4 17l6-6-6-6" />
+        <path d="M12 19h8" />
+      </svg>
+    );
+  }
+  return (
+    <svg {...common}>
+      <circle cx="6" cy="6" r="3" />
+      <circle cx="18" cy="18" r="3" />
+      <path d="M6 9v3a3 3 0 0 0 3 3h6" />
+    </svg>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg className="size-3.5" viewBox="0 0 24 24" fill="currentColor">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+  );
+}
+
+function XIcon() {
+  return (
+    <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+      <path d="M18 6 6 18" />
+      <path d="M6 6l12 12" />
+    </svg>
+  );
+}
 
 function fmtDuration(ms?: number): string {
   if (!ms || ms < 0) return "";
@@ -30,9 +74,11 @@ const BgTaskCard = memo(function BgTaskCard({ t }: { t: BgTaskView }) {
   return (
     <details className="group rounded-lg border border-warning/25 bg-warning/[0.06] [&>summary]:list-none" open={running}>
       <summary className="flex cursor-pointer select-none items-center gap-2 px-3 py-1.5 text-xs">
-        <span className="shrink-0">{KIND_ICON[t.kind]}</span>
+        <KindIcon kind={t.kind} />
         <span className="truncate font-medium text-warning/90 max-w-[55vw] lg:max-w-[30vw]">
-          {t.title || (t.kind === "shell" ? "后台命令" : "subagent")}
+          {/* bridge 给的 title 带 🐚/🧵 emoji 前缀(Discord 线程名用)——web 已有
+              线性 kind 图标,剥掉免重复 */}
+          {(t.title || (t.kind === "shell" ? "后台命令" : "subagent")).replace(/^[🐚🧵]\s*/u, "")}
         </span>
         {running ? (
           <span className="loading loading-spinner loading-xs ml-1 text-warning" />
@@ -46,7 +92,7 @@ const BgTaskCard = memo(function BgTaskCard({ t }: { t: BgTaskView }) {
             preventDefault 防触发 details 开合 */}
         {running && (
           <button
-            className="shrink-0 rounded px-1 text-error/70 hover:bg-error/10"
+            className="grid size-5 shrink-0 place-items-center rounded text-error/70 hover:bg-error/10"
             title="请求 agent 停止此任务"
             aria-label="停止任务"
             onClick={(e) => {
@@ -55,11 +101,11 @@ const BgTaskCard = memo(function BgTaskCard({ t }: { t: BgTaskView }) {
               store.requestStopBgTask(t);
             }}
           >
-            ⏹
+            <StopIcon />
           </button>
         )}
         <button
-          className="shrink-0 rounded px-1 opacity-40 hover:bg-base-content/10 hover:opacity-80"
+          className="grid size-5 shrink-0 place-items-center rounded opacity-40 hover:bg-base-content/10 hover:opacity-80"
           title="收起"
           aria-label="收起任务卡"
           onClick={(e) => {
@@ -68,7 +114,7 @@ const BgTaskCard = memo(function BgTaskCard({ t }: { t: BgTaskView }) {
             store.dismissBgTask(t.id);
           }}
         >
-          ✕
+          <XIcon />
         </button>
         <span className="shrink-0 opacity-30 transition-transform group-open:rotate-90">›</span>
       </summary>
