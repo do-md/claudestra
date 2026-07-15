@@ -2,9 +2,9 @@
 
 **English** · [简体中文](./README.zh-CN.md)
 
-> Manage multiple local Claude Code sessions from Discord.
+> Manage multiple local Claude Code sessions from Discord — or from the built-in web app.
 
-Claudestra lets you run Claude Code on your workstation and drive it from anywhere — phone, tablet, or another machine — through Discord. Each session lives in tmux, so the moment you're back at your desk you can attach and keep going in the same process.
+Claudestra lets you run Claude Code on your workstation and drive it from anywhere — phone, tablet, or another machine — through Discord or the bundled **PWA web client**. Each session lives in tmux, so the moment you're back at your desk you can attach and keep going in the same process.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Bun](https://img.shields.io/badge/runtime-bun-fbf0df.svg)](https://bun.sh)
@@ -14,12 +14,13 @@ Claudestra lets you run Claude Code on your workstation and drive it from anywhe
 
 ## Why
 
-Claude Code is a terminal-only tool: if you aren't at your computer, you aren't using it. Claudestra puts a persistent Discord front door in front of your local sessions so you can:
+Claude Code is a terminal-only tool: if you aren't at your computer, you aren't using it. Claudestra puts a persistent front door (Discord and/or a web app) in front of your local sessions so you can:
 
 - Chat with any active Claude Code session from your phone.
 - Run several sessions in parallel — one Discord channel per session.
 - Return to your desk and attach to the **same** running process via `tmux`.
 - Watch tool calls stream in real time (Read / Edit / Bash / Grep).
+- Open a **live remote terminal** to any session right from the web app.
 - Schedule recurring tasks that spin up a temporary agent and report back.
 
 ## How it works
@@ -56,6 +57,19 @@ Claudestra builds on Claude Code's native **Channel protocol** (MCP) rather than
 - **Cron scheduling** — declarative cron expressions spin up a temporary agent, run a prompt, notify Discord, then clean up.
 - **Cross-Claudestra peer collaboration (v1.8+, redesigned v1.9+)** — invite your friend's bot; bridge automatically creates a `#agent-exchange` shared channel. Opt-in `peer-expose <agent> <peer>` selectively exposes specific local agents to each peer. v1.9.21+ `direct` mode: bridge routes peer requests **straight to the target agent, bypassing both masters** — 2-3 hops instead of 6. v1.9.22+ symmetric: you `@peer-bot` in `#agent-exchange` and peer's bridge routes directly to their agent; no master turns either way. v1.9.26+ disambiguation: multi-candidate routes fall back to Discord button picker (no LLM turn). Agents can call `send_to_agent({ target: "peer:alice.future_data" })` to cross-peer invoke by fully-qualified name.
 - **LLM-free management** — status / kill / restart / cron buttons execute directly on the Bridge, zero-token overhead and near-instant response.
+
+### Web client (v2.10+)
+
+A second front door beside Discord — a **PWA-installable Next.js app** built entirely on the multi-frontend API. Runs beside Discord or fully replaces it (Web-only mode, no bot token needed).
+
+- **Streaming chat** — tool calls render as live three-state cards (running / done / failed), Write & Edit show syntax-highlighted diffs, interrupts and permission / AskUserQuestion prompts are interactive cards.
+- **Live remote terminal** — a real read-write mirror of the agent's tmux pane with a mobile control-key bar.
+- **Chat-history search** — full-text across all sessions, live + archived, global or per-session.
+- **Skills panel** — browse and launch every discovered skill from a composer button; pin favourites, the rest sort by usage.
+- **Background-task threads** — subagents and background shells stream into collapsible sub-conversations.
+- Profile customisation, multi-select session management, per-agent init messages.
+
+Setup + phone remote access (Tailscale / PWA install): **[web/SETUP.md](./web/SETUP.md)**.
 
 ### Discord UI
 - **Interactive components** — buttons, select menus, slash commands.
@@ -259,23 +273,21 @@ src/
   ansi2html.ts           ANSI escape codes → coloured HTML
   html2png.ts            HTML → PNG (Playwright headless Chromium)
   discord-reply.ts       Bash fallback for sending messages via Bridge
+web/                     Next.js web client (PWA) — see web/SETUP.md + web/CLAUDE.md
 master/
   CLAUDE.md.template     Master agent behaviour template (rendered by setup)
-tests/                   78 cases across 5 files
-  cron.test.ts           Cron parser + scheduler
-  modal-parser.test.ts   TUI modal detection
-  skills.test.ts         SKILL.md discovery + name sanitisation
-  slash-registry.test.ts Skill resolver + per-agent isolation
-  jsonl-cost.test.ts     Token rollup
+tests/                   315 cases across 20 files (parsers, routing, registry, history, …)
 install.sh               One-line installer
-SETUP.md                 Full installation guide
+SETUP.md                 Full installation guide (Discord path)
+web/SETUP.md             Web client install + phone remote access
+docs/                    Multi-frontend design + web frontend API contract
 ```
 
 ## Contributing
 
 Issues and pull requests welcome. The core idea is simple; the hard parts are edge cases in tmux, Discord rate limits, and Claude Code channel lifecycle. Before submitting a PR:
 
-1. `bun test` — keep all 78 cases green.
+1. `bun test` — keep all 315 cases green.
 2. `bun build src/bridge.ts --target=bun` (and the same for each entry point) — catches most type issues fast.
 3. Test the actual user flow end-to-end in a sandbox Discord server.
 

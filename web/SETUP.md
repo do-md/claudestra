@@ -1,9 +1,27 @@
 # Claudestra Web Client — Setup & Run
 
-The **Next.js web frontend** for Claudestra — a second front door beside Discord:
-PWA-installable, OneSignal push, multi-session streaming chat, and a live remote
-terminal. It is a standard **Node/npm** app that talks only to the Bridge's HTTP
-API (`/api/v1` + `/api/v1/events`); it does **not** embed the Bun backend.
+The **Next.js web frontend** for Claudestra — a second front door beside Discord.
+It is a standard **Node/npm** app that talks only to the Bridge's HTTP API
+(`/api/v1` + `/api/v1/events`); it does **not** embed the Bun backend.
+
+What you get:
+
+- **Multi-session streaming chat** — one conversation per agent, tool calls render
+  as live cards (running = blue / done = green / failed = red), Write/Edit show
+  syntax-highlighted diffs, interrupts and permission/AskUserQuestion prompts are
+  interactive cards.
+- **Live remote terminal** — a real read-write mirror of the agent's tmux pane,
+  with a mobile control bar (Esc / Tab / arrows / Ctrl-C / …).
+- **Chat history search** — full-text search across every session (live + archived),
+  globally from the sidebar or per-session from the top bar.
+- **Skills panel** — browse and launch every discovered skill/slash command from a
+  button next to the composer; pin favourites, the rest auto-sort by usage.
+- **Background-task threads** — subagents and background shells stream into
+  collapsible panels instead of flooding the main conversation.
+- **PWA-installable** — add to your phone's home screen for a full-screen app feel;
+  optional OneSignal web push.
+- Profile customisation (your + Claude's avatar/nickname), session management
+  (create / kill / restart / clear / multi-select delete), per-agent init messages.
 
 > Architecture & internals live in [`web/CLAUDE.md`](./CLAUDE.md). The wire
 > contract (auth, history pagination, SSE events) is in
@@ -109,6 +127,66 @@ Open the app → you're redirected to `/login`. Enter your **OS username + passw
 
 New agents are created by talking to the master orchestrator (👑 大总管) in chat —
 there is no separate "new session" button by design.
+
+---
+
+## 6. Access from your phone (remote access)
+
+The whole point of Claudestra is driving your workstation from your phone. Three
+tiers, in order of recommendation:
+
+### Same Wi-Fi (zero setup)
+
+`npm run start` listens on all interfaces, so any device on the same network can
+open `http://<your-mac-lan-ip>:3333` (find the IP under *System Settings → Wi-Fi →
+Details*, or `ipconfig getifaddr en0`). Log in with the same OS username/password.
+
+Good for a quick test; useless once you leave the house.
+
+### Tailscale (recommended)
+
+[Tailscale](https://tailscale.com) gives every device a stable private IP over
+WireGuard — no port forwarding, no public exposure, free for personal use:
+
+1. Install Tailscale on the workstation and on your phone, log both into the same
+   tailnet.
+2. From your phone, open `http://<machine-name>:3333` (MagicDNS) or
+   `http://100.x.y.z:3333`.
+
+For **HTTPS** (required for PWA service workers and web push — plain-HTTP access
+works for chat but installs as a degraded PWA), let Tailscale terminate TLS with a
+real certificate:
+
+```bash
+tailscale serve --bg 3333
+# → https://<machine-name>.<tailnet>.ts.net
+```
+
+That URL is reachable only from inside your tailnet, but carries a browser-trusted
+certificate — the ideal endpoint to install the PWA from.
+
+### Public reverse proxy (advanced, only if you know why you need it)
+
+Put Caddy/nginx with TLS in front of port `3333` on a domain you own. Keep in mind:
+
+- **Never** port-forward `3333` (or Bridge's `3847`) raw to the internet. The web
+  login is your **OS account password** — brute-forcing it is brute-forcing your
+  machine.
+- Add your own rate limiting / IP allowlist / 2FA layer at the proxy.
+- `BRIDGE_BIND` stays `127.0.0.1` — only the Next.js app needs to be reachable;
+  the browser never talks to the Bridge directly.
+
+### Install as a PWA
+
+Once the app is reachable over HTTPS (or you accept degraded mode over HTTP):
+
+- **iOS Safari** — open the URL → Share sheet → **Add to Home Screen**. Launches
+  full-screen (standalone), with app icon and safe-area-aware layout.
+- **Android Chrome** — open the URL → ⋮ menu → **Install app** (or accept the
+  install banner).
+
+> iOS caches the manifest at install time — after big upgrades, if icons or
+> full-screen behaviour look stale, delete the home-screen icon and re-add it.
 
 ---
 

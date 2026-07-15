@@ -10,6 +10,13 @@ This file exists as a reference for:
 - Understanding what the wizard does under the hood.
 - Operators who prefer to configure things by hand.
 
+> **Two front doors.** This guide sets up the **Discord** frontend. Since v2.10
+> there is also a **web client** — a PWA-installable Next.js app with streaming
+> chat, a live remote terminal, and chat-history search. It can run **beside**
+> Discord or **instead of it** (Web-only mode, no bot token needed). See
+> **[web/SETUP.md](./web/SETUP.md)**, including the "Access from your phone"
+> section (Tailscale / PWA install).
+
 ---
 
 ## Quick start
@@ -59,6 +66,11 @@ Total cross-Claudestra hops shrink from 6 (old master-transcribe model) to 2-3 (
 - **Wedge detection** — if an agent's tmux pane stays unchanged for 30+ min while not idle, you get an @mention with one-click Esc / Ctrl+C rescue buttons.
 - **`manager.ts cost` + `metrics`** — token-usage rollup from JSONL files + bridge event log summary.
 - **Auto-interrupt on new message** — sending a Discord text while Claude is mid-task auto-injects Ctrl+C so the new message redirects instead of queuing.
+- **Multi-frontend API (v2.6+)** — Bearer-token HTTP API (`/api/v1` + SSE `/events`) so any frontend can talk to your agents: `bun src/manager.ts token-add <name> --agents <a,b|*>` issues scoped tokens. The web client below is built entirely on this.
+- **Web client (v2.10+)** — PWA-installable Next.js app: streaming chat with tool cards and diffs, live remote terminal, chat-history search, Skills panel, background-task threads. Setup + phone remote access: [web/SETUP.md](./web/SETUP.md).
+- **Session archive & history (v2.8+)** — every retired session's JSONL is snapshotted to `~/.claude-orchestrator/archive/`, plus a daily sweep of live sessions; chat history survives Claude Code's `cleanupPeriodDays` pruning and stays readable via the history API even after an agent is killed.
+- **Background-activity threads (v2.8+)** — subagents and background shell tasks stream into their own Discord threads (auto-archived on completion) instead of flooding the agent's main channel.
+- **Claude Code agents-mode guards (v2.7+)** — detects and heals "doppelganger" background sessions created by Claude Code's bg-agent daemon (the ← key trap): `/agents` inventory panel, one-click adopt/cleanup, automatic `--fork-session` retry on restart.
 
 ---
 
@@ -252,6 +264,7 @@ The same applies if Discord is still showing an old command list after a Claudes
 
 ## Next steps
 
+- **Set up the web client** — [web/SETUP.md](./web/SETUP.md): PWA chat + live terminal + history search, and how to reach it from your phone outside your home network (Tailscale recommended).
 - Read [CLAUDE.md](./CLAUDE.md) for an architecture overview (written for contributors and agents).
 - Try `send_to_agent` MCP tool for agent-to-agent workflows.
 - Set up a cron job that runs every morning and reports to your control channel.

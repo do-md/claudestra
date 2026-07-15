@@ -10,6 +10,12 @@
 - 了解向导在幕后做了什么。
 - 偏好手动配置的人用作参考。
 
+> **两个前门。** 本指南装的是 **Discord** 前端。v2.10 起还有一个 **Web 客户端**——
+> 可安装到手机主屏的 PWA（Next.js），带流式聊天、实时远程终端、聊天记录搜索。
+> 它可以和 Discord **并存**，也可以**完全替代** Discord（Web-only 模式，不需要
+> bot token）。见 **[web/SETUP.md](./web/SETUP.md)**，里面有「Access from your
+> phone」一章（Tailscale 远程访问 / PWA 安装）。
+
 ---
 
 ## 快速开始
@@ -59,6 +65,11 @@ bun run setup
 - **Wedge 检测** — agent 的 tmux pane 30+ 分钟没变化且没 idle → @你 + 一键 Esc / Ctrl+C 救回按钮。
 - **`manager.ts cost` + `metrics`** — 从 JSONL 汇总 token 消耗 + bridge 事件日志聚合。
 - **新消息自动打断** — 你在 Discord 发新消息时，如果 agent 正在干活，bridge 自动 Ctrl+C 让新消息覆盖当前任务。
+- **多前端 API（v2.6+）** — Bearer token 鉴权的 HTTP API（`/api/v1` + SSE `/events`），任何前端都能接上你的 agent：`bun src/manager.ts token-add <name> --agents <a,b|*>` 签发按 agent 限定范围的 token。下面的 Web 客户端完全建在这套 API 上。
+- **Web 客户端（v2.10+）** — 可 PWA 安装的 Next.js 应用：流式聊天（工具卡 + diff 着色）、实时远程终端、聊天记录搜索、Skills 面板、后台任务子会话。安装 + 手机远程访问见 [web/SETUP.md](./web/SETUP.md)。
+- **会话归档与历史（v2.8+）** — 每个退役 session 的 JSONL 自动快照到 `~/.claude-orchestrator/archive/`，外加每日全量扫描；聊天记录不再被 Claude Code 的 `cleanupPeriodDays` 清掉，agent 被 kill 之后历史照样可读。
+- **后台活动子线程（v2.8+）** — subagent 和后台 shell 任务各开一条 Discord thread 流式输出（完成后自动归档），不再刷爆 agent 主频道。
+- **Claude Code agents-mode 防护（v2.7+）** — 检测并自愈 Claude Code 后台 agent 守护进程造出的「分身」session（← 键误触陷阱）：`/agents` 清单面板、一键收编/清理、restart 自动 `--fork-session` 重试。
 
 ---
 
@@ -252,6 +263,7 @@ Claudestra 升级后 Discord 里命令列表还是老的 —— 同样处理。
 
 ## 接下来
 
+- **装 Web 客户端** — [web/SETUP.md](./web/SETUP.md)：PWA 聊天 + 实时终端 + 记录搜索，以及在家庭网络之外用手机访问的方案（推荐 Tailscale）。
 - 读 [CLAUDE.zh-CN.md](./CLAUDE.zh-CN.md) 了解架构（给贡献者和 agent 看的）。
 - 试试 `send_to_agent` MCP 工具搭建多 agent 协作流。
 - 建个每天早上跑的定时任务，让它汇报到控制频道。
