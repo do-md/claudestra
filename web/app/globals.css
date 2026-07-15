@@ -12,8 +12,10 @@
     prefersdark: true;
     --color-primary: "#FFFFFF";
     --color-primary-content: "#000000";
+    /* accent = Claude 品牌陶土橙(owner 2026-07-16「粉色太杂」→ 收敛到品牌色系;
+       dark 亮一档保证深底上的辨识度) */
     --color-secondary: "#853A2D";
-    --color-accent: "#EC5A72";
+    --color-accent: "#D97757";
     --color-neutral: "#2E3034";
     --color-neutral-content: "#aaaaaa";
     --color-base-100: "rgb(23,24,25)";
@@ -32,7 +34,8 @@
     default: true;
     --color-primary: "#000000";
     --color-primary-content: "#FFFFFF";
-    --color-accent: "#EC5A72";
+    /* light 用深一档的陶土橙,白字/白底对比才够 */
+    --color-accent: "#C15F3C";
     --color-base-100: "#FFFFFF";
     --color-base-200: "#F7F7F7";
     --color-base-300: "#EDEDED";
@@ -239,7 +242,7 @@ html.canvas-list {
     margin: 0.3em 0 0.3em 1.1em;
 }
 .chat-domd a {
-    color: var(--color-accent, #ec5a72);
+    color: var(--color-accent, #c15f3c);
     text-decoration: underline;
     text-underline-offset: 2px;
 }
