@@ -548,6 +548,8 @@ const PREEMPT_COOLDOWN_MS = 4_000;
 
 async function deliverToLocal(env: RouterEnvelope, to: RouterLocalEndpoint): Promise<RouterDelivery> {
   const content = await renderContentForLocal(env);
+  // v2.10+「谁发的谁回」:Web/API 触发的回合,Stop 时不发 Discord @ 推送
+  if (env.from.kind === "api") lastMessageSource.set(to.channelId, "api");
   // chat_id 是 agent reply() 时要传回的 id：消息从哪个 Discord 频道来，回复就发回那里。
   // direct route 场景下 from 是 peer 在 #agent-exchange，agent 被"偷偷"路由到自己私频，
   // 但 reply 目标必须还是 #agent-exchange，不是 agent 的私频。
@@ -3585,8 +3587,11 @@ async function handleClientMessage(ws: ServerWebSocket<unknown>, raw: string) {
 // channelId → 最近一次完成通知时间戳，用于去抖
 const lastCompletionSent = new Map<string, number>();
 // v1.9.6+: 记录每个 channel 的最近一次消息触发源。如果是 "agent"（peer bot / send_to_agent 转发）
-// 那次 turn 结束时就不发完成 @ — 用户没问问题，不用通知他
-const lastMessageSource = new Map<string, "user" | "agent">();
+// 那次 turn 结束时就不发完成 @ — 用户没问问题，不用通知他。
+// v2.10+ "api"(owner 2026-07-16「谁发的谁回」):Web 端触发的回合不发 Discord @
+// 推送(内容 mirror 照旧,用户在 Web 上收;未来 Web push 反向同理——Discord 触发
+// 的回合不打 Web 推送,本 map 就是两边共用的分流依据)。
+const lastMessageSource = new Map<string, "user" | "agent" | "api">();
 const COMPLETION_DEDUPE_MS = 10_000; // 10 秒内不重复发完成通知
 
 /**
@@ -4399,10 +4404,15 @@ async function handleHookRequest(req: Request): Promise<Response> {
       }
 
       // v1.9.6+: 如果最近一次 message 来自 agent（peer bot / send_to_agent 转发），
-      // 这次 Stop 是"为 agent 工作" — 用户没问过问题，不用 @ 他
-      if (shouldNotify && lastMessageSource.get(channelId) === "agent") {
-        console.log(`🏁 跳过完成通知（上一次消息来自 agent，非 user 触发）: channel=${channelId}`);
-        shouldNotify = false;
+      // 这次 Stop 是"为 agent 工作" — 用户没问过问题，不用 @ 他。
+      // v2.10+ "api" 同跳（owner「谁发的谁回」）:Web 端触发的回合,用户在 Web 上
+      // 看回复,Discord 不再 @ 推送(mirror 内容照旧)。
+      {
+        const src = lastMessageSource.get(channelId);
+        if (shouldNotify && (src === "agent" || src === "api")) {
+          console.log(`🏁 跳过完成通知（触发源=${src},非 Discord 用户）: channel=${channelId}`);
+          shouldNotify = false;
+        }
       }
 
       // 防御性：等 Claude Code TUI 稳定下来（~1.5s），再看 pane 状态确认真的"完成"。

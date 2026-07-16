@@ -510,7 +510,7 @@ function QuoteSwipe({ quote, className, children }: { quote: string; className?:
   const store = useChatStoreApi();
   const ref = useRef<HTMLDivElement>(null);
   const iconRef = useRef<HTMLSpanElement>(null);
-  const st = useRef<{ x: number; y: number; drag: boolean; dead: boolean } | null>(null);
+  const st = useRef<{ x: number; y: number; drag: boolean; dead: boolean; startDx: number } | null>(null);
   return (
     <div className={`relative ${className ?? ""}`}>
       <span
@@ -527,7 +527,7 @@ function QuoteSwipe({ quote, className, children }: { quote: string; className?:
         ref={ref}
         onTouchStart={(e) => {
           const t = e.touches[0];
-          st.current = t ? { x: t.clientX, y: t.clientY, drag: false, dead: false } : null;
+          st.current = t ? { x: t.clientX, y: t.clientY, drag: false, dead: false, startDx: 0 } : null;
         }}
         onTouchMove={(e) => {
           const s = st.current;
@@ -538,19 +538,23 @@ function QuoteSwipe({ quote, className, children }: { quote: string; className?:
           const dx = t.clientX - s.x;
           const dy = Math.abs(t.clientY - s.y);
           if (!s.drag) {
-            // 竖向先动 → 手势让给列表滚动;明显左滑才接管
+            // 竖向先动 → 手势让给列表滚动;轻微左滑即接管(阈值太高「不跟手」,
+            // owner 2026-07-16 打回过一版 14px)
             if (dy > 10 && dy > -dx) {
               s.dead = true;
               return;
             }
-            if (!(dx < -14 && -dx > dy * 1.3)) return;
+            if (!(dx < -6 && -dx > dy)) return;
             s.drag = true;
+            s.startDx = dx; // 从接管点起算,起步不跳变
           }
           e.stopPropagation();
-          const pull = Math.max(-72, Math.min(0, dx));
+          const raw = Math.min(0, dx - s.startDx);
+          // 72px 内 1:1 跟手,超出 sqrt 阻尼(能继续拖但渐重,不再生硬钉死)
+          const pull = raw > -72 ? raw : -72 - Math.sqrt(-raw - 72) * 3;
           el.style.transition = "none";
           el.style.transform = `translateX(${pull}px)`;
-          if (iconRef.current) iconRef.current.style.opacity = String(Math.min(1, -pull / 48));
+          if (iconRef.current) iconRef.current.style.opacity = String(Math.min(1, -pull / 44));
         }}
         onTouchEnd={(e) => {
           const s = st.current;
@@ -558,14 +562,14 @@ function QuoteSwipe({ quote, className, children }: { quote: string; className?:
           st.current = null;
           if (!s?.drag || !el) return;
           const t = e.changedTouches[0];
-          const dx = t ? t.clientX - s.x : 0;
+          const dx = t ? t.clientX - s.x - s.startDx : 0;
           el.style.transition = "transform 0.18s ease-out";
           el.style.transform = "translateX(0)";
           if (iconRef.current) {
             iconRef.current.style.transition = "opacity 0.18s ease-out";
             iconRef.current.style.opacity = "0";
           }
-          if (dx < -48) store.setQuote(quote);
+          if (dx < -44) store.setQuote(quote);
         }}
       >
         {children}
