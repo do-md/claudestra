@@ -436,8 +436,11 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     }
   }
 
-  /** 断流自动重连的退避（ms）：流存活 ≥10s 视为曾健康、重置 3s；快速反复断则翻倍封顶 30s。 */
-  private reconnectDelay = 3_000;
+  /** 断流自动重连的退避（ms）：流存活 ≥10s 视为曾健康、重置 1s；快速反复断则翻倍封顶 10s。 */
+  private reconnectDelay = 1_000;
+
+  /** 假死流看门狗(25s 无字节 → cancel 重连);openStream 内创建,finally 清。 */
+  private streamDog: ReturnType<typeof setInterval> | null = null;
 
   /** 断点续传锚:最后收到的 bridge 事件 seq(BFF 附在每条事件的 eid 上)。
    *  重连带 ?since=<seq> → bridge 环形缓冲重放错过的事件,不用全量重拉历史。 */
@@ -461,9 +464,24 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       );
       if (res.status === 401) return this.gotoLogin();
       if (gen !== this.streamGen) return; // 已切走
-      const reader = res.body?.getReader();
-      if (!reader) return;
-      this.streamReader = reader;
+      const rawReader = res.body?.getReader();
+      if (!rawReader) return;
+      this.streamReader = rawReader;
+      // 假死流看门狗:iOS 挂起恢复/网络切换后连接常「不报错也不产出」,以前
+      // 只能等用户切页触发对齐。BFF 心跳 10s 一发,25s 收不到任何字节即判死,
+      // 主动 cancel → read 返回 done → finally 走快路径重连(断点重放无损)。
+      let lastByteAt = Date.now();
+      if (this.streamDog) clearInterval(this.streamDog);
+      this.streamDog = setInterval(() => {
+        if (Date.now() - lastByteAt > 25_000) rawReader.cancel().catch(() => {});
+      }, 5_000);
+      const reader = {
+        read: () =>
+          rawReader.read().then((r) => {
+            lastByteAt = Date.now();
+            return r;
+          }),
+      } as ReadableStreamDefaultReader<Uint8Array>;
       await consumeSSEStream(reader, (evt) => {
         if (gen !== this.streamGen) return;
         const eid = (evt as { eid?: number }).eid;
@@ -482,6 +500,10 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     } catch {
       /* 断流：保持静默，由下面的自动重连续 */
     } finally {
+      if (this.streamDog) {
+        clearInterval(this.streamDog);
+        this.streamDog = null;
+      }
       // 流关闭/断开时，若本轮仍卡在 streaming（done 没收到、流被掐、bridge 重启），
       // 解锁 composer——别让「■ 停止」永久卡住导致用户发不出/看着像没渲染。仅清当前流。
       if (
@@ -509,12 +531,15 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       // 后续处理过程 web 上完全没有）。仍是当前流才自动重连；走 maybeReconnect
       // 完整对齐（重拉历史把断流期间的消息补回来）。后台页交给 visibilitychange。
       if (gen === this.streamGen && this.state.activeAgent === name) {
+        // 退避 1s 起步 / 10s 封顶(曾 3s/30s——web 实时性完全押在这条流上,
+        // 断档窗口就是「web 慢于 Discord」的主要成分;有断点重放兜着,激进
+        // 一点重连是无损的。owner 2026-07-16)
         this.reconnectDelay =
-          Date.now() - startedAt >= 10_000 ? 3_000 : Math.min(this.reconnectDelay * 2, 30_000);
+          Date.now() - startedAt >= 10_000 ? 1_000 : Math.min(this.reconnectDelay * 2, 10_000);
         setTimeout(() => {
           if (gen !== this.streamGen || this.state.activeAgent !== name) return;
           if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
-          // 断流重连:断档只有退避的 3-30s,带断点锚快路径重连(重放补事件)
+          // 断流重连:断档只有退避的 1-10s,带断点锚快路径重连(重放补事件)
           this.maybeReconnect({ fast: true });
         }, this.reconnectDelay);
       }

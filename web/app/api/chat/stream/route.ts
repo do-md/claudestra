@@ -193,7 +193,9 @@ export async function GET(request: Request) {
           /* 已关闭 */
         }
       };
-      heartbeat = setInterval(() => send(SSE_DONE), 30_000);
+      // 10s 心跳(曾 30s):前端假死流看门狗按「25s 无字节」判死,心跳周期必须
+      // 显著短于判死阈值,不然活流被误杀
+      heartbeat = setInterval(() => send(SSE_DONE), 10_000);
 
       // 连流即补拉当前挂起态（question 事件 + 回合进行态可能早于本次订阅：
       // 切会话 / 刷新 / 回前台）。thinking 时先补一条 status:running，让 composer
