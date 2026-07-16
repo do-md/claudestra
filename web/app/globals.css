@@ -106,32 +106,33 @@ html.canvas-list {
 /*
  * ── Chat 消息进入动画 + 流式「思考中」三点（抄自 Claude OS styles.tsx） ──
  */
+/* owner 2026-07-16:进场统一「从右滑入 + 透明度渐显」 */
 @keyframes chat-msg-in {
     from {
         opacity: 0;
-        transform: translateY(6px);
+        transform: translateX(18px);
     }
     to {
         opacity: 1;
-        transform: translateY(0);
+        transform: translateX(0);
     }
 }
 .chat-msg-in {
-    animation: chat-msg-in 0.24s ease-out;
+    animation: chat-msg-in 0.28s cubic-bezier(0.22, 0.9, 0.35, 1);
 }
-/* 工具卡进场:比气泡更轻(高频出现,大动作会闹) */
+/* 工具卡进场:同方向,幅度/时长更轻(高频出现,大动作会闹) */
 @keyframes tool-in {
     from {
         opacity: 0;
-        transform: translateY(3px);
+        transform: translateX(10px);
     }
     to {
         opacity: 1;
-        transform: translateY(0);
+        transform: translateX(0);
     }
 }
 .tool-in {
-    animation: tool-in 0.18s ease-out;
+    animation: tool-in 0.2s ease-out;
 }
 /* 思考中 ✦/头像缓慢呼吸(2s 周期,scale+opacity 双通道) */
 @keyframes claude-pulse {
