@@ -14,18 +14,17 @@ self.addEventListener("push", (event) => {
     /* 非 JSON payload,用默认 */
   }
   event.waitUntil(
-    (async () => {
-      // 人正盯着页面就不弹系统横幅(页面内实时流已经在渲染回复)
-      const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-      if (wins.some((w) => w.focused)) return;
-      await self.registration.showNotification(payload.title, {
-        body: payload.body,
-        tag: payload.tag,
-        icon: "/icons/icon-192.png",
-        badge: "/icons/icon-192.png",
-        data: { url: payload.url, agent: payload.agent },
-      });
-    })()
+    // ⚠ 必须无条件 showNotification——iOS/Safari 对「push 到达却不展示」有
+    // 惩罚:静默几次后开始丢弃该订阅的后续推送(2026-07-16 真机实锤:一版
+    // 「前台聚焦不弹」把用户开着页面期间的推送全静默,随后通知全部收不到)。
+    // 前台重复感靠 tag 折叠缓解;绝不静默。
+    self.registration.showNotification(payload.title, {
+      body: payload.body,
+      tag: payload.tag,
+      icon: "/icons/icon-192.png",
+      badge: "/icons/icon-192.png",
+      data: { url: payload.url, agent: payload.agent },
+    })
   );
 });
 
