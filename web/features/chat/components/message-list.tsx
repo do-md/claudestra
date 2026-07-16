@@ -7,6 +7,7 @@ import { PermissionCard } from "./permission-card";
 import { AskQuestionCard } from "./ask-question-card";
 import { ReplyComponents } from "./reply-components";
 import { BgTaskPanel } from "./bg-task-panel";
+import { CcTaskPanel } from "./cc-task-panel";
 import { highlightCode, langForPath } from "../highlight";
 
 /* 复刻 Claude OS features/chat 的对话观感：assistant 全宽 + ✦ Claude 头，
@@ -871,6 +872,7 @@ export function MessageList() {
             awaiting={awaiting}
           />
         ))}
+        <CcTaskPanel />
         <BgTaskPanel />
         {pendingPermission && <PermissionCard p={pendingPermission} />}
         {pendingAsk && <AskQuestionCard a={pendingAsk} />}

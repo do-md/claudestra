@@ -51,6 +51,16 @@ export interface BgTaskView {
   durationMs?: number;
 }
 
+/** Claude Code 原生任务清单条目（~/.claude/tasks/<sessionId>/<id>.json）。 */
+export interface CcTaskView {
+  id: string;
+  subject: string;
+  /** 进行时态描述（in_progress 时 TUI 显示的那句） */
+  activeForm?: string;
+  status: "pending" | "in_progress" | "completed" | string;
+  blockedBy: string[];
+}
+
 /** 用户消息里附带的上传文件（用于自己气泡内回显）。 */
 export interface ChatAttachmentView {
   name: string;

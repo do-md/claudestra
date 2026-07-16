@@ -601,6 +601,49 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     return apiJson(200, { ok: true, query: q, hits: all.slice(0, limit), scanned: files.length });
   }
 
+  // [fork] GET /api/v1/agents/:name/tasks —— Claude Code 原生任务清单。
+  // TaskCreate/TaskUpdate 落盘在 ~/.claude/tasks/<sessionId>/<id>.json(每任务一
+  // 文件:{id,subject,description,activeForm,status,blocks,blockedBy})。Web 会话
+  // 页任务面板的数据源(owner 2026-07-16:「console 里的 todo 适配到 Web UI」)。
+  const tasksMatch = path.match(/^\/agents\/([^/]+)\/tasks$/);
+  if (tasksMatch && req.method === "GET") {
+    const agentParam = decodeURIComponent(tasksMatch[1]);
+    if (!agentInScope(principal, agentParam) && !agentInScope(principal, `agent-${agentParam}`)) {
+      return apiJson(403, { ok: false, error: `agent "${agentParam}" not in token scope` });
+    }
+    const agent = await findApiAgent(agentParam);
+    if (!agent?.sessionId) return apiJson(200, { ok: true, tasks: [] });
+    const dir = `${process.env.HOME}/.claude/tasks/${agent.sessionId}`;
+    const tasks: {
+      id: string;
+      subject: string;
+      activeForm?: string;
+      status: string;
+      blockedBy: string[];
+    }[] = [];
+    try {
+      for (const f of readdirSync(dir)) {
+        if (!/^\d+\.json$/.test(f)) continue;
+        try {
+          const t = JSON.parse(await Bun.file(`${dir}/${f}`).text());
+          tasks.push({
+            id: String(t.id ?? f.replace(".json", "")),
+            subject: String(t.subject ?? ""),
+            ...(t.activeForm ? { activeForm: String(t.activeForm) } : {}),
+            status: String(t.status ?? "pending"),
+            blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy.map(String) : [],
+          });
+        } catch {
+          /* 单个坏文件跳过 */
+        }
+      }
+    } catch {
+      /* 目录不存在 = 该会话没建过任务 */
+    }
+    tasks.sort((a, b) => Number(a.id) - Number(b.id));
+    return apiJson(200, { ok: true, tasks });
+  }
+
   // v2.9+ GET /api/v1/agents/:name/history —— session 清单（live + 归档快照）。
   // agent 已被 kill 时归档仍可读（这正是归档存在的意义），所以 registry 查不到
   // 不算 404，降级为只列归档。响应不含服务器路径（path 字段剥掉）。

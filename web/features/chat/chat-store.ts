@@ -7,6 +7,7 @@ import type {
   PendingPermission,
   PendingAsk,
   BgTaskView,
+  CcTaskView,
 } from "./type";
 import { consumeSSEStream, processStreamEvent, type StreamSink } from "./stream";
 import type { WebStreamEvent, WebComponentRow } from "@/lib/chat/events";
@@ -44,6 +45,9 @@ interface ChatState {
   pendingAsk: PendingAsk | null;
   /** 当前会话的后台任务（subagent / bg shell）跟踪面板，按到达顺序。 */
   bgTasks: BgTaskView[];
+  /** Claude Code 原生任务清单(TaskCreate,~/.claude/tasks/<sid>/)——Web 任务
+   *  面板(owner 2026-07-16「console 里的 todo 适配到 Web UI」)。 */
+  ccTasks: CcTaskView[];
   /** 个人资料：用户头像+昵称（显示在自己消息上方）与 Claude 头像+名称。 */
   profile: { nickname: string; avatar: string; claudeNickname: string; claudeAvatar: string };
 }
@@ -97,6 +101,7 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       pendingPermission: null,
       pendingAsk: null,
       bgTasks: [],
+      ccTasks: [],
       profile: { nickname: "", avatar: "", claudeNickname: "", claudeAvatar: "" },
     });
   }
@@ -336,13 +341,45 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       s.pendingAsk = null;
       // bg 任务面板 per-session：切走清空（新流只带连上后的新任务，watcher 不 replay 旧的）
       s.bgTasks = [];
+      // CC 任务清单 per-session:切走清空,下面异步拉当前 agent 的
+      s.ccTasks = [];
     });
+    void this.refreshCcTasks(name);
     // 无论有无缓存都重拉历史（stale-while-revalidate）——离开期间 agent 的产出
     // 只存在于 jsonl，不重拉就永远看不到。历史解析已稳定，重拉不再"漂"。
     await this.loadMessages(name, gen);
     if (gen !== this.openGen) return; // 已切走
     // 持久流 fire-and-forget（不 await，否则会一直阻塞到流关闭）
     void this.openStream(name);
+  }
+
+  /** CC 任务清单刷新防抖(TaskCreate/TaskUpdate 常连发)。 */
+  private ccTasksTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** 拉取当前 agent 的 Claude Code 原生任务清单(TaskCreate 落盘文件)。 */
+  private async refreshCcTasks(name: string) {
+    try {
+      const res = await fetch(`/api/chat/tasks?agent=${encodeURIComponent(name)}`);
+      if (!res.ok) return;
+      const j = (await res.json()) as { data?: CcTaskView[] };
+      if (this.state.activeAgent !== name) return; // 已切走
+      this.produce((s) => {
+        s.ccTasks = j.data ?? [];
+      });
+    } catch {
+      /* 拉取失败不打扰,下次工具触发再试 */
+    }
+  }
+
+  /** Task* 工具调用出现 → 防抖刷新任务面板(直播侧的触发钩子)。 */
+  public noteTaskToolSeen() {
+    const name = this.state.activeAgent;
+    if (!name) return;
+    if (this.ccTasksTimer) clearTimeout(this.ccTasksTimer);
+    this.ccTasksTimer = setTimeout(() => {
+      this.ccTasksTimer = null;
+      void this.refreshCcTasks(this.state.activeAgent);
+    }, 1200);
   }
 
   /** 强制从 jsonl 重新拉取当前 agent 的历史（丢弃缓存快照）。刷新入口用。 */
@@ -772,6 +809,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     detail?: string,
     id?: string
   ) {
+    // Task* 工具出现 = 任务清单大概率变了 → 防抖刷新任务面板
+    if (/^Task(Create|Update|Stop)$/.test(name)) this.noteTaskToolSeen();
     this.flushPendingText(); // 保持叙述/工具的真实交错序
     this.ensureLiveAssistant();
     this.produce((s) => {
