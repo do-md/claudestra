@@ -55,7 +55,7 @@ import { listAgentSessions, readSessionHistory, isValidSessionId, isValidSubagen
 import { existsSync, readdirSync, statSync } from "fs";
 import * as fs from "fs/promises";
 // [fork] master 历史 probe 用（master 不在 registry，sessionId 从 projects slug 目录取最新）
-import { projectsSlug } from "./lib/jsonl-cost.js";
+import { projectsSlug, projectJsonlPath } from "./lib/jsonl-cost.js";
 // v2.6.0+ 多前端事件总线（设计 docs/design-multi-frontend.md §4）
 import { emitEvent, subscribeEvents, replayEventsSince, getAgentStatus, type EventFilter } from "./bridge/event-bus.js";
 // v2.7+ Claude Code agents 模式适配：中性会话清单 + bg job 清理 + 分身对账
@@ -76,6 +76,7 @@ import {
   apiReqKey,
   // [fork] clear 轮转的快照 diff 用（定义随 /api/v1 路由块落 api-routes.ts）
   listSessionIdsForCwd,
+  latestSessionIdForCwd,
   type PendingApiRequest,
   type ApiReplyResult,
 } from "./bridge/api-routes.js";
@@ -3595,6 +3596,56 @@ const lastMessageSource = new Map<string, "user" | "agent" | "api">();
 const COMPLETION_DEDUPE_MS = 10_000; // 10 秒内不重复发完成通知
 
 /**
+ * bridge 重启后 lastMessageSource 内存清零——重启后的第一个回合会误判成
+ * 「user 触发」照发 Discord @(2026-07-16 两次真机撞上:Web 对话结束仍被 @)。
+ * 兜底:从 agent 的 session jsonl 尾部推断最后一条 inbound 的来源——Web/API
+ * 消息的注入头「[🌐 来自」是持久痕迹,重启也丢不了。只在 map 查不到时读盘,
+ * 结果回填 map,同频道后续 Stop 不再读。
+ */
+async function inferInboundSourceFromJsonl(channelId: string): Promise<"api" | undefined> {
+  try {
+    let cwd: string | undefined;
+    let sessionId: string | undefined;
+    if (channelId === CONTROL_CHANNEL_ID) {
+      cwd = MASTER_DIR;
+      sessionId = latestSessionIdForCwd(cwd);
+    } else {
+      const reg = (await readRegistryAgents()).find((a) => a.channelId === channelId);
+      cwd = reg?.cwd;
+      sessionId = reg?.sessionId;
+    }
+    if (!cwd || !sessionId) return undefined;
+    const f = Bun.file(projectJsonlPath(cwd, sessionId));
+    const size = f.size;
+    if (!size) return undefined;
+    const start = Math.max(0, size - 256 * 1024);
+    const lines = (await f.slice(start, size).text()).split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('"type":"user"')) continue;
+      try {
+        const e = JSON.parse(lines[i]);
+        if (e.type !== "user") continue;
+        const c = e.message?.content;
+        const txt =
+          typeof c === "string"
+            ? c
+            : Array.isArray(c)
+              ? c.map((b: { text?: string }) => b?.text ?? "").join("\n")
+              : "";
+        if (!txt.trim() || /^\[Request interrupted/.test(txt)) continue; // 工具结果/中断标记不是 inbound
+        // 双信号:channel 标签的 chat_id="api: 属性(机器化,最稳)或注入头文案
+        return txt.includes('chat_id="api:') || txt.includes("[🌐 来自") ? "api" : undefined;
+      } catch {
+        /* 跨 chunk 断行 */
+      }
+    }
+  } catch {
+    /* 文件不存在等 → 未知 */
+  }
+  return undefined;
+}
+
+/**
  * v1.9.22+ 对称 direct 路由：我方 bot 在对方 guild 的 foreign #agent-exchange 收到 @
  * 时，判断是否该走直接路由到我方 exposed agent。
  *
@@ -4408,7 +4459,13 @@ async function handleHookRequest(req: Request): Promise<Response> {
       // v2.10+ "api" 同跳（owner「谁发的谁回」）:Web 端触发的回合,用户在 Web 上
       // 看回复,Discord 不再 @ 推送(mirror 内容照旧)。
       {
-        const src = lastMessageSource.get(channelId);
+        let src = lastMessageSource.get(channelId);
+        // bridge 重启后 map 清零 → 从 jsonl 尾部推断(Web 注入头是持久痕迹),
+        // 否则重启后的第一个回合必误发 Discord @(2026-07-16 两次真机撞上)
+        if (src === undefined && shouldNotify) {
+          src = await inferInboundSourceFromJsonl(channelId);
+          if (src) lastMessageSource.set(channelId, src);
+        }
         if (shouldNotify && (src === "agent" || src === "api")) {
           console.log(`🏁 跳过完成通知（触发源=${src},非 Discord 用户）: channel=${channelId}`);
           shouldNotify = false;
