@@ -44,19 +44,32 @@ export async function enablePush(): Promise<{ ok: boolean; msg: string }> {
     const keyRes = await fetch("/api/push");
     const keyJson = (await keyRes.json()) as { data?: { publicKey: string } };
     if (!keyJson.data?.publicKey) throw new Error("no key");
-    const sub =
-      (await reg.pushManager.getSubscription()) ??
-      (await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlB64ToUint8(keyJson.data.publicKey) as BufferSource,
-      }));
+    // 每次「开启」都强制换全新订阅身份:先退掉残留的旧订阅再 subscribe。
+    // 一版 getSubscription()??subscribe() 会复用旧订阅——用户「关了再开」想
+    // 重置时身份根本没换,被 iOS 端作废的订阅救不回来(2026-07-16 排障实锤)。
+    const stale = await reg.pushManager.getSubscription();
+    if (stale) await stale.unsubscribe().catch(() => {});
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlB64ToUint8(keyJson.data.publicKey) as BufferSource,
+    });
     const res = await fetch("/api/push", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ subscription: sub.toJSON() }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return { ok: true, msg: "已开启:Web 端发起的对话有回复时推送到本设备" };
+    // 本地测试通知(不走 APNs):立刻能看到=展示层正常,之后收不到就是投递层
+    try {
+      await reg.showNotification("推送已开启 ✅", {
+        body: "这条是本地测试——能看到它,说明通知展示没问题",
+        tag: "cstra-local-test",
+        icon: "/icons/icon-192.png",
+      });
+    } catch {
+      /* 本地测试失败不影响订阅 */
+    }
+    return { ok: true, msg: "已开启:应该立刻弹了一条本地测试通知" };
   } catch (e) {
     return { ok: false, msg: `开启失败:${(e as Error).message}(需要 HTTPS 或安装到主屏幕)` };
   }
