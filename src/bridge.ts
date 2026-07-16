@@ -828,13 +828,16 @@ async function renderContentForLocal(env: RouterEnvelope): Promise<string> {
     return env.content;
   }
 
-  // v2.6.0+ HTTP API 用户（设计 §5.2）：header 明示对话方不是 Discord 用户 ——
+  // v2.6.0+ HTTP API 用户（设计 §5.2）：header 明示对话方经 Web/API 接入 ——
   // 没有 @mention/push 语义，且这是外部 principal（R1 纵深防御：agent 可据此
   // 对上下文里的敏感内容保持沉默）。reply 直接回 meta.chat_id（api:<tokenId>）。
+  // v2.10+ 措辞修正(owner 2026-07-16):旧文案「对方看不到本频道历史」在 Web
+  // 客户端出现后已失真——Web 有完整聊天记录(history API),agent 被误导后会
+  // 重复复述用户已看到的上下文。
   if (from.kind === "api") {
     return [
-      `[🌐 来自 API 用户「${from.name}」（外部 token 接入，非 Discord）。`,
-      `直接用 reply() 回答到本 chat_id 即可；对方看不到本频道历史，不要在回复里引用与本请求无关的既有上下文内容。]`,
+      `[🌐 来自 Web 端用户「${from.name}」（HTTP API 接入，非 Discord）。`,
+      `用 reply() 回答到本 chat_id。对方界面完整渲染 Markdown（表格可用），且能看到本频道完整聊天记录——不要复述上下文；也不要引用与本请求无关的内容。]`,
       ``,
       env.content,
     ].join("\n");

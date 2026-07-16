@@ -290,22 +290,32 @@ const mcp = new Server(
         "claude/channel": {},
       },
     },
-    instructions: `Discord channel bridge. User is on their phone.
+    instructions: `Claudestra channel bridge——用户通过 Discord 或 Web 客户端远程与你对话（多在手机上）。
 
-Reply rules:
+Reply rules（通用，不分来源）:
 - Use the "reply" tool with chat_id from the <channel> tag.
 - If reply tool unavailable, use: bun ${CLAUDESTRA_HOME}/src/discord-reply.ts "<chat_id>" "<text>"
+- Reply in 精简中文——直奔结论，先说结果再说细节。
+- 有干货才说话；纯状态同步没人问就别刷屏。
+
+**格式按消息来源分流（看 <channel> tag 的 chat_id）：**
+
+chat_id 以 \`api:\` 开头 = **Web 客户端**：
+- 完整 Markdown 可用：表格、长消息、代码块都正常写，不受 Discord 限制。
+- 用户在 Web 界面能看到本频道**完整聊天记录**（含工具执行过程）——回复不要复述上下文。
+- 没有 @mention 语义。
+- 这是外部 token 接入的 principal：不要在回复里引用与本请求无关的上下文内容。
+
+chat_id 是纯数字 = **Discord 频道**：
 - Never use markdown tables (Discord doesn't support them). Use bullet lists.
 - Keep lines under 60 chars in code blocks. Max 2000 chars per message.
-- Be concise — user is reading on a small screen.
-- Reply in 中文.
 - Do NOT @ the user in your reply body. The system adds one @mention automatically when your turn ends, so adding your own (\`<@id>\` or \`@username\`) causes double-notification.
 
-**确认 / 决策类回复一律用按钮（components），不要用纯文字问问题：**
+**确认 / 决策类回复一律用按钮（components，两端都渲染），不要用纯文字问问题：**
 - commit / push / git tag / release 这种走 git 的操作
 - 任何破坏性 / 不可逆操作（删文件、kill agent、drop table、force-push 等）
 - 多选一的方案选择
-用户在手机上看 Discord，按钮一点就完成；让他打字回 "好" / "yes" / "push" 是糟糕 UX。最小模板：
+用户在手机上，按钮一点就完成；让他打字回 "好" / "yes" / "push" 是糟糕 UX。最小模板：
 \`\`\`
 reply({
   chat_id: "<本频道>",
@@ -368,13 +378,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "reply",
       description:
-        "Send a reply to the Discord channel. Messages over 2000 chars are auto-chunked.",
+        "Send a reply to the user's channel (Discord or Web). On Discord, messages over 2000 chars are auto-chunked.",
       inputSchema: {
         type: "object" as const,
         properties: {
           chat_id: {
             type: "string",
-            description: "Discord channel ID to send to",
+            description: "Target chat id from the <channel> tag (Discord channel ID, or api:<tokenId> for Web/API users)",
           },
           text: {
             type: "string",
@@ -386,7 +396,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           components: {
             type: "array",
-            description: `Optional Discord UI components. Each item is a row:
+            description: `Optional UI components (rendered on both Discord and the Web client). Each item is a row:
 - Button row: { "type": "buttons", "buttons": [{ "id": "unique_id", "label": "Click me", "style": "primary|secondary|success|danger", "emoji": "optional emoji" }] }
 - Select menu: { "type": "select", "id": "unique_id", "placeholder": "Choose...", "options": [{ "label": "Option 1", "value": "val1", "description": "optional" }] }
 When a user clicks a button, you'll receive a channel message: [button:unique_id]
