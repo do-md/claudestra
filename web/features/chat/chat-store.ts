@@ -413,7 +413,28 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
           }
           return true;
         });
-        s.messages = [...history, ...pending];
+        // 直播回合保全:回合进行中做对齐(回前台 >5min / seq 倒退兜底),历史
+        // 整体替换会把正在流式的 assistant 气泡吞掉——CC 回合内经常攒内存不落
+        // 盘,jsonl 里还没有这些内容,气泡一吞屏上只剩状态条,「头像和动效都
+        // 消失了,像卡死」(2026-07-16 真机截图)。历史尾部还不是 assistant
+        // (jsonl 未落盘)时,把 streamed 气泡接回列表尾。
+        const liveTail: ChatMessage[] = [];
+        if (this.state.streaming) {
+          const streamedBubbles = s.messages.filter(
+            (m) => m.role === "assistant" && m.streamed
+          );
+          const histLast = history[history.length - 1];
+          if (streamedBubbles.length && (!histLast || histLast.role !== "assistant")) {
+            liveTail.push(...streamedBubbles);
+          }
+        }
+        s.messages = [...history, ...pending, ...liveTail];
+        // 回合进行中但尾部没有直播气泡(被历史吸收/尚无输出)→ 恢复「思考中」
+        // 指示,别让 streaming 态孤零零挂在状态条上而列表底空白
+        if (s.streaming && !liveTail.length) {
+          const tail = s.messages[s.messages.length - 1];
+          if (!(tail?.role === "assistant" && tail.streamed)) s.awaitingChunk = true;
+        }
         s.loadingHistory = false;
         s.historyError = false;
       });
