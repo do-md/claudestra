@@ -4,6 +4,7 @@ import { useChatStore, useChatStoreApi } from "../chat-store";
 import type { AgentSession } from "../type";
 import { SettingsModal } from "./settings-modal";
 import { InstallBanner } from "./install-banner";
+import { PushBanner } from "./push-banner";
 import { StatsPanel } from "./stats-panel";
 import { ctxLevel, CTX_WINDOW } from "../ctx-level";
 import { fmtAgo } from "../fmt-time";
@@ -496,6 +497,8 @@ export function Sidebar({ onSelect }: { onSelect: () => void }) {
 
       {/* 添加到主屏幕引导（浏览器标签页访问且未 dismiss 时显示） */}
       <InstallBanner />
+      {/* 开启推送引导（已具备推送能力且没问过权限时显示,与安装引导天然互斥） */}
+      <PushBanner />
 
       {/* touch-pan-y + overscroll-contain：iOS 到边界时滚动链会穿透到不可滚的
           fixed 应用壳，橡皮筋吃掉手势看着像「滑不动」（BgLines 同款修法）。 */}

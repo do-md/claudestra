@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useChatStoreApi } from "../chat-store";
+import { enablePush, disablePush, getPushSubscription } from "@/lib/push/client";
 
 /** 选中的图片 → 128×128 居中裁剪 jpeg data URL（~10-20KB,存库直出）。 */
 async function fileToAvatar(file: File): Promise<string> {
@@ -96,12 +97,6 @@ const GLOBAL_MODEL_OPTIONS = [
 
 const GLOBAL_EFFORT_OPTIONS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-/** base64url VAPID 公钥 → Uint8Array(pushManager.subscribe 要求)。 */
-function urlB64ToUint8(base64: string): Uint8Array {
-  const pad = "=".repeat((4 - (base64.length % 4)) % 4);
-  const raw = atob((base64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
-  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
-}
 
 /**
  * 全局设置弹窗（侧栏 ⚙️ 进入）：个人资料（我的 + Claude 的头像/昵称,
@@ -161,61 +156,16 @@ export function SettingsModal({ open, onClose }: { open: boolean; onClose: () =>
       .catch(() => setGMsg("读取失败"));
     // 本设备是否已订阅推送(看本地 pushManager,与服务端表无关——多设备各自管各自)
     setPushMsg("");
-    if ("serviceWorker" in navigator && "PushManager" in window) {
-      navigator.serviceWorker
-        .getRegistration()
-        .then((reg) => reg?.pushManager.getSubscription())
-        .then((sub) => setPushOn(!!sub))
-        .catch(() => {});
-    }
+    void getPushSubscription().then((sub) => setPushOn(!!sub));
   }, [open, store]);
 
   const togglePush = async () => {
     setPushBusy(true);
     setPushMsg("");
-    try {
-      if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-        setPushMsg("此环境不支持推送(iOS 需先「添加到主屏幕」并从主屏打开)");
-        return;
-      }
-      const reg = (await navigator.serviceWorker.getRegistration()) ?? (await navigator.serviceWorker.register("/sw.js"));
-      const existing = await reg.pushManager.getSubscription();
-      if (pushOn && existing) {
-        await fetch("/api/push", {
-          method: "DELETE",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: existing.endpoint }),
-        });
-        await existing.unsubscribe();
-        setPushOn(false);
-        setPushMsg("已关闭本设备推送");
-        return;
-      }
-      const perm = await Notification.requestPermission();
-      if (perm !== "granted") {
-        setPushMsg("通知权限被拒绝——请在系统设置里允许后重试");
-        return;
-      }
-      const keyRes = await fetch("/api/push");
-      const keyJson = (await keyRes.json()) as { data?: { publicKey: string } };
-      if (!keyJson.data?.publicKey) throw new Error("no key");
-      const sub = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlB64ToUint8(keyJson.data.publicKey) as BufferSource,
-      });
-      const res = await fetch("/api/push", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subscription: sub.toJSON() }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setPushOn(true);
-      setPushMsg("已开启:Web 端发起的对话有回复时推送到本设备");
-    } catch (e) {
-      setPushMsg(`开启失败:${(e as Error).message}(需要 HTTPS 或安装到主屏幕)`);
-    } finally {
-      setPushBusy(false);
-    }
+    const r = pushOn ? await disablePush() : await enablePush();
+    if (r.ok) setPushOn(!pushOn);
+    setPushMsg(r.msg);
+    setPushBusy(false);
   };
 
   if (!open) return null;
