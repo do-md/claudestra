@@ -58,33 +58,62 @@ export function TerminalPage({
     };
   }, []);
 
-  // 左缘滑返回(owner 2026-07-16:「左滑返回识别率有点低」)——PWA standalone
-  // 下 iOS 系统边缘返回手势不可靠,自己识别:起始点 x<28px、水平位移 >56px 且
-  // 明显横向主导 → 关页。capture 阶段监听,xterm 自己的触摸处理(合成滚轮)
-  // 拦不到左缘起始的这一段。
-  const edgeRef = useRef<{ x: number; y: number; active: boolean } | null>(null);
+  // 左缘滑返回(owner 2026-07-16 二版:「滑到一半闪变聊天页,体验很差」)——
+  // 一版在 touchmove 过 56px 阈值就立即 onClose,手指还在屏上页面已经切了,
+  // 体感即「闪烁」。改成 iOS 原生语义三段式:
+  //   拖动中:页面跟手 translateX(直接写 DOM style,不 setState——xterm 在树里,
+  //           每 move 重渲染会卡);
+  //   松手:位移 > max(90px, 25vw) 才提交(滑出动画 0.2s 后 onClose),否则弹回;
+  //   方向裁决:首次位移横向主导才进入拖动,竖向主导则放弃(让给终端滚动);
+  //           进入拖动后 stopPropagation,别让 xterm 同时收到触摸当滚动处理。
+  // capture 阶段监听,xterm 自己的触摸处理拦不到左缘起始的这一段。
+  const edgeRef = useRef<{ x: number; y: number; dragging: boolean; dead: boolean } | null>(null);
+  const pageRef = useRef<HTMLDivElement>(null);
   return createPortal(
     <div
+      ref={pageRef}
       className="fixed inset-0 z-50 bg-[#1e1e2e]"
       onTouchStartCapture={(e) => {
         const t = e.touches[0];
         edgeRef.current =
-          t && t.clientX < 28 ? { x: t.clientX, y: t.clientY, active: true } : null;
+          t && t.clientX < 28 ? { x: t.clientX, y: t.clientY, dragging: false, dead: false } : null;
       }}
       onTouchMoveCapture={(e) => {
         const s = edgeRef.current;
-        if (!s?.active) return;
+        const el = pageRef.current;
+        if (!s || s.dead || !el) return;
         const t = e.touches[0];
         if (!t) return;
         const dx = t.clientX - s.x;
         const dy = Math.abs(t.clientY - s.y);
-        if (dx > 56 && dx > dy * 1.5) {
-          s.active = false;
-          onClose();
+        if (!s.dragging) {
+          // 方向裁决:横向主导才接管;竖向先动则整个手势让给终端
+          if (dy > 12 && dy > dx) {
+            s.dead = true;
+            return;
+          }
+          if (!(dx > 12 && dx > dy * 1.2)) return;
+          s.dragging = true;
         }
+        e.stopPropagation();
+        el.style.transition = "none";
+        el.style.transform = `translateX(${Math.max(0, dx)}px)`;
       }}
-      onTouchEndCapture={() => {
-        if (edgeRef.current) edgeRef.current.active = false;
+      onTouchEndCapture={(e) => {
+        const s = edgeRef.current;
+        const el = pageRef.current;
+        edgeRef.current = null;
+        if (!s?.dragging || !el) return;
+        const t = e.changedTouches[0];
+        const dx = t ? t.clientX - s.x : 0;
+        const commit = dx > Math.max(90, window.innerWidth * 0.25);
+        el.style.transition = "transform 0.2s ease-out";
+        if (commit) {
+          el.style.transform = "translateX(100%)";
+          setTimeout(onClose, 190);
+        } else {
+          el.style.transform = "translateX(0)";
+        }
       }}
     >
       <div
