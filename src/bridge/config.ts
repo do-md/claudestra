@@ -39,5 +39,9 @@ export const ENV_WITH_BUN = {
 export const WATCHER_CONFIG = {
   showToolUse: true,       // 显示 tool 调用（📖 Read file.ts）
   showClaudeText: true,    // 显示 Claude 说的话（非 reply 的文本）
-  debounceMs: 1500,        // tool 合并等待时间
+  debounceMs: 1500,        // tool 合并等待时间（只作用于 Discord 推送；SSE 即时）
+  // jsonl 轮询间隔。曾 2000ms——web 端显示比终端慢 1-2s 的主因(SSE emit 在
+  // 解析当下就发,但要等下一轮 poll 才解析)。降到 500ms:空转成本只是每
+  // agent 一次 fs.stat,便宜;平均延迟 1s → 0.25s(owner 2026-07-16)。
+  pollMs: 500,
 };

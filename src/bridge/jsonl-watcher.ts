@@ -608,8 +608,9 @@ export async function startWatching(
     if (eventType === "change") processNewData(state, discord);
   });
 
-  // 2 秒轮询兜底（macOS fs.watch 偶尔丢事件）
-  const pollInterval = setInterval(() => processNewData(state, discord), 2000);
+  // 轮询兜底（macOS fs.watch 偶尔丢事件;丢失时延迟全由这里决定——
+  // 2s 曾是 web 端比终端慢几秒的主要成分,现 500ms,见 WATCHER_CONFIG.pollMs）
+  const pollInterval = setInterval(() => processNewData(state, discord), WATCHER_CONFIG.pollMs);
   state.pollInterval = pollInterval;
 
   // 空闲检测由 Claude Code hooks (Stop/Notification) 处理，不再用 tmux 屏幕比较
