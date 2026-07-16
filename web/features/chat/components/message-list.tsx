@@ -78,6 +78,7 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
   const err = tool.state === "error";
   const tone = TOOL_TONE[tool.state] ?? TOOL_TONE.running;
   return (
+    <QuoteSwipe quote={`${tool.name} ${summary}`}>
     <div className={`tool-in rounded-lg border ${tone.box}`}>
       <div
         className="flex cursor-pointer items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs"
@@ -110,6 +111,7 @@ const ActiveToolRow = memo(function ActiveToolRow({ tool, active }: { tool: Tool
         </div>
       )}
     </div>
+    </QuoteSwipe>
   );
 });
 
@@ -125,6 +127,7 @@ const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallVi
   const [open, setOpen] = useState(false);
   const tone = TOOL_TONE[tool.state] ?? TOOL_TONE.done;
   return (
+    <QuoteSwipe quote={`${tool.name} ${summary}`}>
     <div className={`rounded-lg border ${tone.box}`}>
       <div
         className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-1.5 font-mono text-xs"
@@ -160,6 +163,7 @@ const HistoryToolRow = memo(function HistoryToolRow({ tool }: { tool: ToolCallVi
         </div>
       )}
     </div>
+    </QuoteSwipe>
   );
 });
 
@@ -496,6 +500,80 @@ function ReplyDivider() {
  *  喂字）;已封笔的段立即走 Domd——此前整个回合流式期间全是裸 markdown 星号,
  *  长回合要等几十分钟才「渲染出来」（2026-07-14 owner「渲染速度这么慢」）。
  *  memo：props 全是原始值，定稿段的 Domd（markdown 解析）不再随流式重渲染。 */
+/**
+ * 消息块左滑引用(owner 2026-07-16):文字段/工具卡/回复/user 气泡左滑露出
+ * 引用图标,过阈值松手 → composer 出现引用预览,发送时以 Markdown 引用块
+ * 前置(web/Discord 都原生渲染)。方向裁决同终端页手势:竖向先动让给滚动。
+ * 跟手位移直接写 DOM style(不 setState——流式期间高频 re-render 是性能命门)。
+ */
+function QuoteSwipe({ quote, className, children }: { quote: string; className?: string; children: React.ReactNode }) {
+  const store = useChatStoreApi();
+  const ref = useRef<HTMLDivElement>(null);
+  const iconRef = useRef<HTMLSpanElement>(null);
+  const st = useRef<{ x: number; y: number; drag: boolean; dead: boolean } | null>(null);
+  return (
+    <div className={`relative ${className ?? ""}`}>
+      <span
+        ref={iconRef}
+        className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 text-base-content/50"
+        style={{ opacity: 0 }}
+        aria-hidden
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M9.5 8C7 8 5 10 5 12.7c0 2 1.5 3.6 3.4 3.6 1.7 0 3-1.3 3-3 0-1.6-1.2-2.8-2.8-2.8-.3 0-.6 0-.8.1C8.2 9.6 9 8.9 10 8.5L9.5 8zm7 0C14 8 12 10 12 12.7c0 2 1.5 3.6 3.4 3.6 1.7 0 3-1.3 3-3 0-1.6-1.2-2.8-2.8-2.8-.3 0-.6 0-.8.1.4-1 1.2-1.7 2.2-2.1L16.5 8z" />
+        </svg>
+      </span>
+      <div
+        ref={ref}
+        onTouchStart={(e) => {
+          const t = e.touches[0];
+          st.current = t ? { x: t.clientX, y: t.clientY, drag: false, dead: false } : null;
+        }}
+        onTouchMove={(e) => {
+          const s = st.current;
+          const el = ref.current;
+          if (!s || s.dead || !el) return;
+          const t = e.touches[0];
+          if (!t) return;
+          const dx = t.clientX - s.x;
+          const dy = Math.abs(t.clientY - s.y);
+          if (!s.drag) {
+            // 竖向先动 → 手势让给列表滚动;明显左滑才接管
+            if (dy > 10 && dy > -dx) {
+              s.dead = true;
+              return;
+            }
+            if (!(dx < -14 && -dx > dy * 1.3)) return;
+            s.drag = true;
+          }
+          e.stopPropagation();
+          const pull = Math.max(-72, Math.min(0, dx));
+          el.style.transition = "none";
+          el.style.transform = `translateX(${pull}px)`;
+          if (iconRef.current) iconRef.current.style.opacity = String(Math.min(1, -pull / 48));
+        }}
+        onTouchEnd={(e) => {
+          const s = st.current;
+          const el = ref.current;
+          st.current = null;
+          if (!s?.drag || !el) return;
+          const t = e.changedTouches[0];
+          const dx = t ? t.clientX - s.x : 0;
+          el.style.transition = "transform 0.18s ease-out";
+          el.style.transform = "translateX(0)";
+          if (iconRef.current) {
+            iconRef.current.style.transition = "opacity 0.18s ease-out";
+            iconRef.current.style.opacity = "0";
+          }
+          if (dx < -48) store.setQuote(quote);
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
 const TextBlock = memo(function TextBlock({
   text,
   ts,
@@ -511,32 +589,34 @@ const TextBlock = memo(function TextBlock({
 }) {
   const [showTs, setShowTs] = useState(false);
   return (
-    <div
-      className={`cursor-pointer ${
-        muted
-          ? // 首版 13px/60% 被 owner 打回「区分不够」——真因是 DOMD 组件用
-            // adoptedStyleSheets 给 .DOMD-Root 钉 16px/深色,wrapper 的字号颜色
-            // 根本穿不进去。narration-muted(globals.css)按 specificity 打穿,
-            // 这里的 12.5px + 45% 灰才真正落到正文元素上。
-            // 12.5px/45% 又被打回「眼睛疼」——回调到 13.5px/50%,靠竖线+字号差保持区分
-            "narration-muted border-l-2 border-base-content/20 pl-2.5 text-[13.5px] leading-snug text-base-content/50"
-          : ""
-      }`}
-      onClick={() => setShowTs((v) => !v)}
-    >
-      {streamed ? (
-        // 生长中的段也实时富文本（2026-07-14 owner「边输出边渲染」）：DOMD 只读
-        // 一次 → 用 key 按内容长度强制重挂,每次 80ms 合批后重新解析整段。段落
-        // 级体量解析是亚毫秒级,memo 隔离其它段;未闭合语法(写到一半的 **/```)
-        // 期间样式会短暂跳动,属流式渲染的正常代价。
-        <Domd key={text.length} initMd={text} bodyClassName="chat-domd" />
-      ) : (
-        <Domd initMd={text} bodyClassName="chat-domd" />
-      )}
-      {showTs && ts && (
-        <div className="mt-0.5 font-mono text-[10px] tabular-nums opacity-40">{fmtTs(ts)}</div>
-      )}
-    </div>
+    <QuoteSwipe quote={text}>
+      <div
+        className={`cursor-pointer ${
+          muted
+            ? // 首版 13px/60% 被 owner 打回「区分不够」——真因是 DOMD 组件用
+              // adoptedStyleSheets 给 .DOMD-Root 钉 16px/深色,wrapper 的字号颜色
+              // 根本穿不进去。narration-muted(globals.css)按 specificity 打穿,
+              // 这里的 12.5px + 45% 灰才真正落到正文元素上。
+              // 12.5px/45% 又被打回「眼睛疼」——回调到 13.5px/50%,靠竖线+字号差保持区分
+              "narration-muted border-l-2 border-base-content/20 pl-2.5 text-[13.5px] leading-snug text-base-content/50"
+            : ""
+        }`}
+        onClick={() => setShowTs((v) => !v)}
+      >
+        {streamed ? (
+          // 生长中的段也实时富文本（2026-07-14 owner「边输出边渲染」）：DOMD 只读
+          // 一次 → 用 key 按内容长度强制重挂,每次 80ms 合批后重新解析整段。段落
+          // 级体量解析是亚毫秒级,memo 隔离其它段;未闭合语法(写到一半的 **/```)
+          // 期间样式会短暂跳动,属流式渲染的正常代价。
+          <Domd key={text.length} initMd={text} bodyClassName="chat-domd" />
+        ) : (
+          <Domd initMd={text} bodyClassName="chat-domd" />
+        )}
+        {showTs && ts && (
+          <div className="mt-0.5 font-mono text-[10px] tabular-nums opacity-40">{fmtTs(ts)}</div>
+        )}
+      </div>
+    </QuoteSwipe>
   );
 });
 
@@ -660,14 +740,27 @@ const Message = memo(function Message({
           </div>
         )}
         {atts.length > 0 && <AttachmentStrip items={atts} />}
-        {m.content && (
-          <div
-            className="max-w-[85%] cursor-pointer whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90"
-            onClick={() => setShowTs((v) => !v)}
-          >
-            {m.content}
-          </div>
-        )}
+        {m.content && (() => {
+          // 引用回复格式(左滑引用):「> 引用\n\n正文」→ 引用渲染成样式条
+          const qm = m.content.match(/^> (.+?)\n\n([\s\S]*)$/);
+          const quoted = qm?.[1];
+          const body = qm ? qm[2] : m.content;
+          return (
+            <QuoteSwipe quote={body} className="max-w-[85%]">
+              <div
+                className="cursor-pointer whitespace-pre-wrap break-words rounded-[15px_15px_4px_15px] border border-base-content/5 bg-base-300 px-[15px] py-[11px] text-[14.5px] leading-[1.6] text-base-content/90"
+                onClick={() => setShowTs((v) => !v)}
+              >
+                {quoted && (
+                  <div className="mb-2 border-l-2 border-base-content/25 pl-2 text-[12px] leading-snug text-base-content/50">
+                    {quoted}
+                  </div>
+                )}
+                {body}
+              </div>
+            </QuoteSwipe>
+          );
+        })()}
         {showTs && m.ts && (
           <div className="pr-1 font-mono text-[10px] tabular-nums opacity-40">{fmtTs(m.ts)}</div>
         )}

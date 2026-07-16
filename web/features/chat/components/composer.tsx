@@ -146,6 +146,7 @@ export function Composer() {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const active = useChatStore((s) => s.state.activeAgent);
   const streaming = useChatStore((s) => s.state.streaming);
+  const quoteDraft = useChatStore((s) => s.state.quoteDraft);
   const agents = useChatStore((s) => s.state.agents);
   const store = useChatStoreApi();
   // 上下文超标警示(2026-07-14 owner:到限制要在聊天界面提醒)。每会话可关闭。
@@ -566,6 +567,24 @@ export function Composer() {
                 : "border-base-content/10"
           }`}
         >
+          {/* 引用预览条(左滑消息块设置):显示将随下条消息前置的引用,✕ 取消 */}
+          {quoteDraft && (
+            <div className="flex items-center gap-2 border-b border-base-content/[0.06] bg-base-300/40 px-3.5 py-1.5 text-[11.5px]">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" className="shrink-0 text-base-content/40">
+                <path d="M9.5 8C7 8 5 10 5 12.7c0 2 1.5 3.6 3.4 3.6 1.7 0 3-1.3 3-3 0-1.6-1.2-2.8-2.8-2.8-.3 0-.6 0-.8.1C8.2 9.6 9 8.9 10 8.5L9.5 8zm7 0C14 8 12 10 12 12.7c0 2 1.5 3.6 3.4 3.6 1.7 0 3-1.3 3-3 0-1.6-1.2-2.8-2.8-2.8-.3 0-.6 0-.8.1.4-1 1.2-1.7 2.2-2.1L16.5 8z" />
+              </svg>
+              <span className="min-w-0 flex-1 truncate text-base-content/55">{quoteDraft}</span>
+              <button
+                className="shrink-0 p-0.5 text-base-content/40 hover:text-base-content/70"
+                aria-label="取消引用"
+                onClick={() => store.clearQuote()}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+          )}
           {/* 正在回复状态条：流式期间常驻，告知此刻发送会插入当前会话（回合边界后生效），
               暂停按钮就在下方。刷新 / 切回进行中的会话也会经 SSE 补拉进入此态。 */}
           {streaming && (

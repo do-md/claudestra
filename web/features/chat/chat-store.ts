@@ -52,6 +52,8 @@ interface ChatState {
   /** Claude Code 原生任务清单(TaskCreate,~/.claude/tasks/<sid>/)——Web 任务
    *  面板(owner 2026-07-16「console 里的 todo 适配到 Web UI」)。 */
   ccTasks: CcTaskView[];
+  /** 左滑消息块选中的引用文本(composer 显示预览,发送时以 > 引用块前置)。 */
+  quoteDraft: string | null;
   /** 个人资料：用户头像+昵称（显示在自己消息上方）与 Claude 头像+名称。 */
   profile: { nickname: string; avatar: string; claudeNickname: string; claudeAvatar: string };
 }
@@ -108,7 +110,24 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       pendingAsk: null,
       bgTasks: [],
       ccTasks: [],
+      quoteDraft: null,
       profile: { nickname: "", avatar: "", claudeNickname: "", claudeAvatar: "" },
+    });
+  }
+
+  /** 左滑消息块 → 设引用草稿(composer 预览;再滑别的块覆盖;✕ 清除)。 */
+  public setQuote(text: string) {
+    const t = text.trim().replace(/\s+/g, " ").slice(0, 200);
+    if (!t) return;
+    this.produce((s) => {
+      s.quoteDraft = t;
+    });
+  }
+
+  public clearQuote() {
+    if (!this.state.quoteDraft) return;
+    this.produce((s) => {
+      s.quoteDraft = null;
     });
   }
 
@@ -713,10 +732,17 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
    * 不写进程 stdin，靠 CC 原生排队，语义即「插入正在跑的会话」。
    */
   public async send(text: string, files?: File[], wireText?: string) {
-    const display = text.trim();
+    let display = text.trim();
     const hasFiles = !!files && files.length > 0;
     if ((!display && !hasFiles) || !this.state.activeAgent) return;
     const agent = this.state.activeAgent;
+    // 引用回复(owner 2026-07-16 左滑引用):composer 文本发送时把引用草稿以
+    // Markdown 引用块前置——web/Discord 都原生渲染,agent 也看得懂针对哪段。
+    // 按钮点击(wireText 场景)不消费引用。
+    if (!wireText && this.state.quoteDraft && display) {
+      display = `> ${this.state.quoteDraft}\n\n${display}`;
+      this.clearQuote();
+    }
     // wireText：发给 agent 的真实 payload（默认=展示文本）。按钮点击时展示 label、
     // 实际发 [button:<id>]，二者不同——agent 收到的是分支用的机器 payload。
     const wire = (wireText ?? display).trim() || display;
