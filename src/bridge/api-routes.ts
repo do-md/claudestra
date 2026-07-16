@@ -339,10 +339,27 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
       // [fork] busy：正在回合中（hook 驱动的 agent_status，与 /pending 的
       // thinking 同源——manager list 的 tmux idle 探测在回合中也常报 idle，
       // 不可靠，只作 OR 兜底）。web 列表的黄色状态点数据源。
-      for (const a of agents as any[]) {
-        const st = getAgentStatus(a.name) ?? getAgentStatus(String(a.name).replace(/^agent-/, ""));
-        a.busy = st === "thinking" || a.idle === false;
-      }
+      // 第三信号(2026-07-16「两个 working 只有点进去过的才黄」):event-bus 状态
+      // 随 bridge 重启清零且回合中途不再有新事件——重启后正在跑的 agent 状态
+      // undefined、idle 探测又误报空闲 → 黄标失灵。对这类状态不明的 active
+      // agent 补一发 pane spinner 探测(与 deliverToLocal 抢占判据同款三信号)。
+      await Promise.all(
+        (agents as any[]).map(async (a) => {
+          const st = getAgentStatus(a.name) ?? getAgentStatus(String(a.name).replace(/^agent-/, ""));
+          a.busy = st === "thinking" || a.idle === false;
+          if (!a.busy && st === undefined && a.status !== "stopped") {
+            try {
+              const tail = (await tmuxRaw(["capture-pane", "-t", windowTarget(a.name), "-p"]))
+                .split("\n")
+                .slice(-10)
+                .join("\n");
+              if (/esc to interrupt/i.test(tail) || /…\s*\(\d+m?\s*\d*s\b/.test(tail)) a.busy = true;
+            } catch {
+              /* 窗口不存在等,保持不忙 */
+            }
+          }
+        })
+      );
       // [fork] lastActivityTs：agent 最后一条真实对话的时间（不是 mtime——见
       // sessionTailInfo 注释）。contextTokens:当前上下文占用(web 端超标提示)。
       {

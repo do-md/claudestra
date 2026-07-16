@@ -35,6 +35,10 @@ interface ChatState {
   messages: ChatMessage[];
   /** 正在拉取历史消息（openAgent → loadMessages 期间） */
   loadingHistory: boolean;
+  /** 服务端还有更早的历史可翻(向上分页,owner 2026-07-16)。 */
+  historyHasMore: boolean;
+  /** 正在向上翻页加载更早消息。 */
+  loadingOlder: boolean;
   /** 本轮流式进行中 */
   streaming: boolean;
   /** 本轮已起、还没有任何输出 → 显示「思考中」 */
@@ -95,6 +99,8 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       activeAgent: "",
       messages: [],
       loadingHistory: false,
+      historyHasMore: false,
+      loadingOlder: false,
       historyError: false,
       streaming: false,
       awaitingChunk: false,
@@ -981,8 +987,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
         s.awaitingChunk = true;
       }
     });
-    // 新回合开始（此前不在回合中）→ 下一段输出另起气泡，不并进上一回合
-    if (status === "running") this.nextBubbleBoundary = true;
+    // 新回合开始（此前不在回合中）→ 下一段输出另起气泡，不并进上一回合。
+    // ⚠ 例外:列表尾已经是本回合的流式气泡(重连/回前台恢复,detach 清过
+    // streaming,/pending 又补回 running)——回合没换,不置边界,续写原气泡;
+    // 否则同一回合拆成两个气泡,「像新对话一样多了一个头像」(2026-07-16 截图)
+    if (status === "running") {
+      const last = this.state.messages[this.state.messages.length - 1];
+      if (!(last?.role === "assistant" && last.streamed)) this.nextBubbleBoundary = true;
+    }
   }
 
   public endTurn(interrupted?: boolean) {
