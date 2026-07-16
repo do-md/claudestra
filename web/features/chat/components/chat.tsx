@@ -238,6 +238,28 @@ function ChatInner() {
     return () => el.classList.remove("canvas-list");
   }, [showContent]);
 
+  // 通知深链(owner 2026-07-16「点通知切到具体 agent」):
+  // ① 冷启动:openWindow("/chat?agent=x") → 读 URL 参数打开对应会话;
+  // ② 已有窗口:SW notificationclick postMessage → 原地切会话,无整页刷新。
+  useEffect(() => {
+    const qa = new URLSearchParams(window.location.search).get("agent");
+    if (qa) {
+      window.history.replaceState(null, "", window.location.pathname);
+      void store.openAgent(qa);
+      toContent();
+    }
+    if (!("serviceWorker" in navigator)) return;
+    const onMsg = (e: MessageEvent) => {
+      const d = e.data as { type?: string; agent?: string };
+      if (d?.type === "cstra-open-agent" && d.agent) {
+        void store.openAgent(d.agent);
+        toContent();
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", onMsg);
+    return () => navigator.serviceWorker.removeEventListener("message", onMsg);
+  }, [store, toContent]);
+
   // 会话恢复：iOS 把后台页整个回收重载后，URL 还带 #chat 但 store 是全新的
   // （activeAgent=""）——之前就卡在空内容页要手动返回重选（2026-07-12 真机）。
   // agents 列表首次到位后：上次会话还在 → 自动重开；不在 → 退回列表页。

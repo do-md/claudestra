@@ -7,7 +7,7 @@ self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
 
 self.addEventListener("push", (event) => {
-  let payload = { title: "Claudestra", body: "", url: "/chat", tag: "cstra" };
+  let payload = { title: "Claudestra", body: "", url: "/chat", tag: "cstra", agent: "" };
   try {
     payload = { ...payload, ...event.data.json() };
   } catch {
@@ -23,7 +23,7 @@ self.addEventListener("push", (event) => {
         tag: payload.tag,
         icon: "/icons/icon-192.png",
         badge: "/icons/icon-192.png",
-        data: { url: payload.url },
+        data: { url: payload.url, agent: payload.agent },
       });
     })()
   );
@@ -31,13 +31,17 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const url = (event.notification.data && event.notification.data.url) || "/chat";
+  const data = event.notification.data || {};
+  const url = data.url || "/chat";
   event.waitUntil(
     (async () => {
       const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const w of wins) {
         if ("focus" in w) {
           await w.focus();
+          // 已有窗口:postMessage 让页面原地切到该 agent 会话(比 navigate 整页
+          // 刷新顺滑;owner 2026-07-16「点通知切到具体 agent」)
+          if (data.agent) w.postMessage({ type: "cstra-open-agent", agent: data.agent });
           return;
         }
       }

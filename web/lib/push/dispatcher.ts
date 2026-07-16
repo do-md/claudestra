@@ -35,7 +35,7 @@ function dropSub(endpoint: string) {
   }
 }
 
-async function sendToAll(payload: { title: string; body: string; url?: string; tag?: string }) {
+async function sendToAll(payload: { title: string; body: string; url?: string; tag?: string; agent?: string }) {
   const subs = listSubs();
   if (!subs.length) return;
   ensureVapid();
@@ -72,7 +72,9 @@ function maybePush(evt: { type: string; agent: string; chatId: string; data: Rec
   void sendToAll({
     title: agent,
     body: text.length > 180 ? `${text.slice(0, 180)}…` : text,
-    url: "/chat",
+    // 深链:点通知直达该 agent 会话(owner 2026-07-16)
+    url: `/chat?agent=${encodeURIComponent(agent)}`,
+    agent,
     // 同 agent 的连续回复折叠成一条(系统通知中心不刷屏)
     tag: `cstra-${agent}`,
   });

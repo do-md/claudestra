@@ -33,11 +33,15 @@ export function getVapidKeys(): VapidKeys {
   return cached;
 }
 
-/** 给 web-push 应用 VAPID 身份(幂等)。subject 用占位 mailto(规范要求非空)。 */
+/** 给 web-push 应用 VAPID 身份(幂等)。
+ *  subject 必须是合法 https URL 或 mailto——Apple 推送服务严格校验,
+ *  `.local` 假域名直接 403 BadJwtToken(2026-07-16 真机实测);FCM 不挑。
+ *  可用 PUSH_VAPID_SUBJECT 覆盖。 */
 export function ensureVapid(): VapidKeys {
   const keys = getVapidKeys();
   if (!applied) {
-    webpush.setVapidDetails("mailto:push@claudestra.local", keys.publicKey, keys.privateKey);
+    const subject = process.env.PUSH_VAPID_SUBJECT || "https://github.com/shawnlu96/claudestra";
+    webpush.setVapidDetails(subject, keys.publicKey, keys.privateKey);
     applied = true;
   }
   return keys;
