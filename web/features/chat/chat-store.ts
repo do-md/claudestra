@@ -1314,9 +1314,14 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
   }
 
   /** 一键中断：给当前会话的 tmux window 发 Ctrl+C。 */
+  /** 打断请求的本地冷却(防双击双 C-c;服务端另有 3s 冷却兜底)。 */
+  private lastInterruptAt = 0;
+
   public async interrupt(): Promise<{ ok: boolean; error?: string }> {
     const agent = this.state.activeAgent;
     if (!agent) return { ok: false, error: "无活动会话" };
+    if (Date.now() - this.lastInterruptAt < 3_000) return { ok: true };
+    this.lastInterruptAt = Date.now();
     const res = await this.postAction("/api/chat/interrupt", { agent });
     // done 会经 SSE 回来解锁；这里乐观收敛
     if (res.ok)

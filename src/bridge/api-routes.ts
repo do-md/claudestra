@@ -49,6 +49,9 @@ import { resolveModelAlias, isKnownEffort, KNOWN_EFFORT_LEVELS } from "../lib/cl
 // [fork] master 不在 registry，从 env 读其控制频道 id（各端点的 master 特判用）
 const CONTROL_CHANNEL_ID = process.env.CONTROL_CHANNEL_ID || "";
 
+/** interrupt 端点的每 agent 冷却(防双击双 C-c——空闲态连按两次是 CC 退出键)。 */
+const interruptCooldown = new Map<string, number>();
+
 /**
  * [fork] master 的最新 session id：master 不在 registry，从其 cwd 的
  * ~/.claude/projects/<slug>/ 目录里 probe mtime 最新的 jsonl。
@@ -904,6 +907,13 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     }
     const agent = await findApiAgent(agentParam);
     if (!agent) return apiJson(404, { ok: false, error: `agent "${agentParam}" not found` });
+    // 防重入(owner 2026-07-16:「打断按钮点两次出两个打断」):3s 冷却——
+    // 空闲态连发两次 C-c 是 CC 的退出快捷键,双击可能直接把会话关了
+    const lastInt = interruptCooldown.get(agent.name) ?? 0;
+    if (Date.now() - lastInt < 3_000) {
+      return apiJson(200, { ok: true, deduped: true });
+    }
+    interruptCooldown.set(agent.name, Date.now());
     const targetWindow = agent.name === "master" ? `${MASTER_SESSION}:0` : windowTarget(agent.name);
     try {
       await tmuxRaw(["send-keys", "-t", targetWindow, "C-c"]);

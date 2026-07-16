@@ -284,6 +284,15 @@ async function getClaudeLatestVersion(): Promise<string | null> {
   return m ? m[1] : null;
 }
 
+/** claude 二进制的安装方式检测:realpath 落在 Homebrew Caskroom → brew cask
+ *  (返回 cask 名);否则按 npm 全局处理。brew 装的机器上跑 npm install -g 必然
+ *  EEXIST 失败——这正是「CC 静默更新老是失败」的根因(owner 2026-07-16)。 */
+async function detectClaudeInstall(): Promise<{ kind: "brew"; cask: string } | { kind: "npm" }> {
+  const which = await runCmd(["/bin/sh", "-lc", "realpath \"$(command -v claude)\" 2>/dev/null"]);
+  const m = which.ok ? which.out.match(/\/Caskroom\/([^/]+)\//) : null;
+  return m ? { kind: "brew", cask: m[1] } : { kind: "npm" };
+}
+
 /** 所有 agent + master 是否都空闲 */
 async function allAgentsIdle(): Promise<boolean> {
   if (!(await tmuxIsIdle(MASTER_WINDOW))) return false;
@@ -356,11 +365,26 @@ async function checkClaudeCodeUpdate() {
 
   const current = await getClaudeVersion();
   if (!current) return;
-  const latest = await getClaudeLatestVersion();
-  if (!latest) return;
-  if (current === latest) return;
 
-  console.log(`🆙 Claude Code 有新版本: ${current} → ${latest}`);
+  // 安装方式分流:brew cask 场景版本判断和升级都必须走 brew——npm 的 latest
+  // 常领先 cask 几小时到几天,拿 npm 版本对比会永远误报「有更新」,而
+  // npm install -g 对 brew 安装直接 EEXIST 失败(历史上「静默更新老失败」)。
+  const install = await detectClaudeInstall();
+  let latest: string;
+  if (install.kind === "brew") {
+    await runCmd(["brew", "update", "--quiet"]); // 刷新索引(weekly 一次,慢点无妨)
+    const outdated = await runCmd(["brew", "outdated", "--cask", install.cask]);
+    if (!outdated.ok || !outdated.out.trim()) return; // 已是 cask 最新
+    const m = outdated.out.match(/(\d+\.\d+\.\d+)\s*$/m);
+    latest = m ? m[1] : "(brew 新版)";
+  } else {
+    const npmLatest = await getClaudeLatestVersion();
+    if (!npmLatest) return;
+    if (current === npmLatest) return;
+    latest = npmLatest;
+  }
+
+  console.log(`🆙 Claude Code 有新版本: ${current} → ${latest} (${install.kind})`);
 
   // 等所有 agent 空闲再更新（避免打断正在进行的任务）
   if (!(await allAgentsIdle())) {
@@ -375,22 +399,25 @@ async function checkClaudeCodeUpdate() {
       type: "reply",
       chatId: CONTROL_CHANNEL_ID,
       text: t(
-        `🆙 **Claude Code 新版本** ${current} → ${latest} ${mention}\n\n所有 agent 当前空闲，开始 npm install + 重启...`,
-        `🆙 **Claude Code update** ${current} → ${latest} ${mention}\n\nAll agents idle, running npm install + restart...`,
+        `🆙 **Claude Code 新版本** ${current} → ${latest} ${mention}\n\n所有 agent 当前空闲，开始${install.kind === "brew" ? " brew upgrade" : " npm install"} + 重启...`,
+        `🆙 **Claude Code update** ${current} → ${latest} ${mention}\n\nAll agents idle, running ${install.kind === "brew" ? "brew upgrade" : "npm install"} + restart...`,
       ),
     });
   } catch { /* non-critical */ }
 
-  const install = await runCmd(["npm", "install", "-g", "@anthropic-ai/claude-code"]);
-  if (!install.ok) {
-    console.log(`🆙 npm install 失败: ${install.out}`);
+  const upgrade =
+    install.kind === "brew"
+      ? await runCmd(["brew", "upgrade", "--cask", install.cask])
+      : await runCmd(["npm", "install", "-g", "@anthropic-ai/claude-code"]);
+  if (!upgrade.ok) {
+    console.log(`🆙 ${install.kind} 更新失败: ${upgrade.out}`);
     try {
       await bridgeRequest({
         type: "reply",
         chatId: CONTROL_CHANNEL_ID,
         text: t(
-          `⚠️ Claude Code 更新失败（npm install 返回错误），详见 launcher 日志`,
-          `⚠️ Claude Code update failed (npm install returned error) — see launcher logs`,
+          `⚠️ Claude Code 更新失败（${install.kind === "brew" ? "brew upgrade" : "npm install"} 返回错误），详见 launcher 日志`,
+          `⚠️ Claude Code update failed (${install.kind === "brew" ? "brew upgrade" : "npm install"} returned error) — see launcher logs`,
         ),
       });
     } catch { /* non-critical */ }

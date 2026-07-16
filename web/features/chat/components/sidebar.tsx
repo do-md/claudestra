@@ -259,10 +259,17 @@ function AgentRow({
               </span>
             )}
           </span>
-          {lastAt && (
-            <span className="shrink-0 pl-1 font-mono text-[11px] tabular-nums text-base-content/35">
-              {lastAt}
-            </span>
+          {/* busy 时不显示过期时间(owner 2026-07-16:「明明在工作却显示 48 分钟前」
+              ——lastActivityTs 读 jsonl 最后一条对话,CC 回合内攒内存不落盘,长回合
+              期间时间冻结在回合开始前)→ 显示「工作中」更诚实 */}
+          {(a.busy || busyLive) ? (
+            <span className="shrink-0 pl-1 text-[11px] text-warning/80">工作中</span>
+          ) : (
+            lastAt && (
+              <span className="shrink-0 pl-1 font-mono text-[11px] tabular-nums text-base-content/35">
+                {lastAt}
+              </span>
+            )
           )}
         </button>
         </div>
