@@ -258,6 +258,11 @@ function ChatInner() {
   useEffect(() => {
     store.loadAgents();
     void store.loadProfile();
+    // Web Push 的 Service Worker(sw.js 只做推送,不拦资源缓存);注册失败静默
+    // ——非 HTTPS/不支持的环境本来就没有推送,设置页开关那里会给明确提示
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
     // 回前台时若流断了则重连，并立即刷一次列表（后台期间可能有新 agent）。
     // iOS PWA 从 App 切换器/锁屏回来有时只发 focus/pageshow 不发 visibilitychange
     // (2026-07-14 真机:断流旧帧一直挂着,历史/回复全缺)——三个事件都挂同一

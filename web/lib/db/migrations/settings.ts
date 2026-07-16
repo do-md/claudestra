@@ -44,4 +44,15 @@ export function runSettingsMigrations(db: Database.Database) {
   if (!cols.includes("claude_avatar")) {
     db.exec("ALTER TABLE user_profile ADD COLUMN claude_avatar TEXT NOT NULL DEFAULT ''");
   }
+  // Web Push 订阅(owner 2026-07-16「做 pwa 推送」)。原生 VAPID 自托管,零第三方。
+  // endpoint 为主键(浏览器换订阅=新 endpoint);keys 是 PushSubscription 的
+  // p256dh/auth JSON;410/404 失效时由 dispatcher 自动清理。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      endpoint TEXT PRIMARY KEY,
+      keys TEXT NOT NULL,
+      ua TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    )
+  `);
 }

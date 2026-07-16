@@ -1,0 +1,47 @@
+/**
+ * Claudestra Web Push Service Worker(owner 2026-07-16「做 pwa 推送」)。
+ * - push:展示通知;若已有聚焦中的 App 窗口(人正在看)则不弹横幅,免打扰
+ * - notificationclick:聚焦已有窗口,没有则新开 /chat
+ */
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+
+self.addEventListener("push", (event) => {
+  let payload = { title: "Claudestra", body: "", url: "/chat", tag: "cstra" };
+  try {
+    payload = { ...payload, ...event.data.json() };
+  } catch {
+    /* 非 JSON payload,用默认 */
+  }
+  event.waitUntil(
+    (async () => {
+      // 人正盯着页面就不弹系统横幅(页面内实时流已经在渲染回复)
+      const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      if (wins.some((w) => w.focused)) return;
+      await self.registration.showNotification(payload.title, {
+        body: payload.body,
+        tag: payload.tag,
+        icon: "/icons/icon-192.png",
+        badge: "/icons/icon-192.png",
+        data: { url: payload.url },
+      });
+    })()
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = (event.notification.data && event.notification.data.url) || "/chat";
+  event.waitUntil(
+    (async () => {
+      const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      for (const w of wins) {
+        if ("focus" in w) {
+          await w.focus();
+          return;
+        }
+      }
+      await self.clients.openWindow(url);
+    })()
+  );
+});

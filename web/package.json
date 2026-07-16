@@ -11,6 +11,7 @@
   "dependencies": {
     "@do-md/core-react": "^0.2.10",
     "@microsoft/fetch-event-source": "^2.0.1",
+    "@types/web-push": "^3.6.4",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
@@ -27,6 +28,7 @@
     "react-dom": "19.2.3",
     "ssh2": "^1.17.0",
     "tailwind-merge": "^3.5.0",
+    "web-push": "^3.6.7",
     "yet-another-react-lightbox": "^3.32.1"
   },
   "devDependencies": {
