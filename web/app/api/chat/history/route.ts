@@ -113,7 +113,7 @@ function matchClickedChoice(
   return null;
 }
 
-function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
+function toChatMessages(items: NeutralMessage[], opts?: { tail?: boolean }): ChatMessage[] {
   const out: ChatMessage[] = [];
   let group: ChatMessage | null = null; // 当前正在累积的 assistant 回合气泡
   // 最近一条带组件的 assistant 气泡：后续 user 的按钮点击 payload 命中其组件
@@ -226,8 +226,11 @@ function toChatMessages(items: NeutralMessage[]): ChatMessage[] {
   // 完成标记只给「历史尾轮」:最后一条消息是 assistant 且回合正常收尾
   // (turnMs 来自 turn_duration,进行中/被打断的回合没有)。切后台错过 done
   // 事件后刷新重载,完成态不再蒸发;中间轮不标,不刷屏。
-  const tail = out[out.length - 1];
-  if (tail?.role === "assistant" && typeof tail.turnMs === "number") tail.turnDone = true;
+  // before 分页片段(opts.tail=false)不标——片段尾不是全局尾轮。
+  if (opts?.tail !== false) {
+    const tail = out[out.length - 1];
+    if (tail?.role === "assistant" && typeof tail.turnMs === "number") tail.turnDone = true;
+  }
   return out;
 }
 
@@ -241,8 +244,26 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "missing agent" }, { status: 400 });
   }
   const name = encodeURIComponent(apiAgentName(agent));
+  // 向上分页(owner 2026-07-16「往上滑看全部历史」):before=<seq> + session=<sid>
+  // → 钉在同一 session 往前翻(seq 空间 per-session,不能跨 session 混用)
+  const before = url.searchParams.get("before");
+  const pinnedSession = url.searchParams.get("session");
 
   try {
+    if (before && /^\d+$/.test(before) && pinnedSession) {
+      const page = await bridgeGet<{ ok: boolean; messages: NeutralMessage[] }>(
+        `/agents/${name}/history/${encodeURIComponent(pinnedSession)}?limit=300&before=${before}`,
+        { timeoutMs: 10_000 }
+      );
+      const items = page.messages || [];
+      return NextResponse.json({
+        data: toChatMessages(items, { tail: false }),
+        sessionId: pinnedSession,
+        // 粗判:拿满一页 ≈ 还有更早(边界恰好取空一次,可接受)
+        hasMore: items.length >= 300,
+      });
+    }
+
     // 1) session 清单（mtime 降序，[0] = 最新）
     const list = await bridgeGet<{
       ok: boolean;
@@ -261,7 +282,12 @@ export async function GET(request: Request) {
           `/agents/${name}/history/${encodeURIComponent(s.sessionId)}?limit=500`,
           { timeoutMs: 10_000 }
         );
-        return NextResponse.json({ data: toChatMessages(page.messages || []) });
+        const items = page.messages || [];
+        return NextResponse.json({
+          data: toChatMessages(items),
+          sessionId: s.sessionId,
+          hasMore: items.length >= 500,
+        });
       } catch (e) {
         lastErr = e as Error;
         // not found（轮转竞态）→ 试下一个；其它错误也顺延，全败再抛

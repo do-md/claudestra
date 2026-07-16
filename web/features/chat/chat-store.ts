@@ -359,6 +359,45 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
     void this.openStream(name);
   }
 
+  /** 当前历史所属 sessionId(向上分页要钉在同一 session——seq 空间 per-session)。 */
+  private historySessionId: string | null = null;
+
+  /** 向上翻页:拉当前 session 更早的一页,prepend 到列表头。
+   *  「显示更早」把本地窗口耗尽后由按钮触发(owner 2026-07-16「往上滑看全部历史」)。 */
+  public async loadOlder() {
+    const name = this.state.activeAgent;
+    const sid = this.historySessionId;
+    if (!name || !sid || this.state.loadingOlder || !this.state.historyHasMore) return;
+    // 最早一条历史消息的 seq(id=h{seq};乐观消息是本地 id,跳过)
+    const first = this.state.messages.find((m) => m.id.startsWith("h"));
+    const beforeSeq = first ? Number(first.id.slice(1)) : NaN;
+    if (!Number.isFinite(beforeSeq)) return;
+    const gen = this.openGen;
+    this.produce((s) => {
+      s.loadingOlder = true;
+    });
+    try {
+      const res = await fetch(
+        `/api/chat/history?agent=${encodeURIComponent(name)}&before=${beforeSeq}&session=${encodeURIComponent(sid)}`
+      );
+      if (res.status === 401) return this.gotoLogin();
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = (await res.json()) as { data?: ChatMessage[]; hasMore?: boolean };
+      if (gen !== this.openGen) return; // 已切走
+      this.produce((s) => {
+        s.messages = [...(json.data ?? []), ...s.messages];
+        s.historyHasMore = !!json.hasMore;
+        s.loadingOlder = false;
+      });
+    } catch {
+      if (gen === this.openGen) {
+        this.produce((s) => {
+          s.loadingOlder = false;
+        });
+      }
+    }
+  }
+
   /** CC 任务清单刷新防抖(TaskCreate/TaskUpdate 常连发)。 */
   private ccTasksTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -414,9 +453,15 @@ export class ChatStore extends ZenithStore<ChatState> implements StreamSink {
       );
       if (res.status === 401) return this.gotoLogin();
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = (await res.json()) as { data?: ChatMessage[] };
+      const json = (await res.json()) as {
+        data?: ChatMessage[];
+        sessionId?: string;
+        hasMore?: boolean;
+      };
       if (gen !== this.openGen) return; // 已切走，丢弃
+      this.historySessionId = json.sessionId ?? null;
       this.produce((s) => {
+        s.historyHasMore = !!json.hasMore;
         const history = json.data ?? [];
         // 乐观消息保全:agent 忙时连发的消息在服务端排队,送达前不进 jsonl——
         // 历史整体替换会把它们从视图「吞掉」(2026-07-14 真机:连发多条 UI 上

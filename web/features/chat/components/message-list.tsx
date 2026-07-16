@@ -720,6 +720,8 @@ export function MessageList() {
   const awaiting = useChatStore((s) => s.state.awaitingChunk);
   const streaming = useChatStore((s) => s.state.streaming);
   const loadingHistory = useChatStore((s) => s.state.loadingHistory);
+  const historyHasMore = useChatStore((s) => s.state.historyHasMore);
+  const loadingOlder = useChatStore((s) => s.state.loadingOlder);
   const historyError = useChatStore((s) => s.state.historyError);
   const active = useChatStore((s) => s.state.activeAgent);
   const store = useChatStoreApi();
@@ -749,13 +751,17 @@ export function MessageList() {
     setExtraVisible(0); // 渲染窗口回到「最近 30 条」
   }, [active]);
 
-  // 「显示更早」展开后保持视口锚定：内容在上方插入，滚动位置按增量补偿
+  // 「显示更早」展开后保持视口锚定：内容在上方插入，滚动位置按增量补偿。
+  // deps 含 messages.length:loadOlder 服务端分页是异步 prepend(iOS Safari 无
+  // overflow-anchor,不补偿视口会被顶飞),prevScrollHeightRef 非空才动、动完即清,
+  // 尾部 append 场景 ref 为 null 不受影响。
   useLayoutEffect(() => {
     if (prevScrollHeightRef.current === null) return;
     const el = scrollerRef.current;
     if (el) el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
     prevScrollHeightRef.current = null;
-  }, [extraVisible]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extraVisible, messages.length]);
 
   useEffect(() => {
     // 用户上翻阅读时不强拉回底（follow=false）——之前每来一条新消息/卡片都
@@ -861,6 +867,22 @@ export function MessageList() {
             }}
           >
             显示更早的 {hiddenCount} 条
+          </button>
+        )}
+        {/* 本地窗口耗尽 → 继续向服务端翻更早的一页(同 session,seq 向前)。
+            prepend 后滚动锚定复用同一套 scrollHeight 增量补偿。 */}
+        {hiddenCount === 0 && historyHasMore && (
+          <button
+            className="btn btn-ghost btn-xs mx-auto mb-4 text-base-content/50"
+            disabled={loadingOlder}
+            onClick={() => {
+              prevScrollHeightRef.current = scrollerRef.current?.scrollHeight ?? null;
+              setExtraVisible((n) => n + 300);
+              void store.loadOlder();
+            }}
+          >
+            {loadingOlder && <span className="loading loading-spinner loading-xs" />}
+            加载更早的消息…
           </button>
         )}
         {visible.map((m, i) => (
